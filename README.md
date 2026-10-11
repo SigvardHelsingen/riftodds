@@ -25,3 +25,16 @@ Open http://localhost:8000.
   Filled by a background sampler; set `SAMPLER=0` in `.env` to turn it off.
 - **Player**: summary, then tabs for Champions (vs your rank), Draft (pick predictor),
   Habits and Win conditions.
+
+## Users
+
+The site is invite-only. Manage logins on the server:
+
+```
+uv run python auth.py add <username>      # prompts for a password
+uv run python auth.py passwd <username>
+uv run python auth.py remove <username>
+uv run python auth.py list
+```
+
+Users and sessions are stored in `users.db` (not in git).

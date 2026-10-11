@@ -13,10 +13,12 @@ import time
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
+import auth
 import stats
 import store
 from riot import PLATFORMS, Riot, RiotError, load_champions
@@ -53,6 +55,46 @@ async def lifespan(app):
 
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+PUBLIC_API = {"/api/login", "/api/logout"}
+
+
+@app.middleware("http")
+async def require_login(request: Request, call_next):
+    """Every /api route except login/logout needs a valid session. The page shell is public."""
+    if request.url.path.startswith("/api/") and request.url.path not in PUBLIC_API:
+        user = auth.user_for(request.cookies.get(auth.COOKIE))
+        if not user:
+            return JSONResponse({"detail": "Not logged in"}, status_code=401)
+        request.state.user = user
+    return await call_next(request)
+
+
+class Credentials(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+def login(creds: Credentials, request: Request, response: Response):
+    token = auth.login(creds.username.strip(), creds.password)
+    if not token:
+        raise HTTPException(401, "Wrong username or password.")
+    response.set_cookie(auth.COOKIE, token, max_age=auth.SESSION_DAYS * 86400, httponly=True,
+                        samesite="lax", secure=request.url.scheme == "https")
+    return {"username": creds.username.strip()}
+
+
+@app.post("/api/logout")
+def logout(request: Request, response: Response):
+    auth.logout(request.cookies.get(auth.COOKIE))
+    response.delete_cookie(auth.COOKIE)
+    return {"ok": True}
+
+
+@app.get("/api/me")
+def me(request: Request):
+    return {"username": request.state.user}
 
 
 def riot_errors(e: RiotError):

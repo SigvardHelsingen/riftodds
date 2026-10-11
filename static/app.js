@@ -20,8 +20,45 @@ let pollTimer = null;
 async function api(path, opts) {
   const r = await fetch(path, opts);
   const body = await r.json().catch(() => ({}));
+  if (r.status === 401 && path !== "/api/login") {
+    showLogin(); // session expired or user removed
+    throw new Error("Not logged in");
+  }
   if (!r.ok) throw new Error(body.detail || `HTTP ${r.status}`);
   return body;
+}
+
+const postJSON = (path, data) =>
+  api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+
+// ---------------------------------------------------------------- login
+function showLogin() {
+  clearInterval(pollTimer);
+  $("#top-search").hidden = true;
+  $("#user").hidden = true;
+  $("#app").innerHTML = `
+    <section class="login">
+      <h1>Members<br><em>only.</em></h1>
+      <form class="card" id="login-form">
+        <label>Username<input name="username" autocomplete="username" required autofocus></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <button class="btn">Log in</button>
+        <p class="error small" id="login-error"></p>
+      </form>
+    </section>`;
+  const form = $("#login-form");
+  form.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    form.querySelector("button").disabled = true;
+    try {
+      await postJSON("/api/login", { username: form.username.value, password: form.password.value });
+      start();
+    } catch (err) {
+      $("#login-error").textContent = err.message;
+      form.password.value = "";
+      form.querySelector("button").disabled = false;
+    }
+  });
 }
 
 // ---------------------------------------------------------------- shared pieces
@@ -415,8 +452,21 @@ function tabWincons() {
 }
 
 // ---------------------------------------------------------------- boot
-(async () => {
-  META = await api("/api/meta");
-  window.addEventListener("hashchange", route);
-  route();
-})();
+async function start() {
+  try {
+    const me = await api("/api/me");
+    META = await api("/api/meta");
+    $("#user").hidden = false;
+    $("#username").textContent = me.username;
+    route();
+  } catch {
+    // api() already showed the login view on 401
+  }
+}
+
+$("#logout").addEventListener("click", async () => {
+  await postJSON("/api/logout", {});
+  showLogin();
+});
+window.addEventListener("hashchange", () => META && route());
+start();
