@@ -12,7 +12,7 @@ interval, so "60% over 10 games" is shown with how sure it really is.
 - **Player profiles:** champion win rates compared with players of the same rank, a draft pick
   predictor (optionally by lane opponent), session and tilt habits, win conditions, and
   comeback and close-out rates.
-- **Match history:** every game type (ranked, normals, ARAM, Arena) with expandable scoreboards.
+- **Match history:** every game type (ranked, normals, ARAM, ARAM: Mayhem, Arena) with expandable scoreboards.
 - **Live game:** rank, mastery and recent form for all ten players in a player's current game.
 
 ## Running it yourself

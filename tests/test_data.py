@@ -248,7 +248,7 @@ class PatchAndModeTests(unittest.TestCase):
 
     def test_match_without_rift_objectives_is_saved(self):
         match = match_fixture("ARENA_1")
-        match["info"].update(queueId=1700, teams=[])
+        match["info"].update(queueId=1710, teams=[])
         store.save_match(self.db, "FIXTURE", match)
         self.assertTrue(store.has_match(self.db, "ARENA_1"))
         match = match_fixture("NO_OBJECTIVES")

@@ -14,7 +14,8 @@ const champions = {
 const meta = {
   champions, spells: { 4: "https://images.test/flash.png" }, ddragon: "16.20.1",
   platforms: ["euw1", "na1"], tiers: ["EMERALD", "DIAMOND"], roles: ["MIDDLE", "BOTTOM"],
-  queues: [{ key: "420", label: "Ranked Solo" }, { key: "450", label: "ARAM" }],
+  queues: [["420", "Ranked Solo"], ["440", "Ranked Flex"], ["400", "Normal Draft"], ["480", "Swiftplay"], ["450", "ARAM"],
+    ["2400", "ARAM: Mayhem"], ["1710", "Arena"]].map(([key, label]) => ({ key, label })),
   default_range: "20", ranges: [
     { key: "20", label: "Last 20 games", kind: "count" },
     { key: "season", label: "Whole season", kind: "time" },

@@ -490,7 +490,7 @@ class MatchHistoryTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def arena_fixture(mid, puuid):
         match = test_data.match_fixture(mid, puuid)
-        match["info"].update(queueId=1700, gameMode="CHERRY", mapId=30, teams=[])
+        match["info"].update(queueId=1710, gameMode="CHERRY", mapId=30, teams=[])
         for i, p in enumerate(match["info"]["participants"]):
             p.update(playerSubteamId=i // 2 + 1, placement=i // 2 + 1, teamPosition="", kills=i)
         return match
@@ -524,8 +524,16 @@ class MatchHistoryTests(unittest.IsolatedAsyncioTestCase):
 
         self.riot.match_ids.reset_mock()
         self.riot.match_ids.return_value = []
-        self.assertEqual((await self.matches(queue="1700", offset=2))["next"], None)
-        self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, 1700, 20, start=2)
+        self.assertEqual((await self.matches(queue="1710", offset=2))["next"], None)
+        self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, 1710, 20, start=2)
+
+    async def test_current_modes_are_filters_and_retired_arena_is_not(self):
+        self.riot.match_ids.return_value = []
+        await self.matches(queue="2400")
+        self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, 2400, 20, start=0)
+        for retired in ("1700", "490"):
+            response = await self.client.get(f"/api/player/{self.PUUID}/matches", params={"queue": retired})
+            self.assertEqual(response.status_code, 400, retired)
 
     async def test_unknown_queue_is_rejected(self):
         response = await self.client.get(f"/api/player/{self.PUUID}/matches", params={"queue": "999"})

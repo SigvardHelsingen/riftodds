@@ -44,8 +44,10 @@ SAMPLER = {
     "players": int(os.environ.get("SAMPLER_PLAYERS", "8")),     # players sampled in parallel per tier
     "share": 0.5,  # fraction of the rate limits the sampler may use
 }
+# IDs from https://static.developer.riotgames.com/docs/lol/queues.json — retired ones stay for old games' labels
 QUEUES = {420: "Ranked Solo", 440: "Ranked Flex", 400: "Normal Draft", 430: "Normal Blind", 450: "ARAM",
-          490: "Quickplay", 1700: "Arena", 1900: "URF"}
+          480: "Swiftplay", 490: "Quickplay", 1700: "Arena", 1710: "Arena", 1900: "URF", 2300: "Brawl",
+          2400: "ARAM: Mayhem"}
 LIVE_TTL = 60  # seconds before re-checking the spectator endpoint while polling (ranks/mastery: once per game)
 LIVE_FORM_GAMES = 10  # recent games synced per live participant (matches only, no timelines)
 PROFILE_TTL = 6 * 3600  # Riot ID -> PUUID, profile icon, level and mastery are reused this long
@@ -534,7 +536,7 @@ def player_analysis(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias
 
 ITEM_SLOTS = [f"item{i}" for i in range(7)]  # item6 is the trinket
 POSITION_ORDER = {"TOP": 0, "JUNGLE": 1, "MIDDLE": 2, "BOTTOM": 3, "UTILITY": 4}
-HISTORY_QUEUES = (420, 440, 400, 490, 450, 1700)  # match-history filters, besides "all"
+HISTORY_QUEUES = (420, 440, 400, 480, 450, 2400, 1710)  # match-history filters, besides "all"; 1710 = 16-player Arena
 SUMMONERS_RIFT = 11  # mapId: dragons and barons only exist here
 
 
