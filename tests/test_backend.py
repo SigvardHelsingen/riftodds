@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import httpx
 
 import config
+import test_data
 
 # Import definitions without loading the real env file or starting the lifespan.
 with patch.object(config, "load_env"), patch.dict(os.environ, {
@@ -79,6 +80,12 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(threads)
         self.assertNotEqual(threads[0], threading.get_ident())
         self.user_for.assert_called_once_with("dummy-session")
+
+    async def test_index_versions_assets_and_is_revalidated(self):
+        response = await self.client.get("/")
+        self.assertEqual(response.headers["cache-control"], "no-cache")
+        self.assertRegex(response.text, r'src="/static/app\.js\?v=[0-9a-f]{12}"')
+        self.assertRegex(response.text, r'href="/static/style\.css\?v=[0-9a-f]{12}"')
 
     async def test_missing_session_still_returns_401(self):
         self.user_for.return_value = None
@@ -337,7 +344,7 @@ class SnapshotBoundaryTests(unittest.TestCase):
     def test_patch_response_uses_one_snapshot_across_concurrent_commit(self):
         updated = False
 
-        def latest(db):
+        def latest(db, before=None):
             nonlocal updated
             self.count(db)
             if not updated:
@@ -391,7 +398,7 @@ class SnapshotBoundaryTests(unittest.TestCase):
         self.prepare_analysis(concurrent_write=True)
         result = main.analysis("dummy-puuid", self.rng, 0)
         self.assertEqual(result["profile"]["level"], 1)
-        self.assertEqual(result["games_analysed"], 1)
+        self.assertEqual(result["games_analyzed"], 1)
         for key in ("overview", "vs_rank", "leads", "mastery"):
             self.assertEqual(result[key]["count"], 1)
         self.assertEqual(self.writer.execute("SELECT COUNT(*) FROM matches").fetchone()[0], 2)
@@ -416,6 +423,124 @@ class SnapshotBoundaryTests(unittest.TestCase):
                 main.analysis("unknown", self.rng, 0)
         self.assertEqual(error.exception.status_code, 404)
         self.assert_snapshot_closed()
+
+
+class PatchFallbackTests(unittest.TestCase):
+    """Right after a patch drops, the landing page keeps the previous patch until the new one has enough games."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "cache.sqlite"
+        with closing(test_data.fixture_db(self.path)) as db:
+            for i in range(main.MIN_PATCH_GAMES + 10):
+                db.execute("INSERT INTO matches VALUES (?, 'X', 420, ?, 1800, '16.19', 0, NULL)", (f"OLD_{i}", i))
+            db.commit()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(patch.object(main.store, "connect", side_effect=lambda: test_data.fixture_db(self.path)))
+        stack.enter_context(patch.dict(main.state, {"ddragon": "16.20.1", "sampler": {"status": "off"}}))
+        stack.enter_context(patch.object(main.stats, "patch_overview", side_effect=lambda db, shown, tier: {"patch": shown, "matches": 0, "tiers": []}))
+
+    def add_new_patch_games(self, n):
+        with closing(test_data.fixture_db(self.path)) as db:
+            db.executemany("INSERT INTO matches VALUES (?, 'X', 420, 9999, 1800, '16.20', 0, NULL)",
+                           [(f"NEW_{i}",) for i in range(n)])
+            db.commit()
+
+    def test_previous_patch_shown_while_new_patch_has_few_games(self):
+        self.add_new_patch_games(5)
+        result = main.patch()
+        self.assertEqual((result["patch"], result["current_patch"], result["current_patch_games"]), ("16.19", "16.20", 5))
+
+    def test_new_patch_shown_once_it_has_enough_games(self):
+        self.add_new_patch_games(main.MIN_PATCH_GAMES)
+        self.assertEqual(main.patch()["patch"], "16.20")
+
+
+class MatchHistoryTests(unittest.IsolatedAsyncioTestCase):
+    PUUID = "fixture-player"
+
+    async def asyncSetUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.path = Path(directory.name) / "cache.sqlite"
+        with closing(test_data.fixture_db(self.path)) as db:
+            for i in range(25):  # ranked solo, one every two hours
+                match = test_data.match_fixture(f"SOLO_{i:02}", self.PUUID)
+                match["info"]["gameStartTimestamp"] = 1_000_000 + i * 7_200_000
+                main.store.save_match(db, "euw1", match)
+            main.store.save_player(db, self.PUUID, "Fixture", "EUW", "euw1", {})
+            db.commit()
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(main.store, "connect", side_effect=lambda: test_data.fixture_db(self.path)))
+        self.stack.enter_context(patch.object(main.auth, "user_for", return_value="alice"))
+        self.riot = SimpleNamespace(match_ids=AsyncMock(), match=AsyncMock())
+        self.stack.enter_context(patch.dict(main.state, {"riot": self.riot, "live": {}, "last_activity": 0}))
+        self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test",
+                                        cookies={main.auth.COOKIE: "dummy-session"})
+        self.addAsyncCleanup(self.client.aclose)
+
+    async def matches(self, **params):
+        response = await self.client.get(f"/api/player/{self.PUUID}/matches", params={"range": "50", **params})
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    @staticmethod
+    def arena_fixture(mid, puuid):
+        match = test_data.match_fixture(mid, puuid)
+        match["info"].update(queueId=1700, gameMode="CHERRY", mapId=30, teams=[])
+        for i, p in enumerate(match["info"]["participants"]):
+            p.update(playerSubteamId=i // 2 + 1, placement=i // 2 + 1, teamPosition="", kills=i)
+        return match
+
+    async def test_ranked_solo_pages_follow_the_synced_range(self):
+        first = await self.matches(limit=20)
+        self.assertEqual((first["total"], first["next"], len(first["rows"])), (25, 20, 20))
+        self.assertEqual(first["rows"][0]["match_id"], "SOLO_24")  # newest first
+        row = first["rows"][0]
+        self.assertEqual((row["queue"], row["opp_champ"], row["kill_participation"]), ("Ranked Solo", 6, 5 / 10))
+        second = await self.matches(offset=20, limit=20)
+        self.assertEqual((second["next"], [r["match_id"] for r in second["rows"]]),
+                         (None, [f"SOLO_{i:02}" for i in range(4, -1, -1)]))
+        self.riot.match_ids.assert_not_called()
+
+    async def test_more_than_a_hundred_rows_are_paged_not_rejected(self):
+        self.assertEqual((await self.client.get(f"/api/player/{self.PUUID}/matches", params={"limit": 120})).status_code, 422)
+        self.assertEqual((await self.matches(offset=120, limit=20))["rows"], [])
+
+    async def test_other_queues_list_from_riot_and_fetch_only_uncached_matches(self):
+        self.riot.match_ids.return_value = ["ARENA_1", "SOLO_24"]
+        self.riot.match.side_effect = lambda platform, mid: self.arena_fixture(mid, self.PUUID)
+        page = await self.matches(queue="all", limit=2, offset=0)
+        self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, None, 2, start=0)
+        self.riot.match.assert_awaited_once_with("euw1", "ARENA_1")  # SOLO_24 was cached
+        self.assertEqual(page["next"], 2)
+        arena, solo = page["rows"]
+        self.assertEqual((arena["queue"], arena["placement"], solo["queue"]), ("Arena", 1, "Ranked Solo"))
+        self.assertEqual(arena["kill_participation"], (0 + 3) / (0 + 1))  # KP within the duo, not all 16 players
+        self.assertIsNone(arena["opp_champ"])
+
+        self.riot.match_ids.reset_mock()
+        self.riot.match_ids.return_value = []
+        self.assertEqual((await self.matches(queue="1700", offset=2))["next"], None)
+        self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, 1700, 20, start=2)
+
+    async def test_unknown_queue_is_rejected(self):
+        response = await self.client.get(f"/api/player/{self.PUUID}/matches", params={"queue": "999"})
+        self.assertEqual(response.status_code, 400)
+
+    async def test_arena_scoreboard_lists_each_duo_by_placement(self):
+        with closing(test_data.fixture_db(self.path)) as db:
+            main.store.save_match(db, "euw1", self.arena_fixture("ARENA_2", self.PUUID))
+            db.commit()
+        detail = (await self.client.get("/api/match/ARENA_2")).json()
+        self.assertEqual([t["placement"] for t in detail["teams"]], [1, 2, 3, 4, 5])
+        self.assertEqual([len(t["players"]) for t in detail["teams"]], [2] * 5)
+        self.assertEqual((detail["queue"], detail["teams"][0]["dragons"]), ("Arena", None))
+        rift = (await self.client.get("/api/match/SOLO_00")).json()
+        self.assertEqual([(t["team_id"], t["win"], t["kills"]) for t in rift["teams"]], [(100, True, 10), (200, False, 10)])
 
 
 class ConfigTests(unittest.TestCase):

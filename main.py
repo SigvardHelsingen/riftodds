@@ -6,6 +6,7 @@ across all tiers, so the landing page can show stats for the current patch.
 Run:  uv run fastapi dev main.py
 """
 import asyncio
+import hashlib
 import logging
 import os
 import random
@@ -14,7 +15,7 @@ from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -275,7 +276,7 @@ async def sampler():
                 continue
             riot = state["riot"].background(sampler_share())
             db = store.connect()
-            patch = stats.latest_patch(db)
+            patch = current_patch(db)  # not the newest cached one: a finished old patch must not idle the sampler
             s.update(platform=platform, target=SAMPLER["target"], patch=patch,
                      matches=patch_matches(db, patch) if patch else 0)
             no_timeline = [r[0] for r in db.execute(
@@ -314,9 +315,22 @@ async def sampler():
             await asyncio.sleep(60)
 
 
+def index_html():
+    """index.html with content-hashed asset URLs: after a deploy, browsers can't pair the new API
+    with a cached old app.js."""
+    html = (STATIC / "index.html").read_text()
+    for name in ("app.js", "style.css"):
+        digest = hashlib.sha256((STATIC / name).read_bytes()).hexdigest()[:12]
+        html = html.replace(f"/static/{name}", f"/static/{name}?v={digest}")
+    return html
+
+
+INDEX_HTML = index_html()
+
+
 @app.get("/")
 def index():
-    return FileResponse(STATIC / "index.html")
+    return HTMLResponse(INDEX_HTML, headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/favicon.ico", include_in_schema=False)
@@ -339,6 +353,7 @@ def meta():
             "ranges": [{"key": k, "label": r["label"], "kind": "count" if "count" in r else "time"}
                        for k, r in history.RANGES.items()],
             "default_range": history.DEFAULT_RANGE,
+            "queues": [{"key": str(q), "label": QUEUES[q]} for q in HISTORY_QUEUES],
             "ddragon": state["ddragon"], "champions": state["champions"], "spells": state["spells"]}
 
 
@@ -349,7 +364,7 @@ def patch(tier: str | None = None):
     with closing(store.connect()) as db, store.read_snapshot(db):
         current = current_patch(db)
         current_games = patch_matches(db, current)
-        shown = current if current_games >= MIN_PATCH_GAMES else (stats.latest_patch(db) or current)
+        shown = current if current_games >= MIN_PATCH_GAMES else (stats.latest_patch(db, before=current) or current)
         overview = stats.patch_overview(db, shown, tier) if shown else {"patch": None, "matches": 0, "tiers": []}
         if shown and overview["matches"]:
             overview["leads"] = stats.patch_lead_curve(db, shown, tier)
@@ -370,7 +385,7 @@ def analysis(puuid, rng, tz):
                         "season_wins": p["wins"], "season_losses": p["losses"], "level": p["level"],
                         "icon": profile_icon(state["ddragon"], p["profile_icon"]) if p["profile_icon"] is not None else None},
             "range": {"key": rng["key"], "label": rng["label"]},
-            "games_analysed": len(games),
+            "games_analyzed": len(games),
             "first_game": games[0]["game_start"] if games else None,
             "last_game": games[-1]["game_start"] if games else None,
             "overview": stats.overview(games, tz) if games else None,
@@ -383,7 +398,7 @@ def analysis(puuid, rng, tz):
 
 @app.get("/api/player")
 async def player(platform: str, riot_id: str, range_: str = Query(history.DEFAULT_RANGE, alias="range"),
-                 tz: int = 0):
+                 tz: int = 0, tzname: str | None = None):
     """Resolve the player, start syncing their history for the range, and return what's cached.
 
     Small ranges usually finish within the wait below; big ones keep running in the
@@ -423,7 +438,8 @@ async def player(platform: str, riot_id: str, range_: str = Query(history.DEFAUL
     history.start(riot.background(HISTORY_SHARE), platform, puuid, solo.get("tier", "UNRANKED"), rng)
     await history.wait_for_matches(puuid, FIRST_RESPONSE_WAIT)  # timelines keep loading in the background
     # stats queries are blocking SQLite work: keep them off the event loop that drives the fetches
-    return {**await asyncio.to_thread(analysis, puuid, rng, tz), "live": live_summary(puuid, game)}
+    return {**await asyncio.to_thread(analysis, puuid, rng, stats.local_zone(tzname, tz)),
+            "live": live_summary(puuid, game)}
 
 
 def live_summary(puuid, game):
@@ -510,65 +526,126 @@ async def live(puuid: str, form: bool = False):
 
 
 @app.get("/api/player/{puuid}/analysis")
-def player_analysis(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias="range"), tz: int = 0):
+def player_analysis(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias="range"), tz: int = 0,
+                    tzname: str | None = None):
     history.touch(puuid)
-    return analysis(puuid, history.resolve(range_), tz)
+    return analysis(puuid, history.resolve(range_), stats.local_zone(tzname, tz))
 
 
 ITEM_SLOTS = [f"item{i}" for i in range(7)]  # item6 is the trinket
 POSITION_ORDER = {"TOP": 0, "JUNGLE": 1, "MIDDLE": 2, "BOTTOM": 3, "UTILITY": 4}
+HISTORY_QUEUES = (420, 440, 400, 490, 450, 1700)  # match-history filters, besides "all"
+SUMMONERS_RIFT = 11  # mapId: dragons and barons only exist here
+
+
+def queue_name(info):
+    return QUEUES.get(info.get("queueId"), (info.get("gameMode") or "Game").title())
+
+
+def team_of(p):
+    """Arena puts duos in one Riot team: its subteam is the real team."""
+    return p.get("playerSubteamId") or p["teamId"]
+
+
+def history_row(raw, puuid):
+    """One match-history row for `puuid`, read from the raw match JSON (any queue)."""
+    info = raw["info"]
+    me = next((p for p in info["participants"] if p["puuid"] == puuid), None)
+    if me is None or store.is_remake(info):
+        return None
+    position = me.get("teamPosition") or ""
+    team_kills = sum(p["kills"] for p in info["participants"] if team_of(p) == team_of(me))
+    return {
+        "match_id": raw["metadata"]["matchId"], "queue": queue_name(info),
+        "game_start": info["gameStartTimestamp"], "duration": info["gameDuration"],
+        "champion_id": me["championId"], "position": position, "team_id": me["teamId"], "win": bool(me["win"]),
+        "placement": me.get("placement") or None,  # Arena: 1st-8th
+        "kills": me["kills"], "deaths": me["deaths"], "assists": me["assists"],
+        "cs": me["totalMinionsKilled"] + me["neutralMinionsKilled"], "gold": me["goldEarned"],
+        "damage": me["totalDamageDealtToChampions"], "vision": me["visionScore"],
+        "opp_champ": next((p["championId"] for p in info["participants"] if position and p["teamId"] != me["teamId"]
+                           and p.get("teamPosition") == position), None),
+        "items": [me.get(slot, 0) for slot in ITEM_SLOTS],
+        "spells": [me.get("summoner1Id"), me.get("summoner2Id")],
+        "level": me.get("champLevel"),
+        "kill_participation": (me["kills"] + me["assists"]) / team_kills if team_kills else None,
+    }
+
+
+def history_rows(db, puuid, match_ids):
+    """Rows for the cached, non-remake games among `match_ids`, in order, with gold leads at 15."""
+    raws = (store.match_raw(db, m) for m in match_ids)
+    rows = [row for row in (history_row(raw, puuid) for raw in raws if raw) if row]
+    return stats.attach_gold(db, rows, puuid)
 
 
 @app.get("/api/player/{puuid}/matches")
-def player_matches(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias="range"),
-                   offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)):
-    """One page of the player's games in the range, newest first, with items and session info.
+async def player_matches(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias="range"),
+                         queue: str = str(SOLO_QUEUE), offset: int = Query(0, ge=0),
+                         limit: int = Query(20, ge=1, le=100)):
+    """One page of the player's games, newest first, with items and lane opponent.
 
-    Items/spells come from the raw match JSON, so only the requested page is decoded."""
+    Ranked solo is the synced range, straight from the cache. Other queues ("all" = every
+    queue) aren't synced: each page lists its IDs from Riot and fetches only the uncached
+    matches (no timelines). `next` is the offset of the following page, or null."""
+    if queue != "all" and queue not in {str(q) for q in HISTORY_QUEUES}:
+        raise HTTPException(400, "Unknown queue")
     history.touch(puuid)
-    db = store.connect()
-    games = stats.attach_gold(db, history.window(stats.player_games(db, puuid, SOLO_QUEUE),
-                                                 history.resolve(range_)), puuid)
-    sessions = stats.session_index(games)
-    rows = []
-    for g in games[::-1][offset:offset + limit]:
-        raw = store.match_raw(db, g["match_id"])
-        info = raw["info"] if raw else {"participants": [], "teams": []}
-        me = next((p for p in info["participants"] if p["puuid"] == puuid), {})
-        team_kills = next((t["objectives"]["champion"]["kills"] for t in info["teams"] if t["teamId"] == g["team_id"]), 0)
-        rows.append({
-            **{k: g[k] for k in ("match_id", "game_start", "duration", "champion_id", "position", "win", "kills",
-                                 "deaths", "assists", "cs", "gold", "damage", "vision", "opp_champ",
-                                 "team_diff15", "lane_diff15")},
-            "items": [me.get(slot, 0) for slot in ITEM_SLOTS],
-            "spells": [me.get("summoner1Id"), me.get("summoner2Id")],
-            "level": me.get("champLevel"),
-            "kill_participation": (g["kills"] + g["assists"]) / team_kills if team_kills else None,
-            "session": sessions[g["match_id"]],
-        })
-    return {"total": len(games), "offset": offset, "rows": rows}
+    if queue == str(SOLO_QUEUE):
+        def solo_page():
+            with closing(store.connect()) as db, store.read_snapshot(db):
+                games = history.window(stats.player_games(db, puuid, SOLO_QUEUE), history.resolve(range_))
+                page = [g["match_id"] for g in games[::-1][offset:offset + limit]]
+                return {"total": len(games), "next": offset + limit if offset + limit < len(games) else None,
+                        "rows": history_rows(db, puuid, page)}
+        return {"queue": queue, "offset": offset, "error": None, **await asyncio.to_thread(solo_page)}
+
+    with closing(store.connect()) as db:
+        p = store.get_player(db, puuid)
+        if not p:
+            raise HTTPException(404, "Unknown player")
+        riot, error = state["riot"], None
+        try:
+            ids = await riot.match_ids(p["platform"], puuid, None if queue == "all" else int(queue), limit, start=offset)
+            await history.fetch_chunk(riot, db, p["platform"], ids, None, timelines=False)
+        except RiotError as e:
+            raise riot_errors(e)
+        except history.FetchChunkError:
+            error = "Some games couldn't be loaded from Riot. Show more or refresh to retry."
+
+    def page_rows():
+        with closing(store.connect()) as db, store.read_snapshot(db):
+            return history_rows(db, puuid, ids)
+    return {"queue": queue, "offset": offset, "total": None, "error": error, "rows": await asyncio.to_thread(page_rows),
+            "next": offset + len(ids) if len(ids) == limit else None}
 
 
 @app.get("/api/match/{match_id}")
 def match_detail(match_id: str):
-    """Full scoreboard for one cached match: both teams, objectives, bans, gold at 15."""
-    db = store.connect()
-    raw = store.match_raw(db, match_id)
-    if not raw:
-        raise HTTPException(404, "Match not in the cache")
+    """Full scoreboard for one cached match: every team, objectives, bans, gold at 15."""
+    with closing(store.connect()) as db:
+        raw = store.match_raw(db, match_id)
+        if not raw:
+            raise HTTPException(404, "Match not in the cache")
+        platform = db.execute("SELECT platform FROM matches WHERE match_id = ?", (match_id,)).fetchone()[0]
+        gold15 = dict(db.execute("SELECT puuid, gold FROM frames WHERE match_id = ? AND minute = 15", (match_id,)).fetchall())
     info = raw["info"]
-    platform = db.execute("SELECT platform FROM matches WHERE match_id = ?", (match_id,)).fetchone()[0]
-    gold15 = dict(db.execute("SELECT puuid, gold FROM frames WHERE match_id = ? AND minute = 15", (match_id,)).fetchall())
+    riot_teams = {t["teamId"]: t for t in info.get("teams", [])}
+    rift = info.get("mapId", SUMMONERS_RIFT) == SUMMONERS_RIFT
+    by_team = {}
+    for p in info["participants"]:
+        by_team.setdefault(team_of(p), []).append(p)
     teams = []
-    for t in info["teams"]:
-        o = t["objectives"]
-        players = sorted((p for p in info["participants"] if p["teamId"] == t["teamId"]),
-                         key=lambda p: POSITION_ORDER.get(p.get("teamPosition"), 9))
+    for team_id, players in by_team.items():
+        players.sort(key=lambda p: POSITION_ORDER.get(p.get("teamPosition"), 9))
+        t = riot_teams.get(team_id, {})
+        o = t.get("objectives") or {}
+        count = lambda key: (o.get(key) or {}).get("kills")
         teams.append({
-            "team_id": t["teamId"], "win": t["win"],
-            "kills": o["champion"]["kills"], "towers": o["tower"]["kills"], "dragons": o["dragon"]["kills"],
-            "barons": o["baron"]["kills"], "grubs": o.get("horde", {}).get("kills", 0),
-            "gold15": sum(gold15.get(p["puuid"], 0) for p in players) if len(gold15) == 10 else None,
+            "team_id": team_id, "win": bool(players[0]["win"]), "placement": players[0].get("placement") or None,
+            "kills": sum(p["kills"] for p in players), "towers": count("tower"),
+            "dragons": count("dragon") if rift else None, "barons": count("baron") if rift else None,
+            "gold15": sum(gold15.get(p["puuid"], 0) for p in players) if len(gold15) == len(info["participants"]) else None,
             "bans": [b["championId"] for b in t.get("bans", []) if b["championId"] > 0],
             "players": [{
                 "puuid": p["puuid"], "champion_id": p["championId"], "position": p.get("teamPosition") or "",
@@ -579,7 +656,8 @@ def match_detail(match_id: str):
                 "items": [p.get(slot, 0) for slot in ITEM_SLOTS], "spells": [p.get("summoner1Id"), p.get("summoner2Id")],
             } for p in players],
         })
-    return {"match_id": match_id, "platform": platform, "game_start": info["gameStartTimestamp"],
+    teams.sort(key=lambda t: (t["placement"] or 0, t["team_id"]))  # blue, red — or Arena's standings
+    return {"match_id": match_id, "platform": platform, "queue": queue_name(info), "game_start": info["gameStartTimestamp"],
             "duration": info["gameDuration"], "patch": ".".join(info["gameVersion"].split(".")[:2]), "teams": teams}
 
 

@@ -14,6 +14,7 @@ const champions = {
 const meta = {
   champions, spells: { 4: "https://images.test/flash.png" }, ddragon: "16.20.1",
   platforms: ["euw1", "na1"], tiers: ["EMERALD", "DIAMOND"], roles: ["MIDDLE", "BOTTOM"],
+  queues: [{ key: "420", label: "Ranked Solo" }, { key: "450", label: "ARAM" }],
   default_range: "20", ranges: [
     { key: "20", label: "Last 20 games", kind: "count" },
     { key: "season", label: "Whole season", kind: "time" },
@@ -35,7 +36,7 @@ const data = {
     name: "LongPlayerName", tag: "EUW12", platform: "euw1", tier: "EMERALD", division: "II",
     lp: 42, season_wins: 100, season_losses: 80, level: 250, icon: "https://images.test/profile.png",
   },
-  first_game: now - 86400000, last_game: now, games_analysed: 20,
+  first_game: now - 86400000, last_game: now, games_analyzed: 20,
   sync: { running: false, phase: "done", error: null },
   overview: {
     record: winrate(), roles: [{ role: "MIDDLE", games: 20, share: 1, wr: 0.6, pool: { effective_pool: 2.5, top: [{ champion_id: 1 }] } }],
@@ -73,8 +74,16 @@ const matchRow = {
   match_id: "EUW1_123", champion_id: 1, spells: [4, 4], win: true, kills: 12, deaths: 3, assists: 9,
   kill_participation: 0.7, cs: 220, duration: 1900, gold: 14000, damage: 30000, vision: 20,
   opp_champ: 2, items: [1001, 1002, 1003, 1004, 1005, 1006, 1007], position: "MIDDLE", level: 18,
-  lane_diff15: 1200, team_diff15: 2300, game_start: now - 3600000,
-  session: { id: "first", start: now - 3600000, games: 1, wins: 1 },
+  lane_diff15: 1200, team_diff15: 2300, game_start: now - 3600000, queue: "Ranked Solo", placement: null,
+};
+// 20 games in one session, then one from days earlier on the second page
+const soloRows = [matchRow, ...Array.from({ length: 19 }, (_, i) => ({ ...matchRow, match_id: `EUW1_1${i + 30}`, game_start: matchRow.game_start - (i + 1) * 2400000 })),
+  { ...matchRow, match_id: "EUW1_122", win: false, game_start: now - 3 * 86400000 }];
+const aramRow = { ...matchRow, match_id: "EUW1_124", queue: "ARAM", position: "", opp_champ: null, lane_diff15: null, team_diff15: null };
+const matchPage = (q) => {
+  if (q.get("queue") !== "420") return { queue: q.get("queue"), rows: [aramRow, matchRow], total: null, next: null, error: null };
+  const offset = +q.get("offset"), end = offset + +q.get("limit");
+  return { queue: "420", rows: soloRows.slice(offset, end), total: soloRows.length, next: end < soloRows.length ? end : null, error: null };
 };
 const detail = {
   platform: "euw1", teams: [100, 200].map((team_id) => ({
@@ -101,7 +110,7 @@ async function fixturePage(browser, width, options = {}) {
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (err) => errors.push(err.message));
-  const state = { authenticated: options.authenticated !== false, liveRequests: 0, pickAlphas: [] };
+  const state = { authenticated: options.authenticated !== false, liveRequests: 0, pickAlphas: [], matchQueues: [] };
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     if (url.host !== "rift.test" || url.pathname === "/favicon.ico" || /^\/static\/(favicon|apple-touch-icon)/.test(url.pathname)) {
@@ -125,7 +134,7 @@ async function fixturePage(browser, width, options = {}) {
       body = options.patchError ? { detail: "Upstream unavailable" } : patch;
     }
     else if (url.pathname === "/api/player" || url.pathname.endsWith("/analysis")) body = options.data || data;
-    else if (url.pathname.endsWith("/matches")) body = { rows: [matchRow], total: 1 };
+    else if (url.pathname.endsWith("/matches")) { state.matchQueues.push(url.searchParams.get("queue")); body = matchPage(url.searchParams); }
     else if (url.pathname.startsWith("/api/match/")) body = detail;
     else if (url.pathname.startsWith("/api/live/")) { state.liveRequests++; body = live; }
     else if (url.pathname === "/api/pick") {
@@ -181,9 +190,23 @@ async function checkWidth(browser, width) {
       if (tab === "matches") {
         await page.waitForSelector(".mh-row");
         await noPageOverflow(page, `matches ${width}`);
-        await page.locator(".mh-row").click();
+        await page.locator(".mh-row").first().click();
         await page.waitForSelector(".mh-detail table");
-        assert.equal(await page.locator(".mh-row").getAttribute("aria-expanded"), "true");
+        assert.equal(await page.locator(".mh-row").first().getAttribute("aria-expanded"), "true");
+        await page.locator("#mh-more").click();
+        await page.waitForSelector('.mh-row[data-mid="EUW1_122"]');
+        assert.equal(await page.locator(".mh-session").count(), 2, "Games days apart are separate sessions");
+        await page.locator('.mh-queues .chip[data-q="all"]').click();
+        await page.waitForSelector('.mh-row[data-mid="EUW1_124"]');
+        assert.equal(state.matchQueues.at(-1), "all");
+        assert.match(await page.locator('.mh-row[data-mid="EUW1_124"] .mh-champ small').textContent(), /ARAM/);
+        assert.equal(await page.locator('.mh-queues .chip[data-q="all"]').getAttribute("aria-pressed"), "true");
+        await noPageOverflow(page, `all matches ${width}`);
+        if (process.env.SCREENSHOTS && [375, 1280].includes(width)) {
+          await page.screenshot({ path: path.join(process.env.SCREENSHOTS, `matches-${width}.png`) });
+        }
+        await page.locator('.mh-queues .chip[data-q="420"]').click();
+        await page.waitForSelector('.mh-row[data-mid="EUW1_123"]');
       } else if (tab === "draft") {
         await page.waitForSelector("#pick-out table");
         await page.locator("#pick-alpha").fill("0");
@@ -215,6 +238,9 @@ async function checkStates(browser) {
     await login.page.goto("http://rift.test/#/");
     await login.page.waitForSelector("#login-form");
     await noPageOverflow(login.page, "login 320");
+    assert.match(await login.page.locator("footer.legal").textContent(), /^Rift Odds isn't endorsed by Riot Games/, "Riot's legal notice is required on every page");
+    assert(await login.page.locator("footer.legal").isVisible());
+    if (process.env.SCREENSHOTS) await login.page.screenshot({ path: path.join(process.env.SCREENSHOTS, "login-320.png"), fullPage: true });
     await login.page.locator('[name="username"]').fill("member");
     await login.page.locator('[name="password"]').fill("password123");
     await login.page.locator("#login-form button").click();

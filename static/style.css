@@ -35,6 +35,8 @@
 body { margin: 0; background: var(--paper); min-height: 100vh; }
 a { color: inherit; }
 main { max-width: 1120px; margin: 0 auto; padding: 0 24px 96px; }
+.legal { max-width: 1120px; margin: 0 auto; padding: 18px 24px 32px; border-top: 1px solid var(--muted);
+         color: var(--muted); font-size: 12px; line-height: 1.5; }
 .muted { color: var(--muted); }
 .small { font-size: 12px; }
 .num, .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
@@ -112,6 +114,7 @@ b { font-weight: 600; }
 .pocket img { width: 40px; height: 40px; border-radius: var(--radius); }
 
 /* ---------- match history ---------- */
+.mh-note { margin: 10px 0 18px; }
 .mh-session { display: flex; align-items: baseline; gap: 12px; margin: 26px 0 10px; font: 800 16px/1 var(--display);
               text-transform: uppercase; letter-spacing: .05em; }
 .mh-session:first-child { margin-top: 0; }

@@ -130,15 +130,17 @@ def has_match(db, match_id):
     return db.execute("SELECT 1 FROM matches WHERE match_id=?", (match_id,)).fetchone() is not None
 
 
+def is_remake(info):
+    return info["gameDuration"] < 300 or any(p.get("gameEndedInEarlySurrender") for p in info["participants"])
+
+
 def save_match(db, platform, m):
     info = m["info"]
     mid = m["metadata"]["matchId"]
-    remake = int(info["gameDuration"] < 300 or any(
-        p.get("gameEndedInEarlySurrender") for p in info["participants"]))
     db.execute(
         "INSERT OR REPLACE INTO matches VALUES (?,?,?,?,?,?,?,?)",
         (mid, platform, info["queueId"], info["gameStartTimestamp"], info["gameDuration"],
-         ".".join(info["gameVersion"].split(".")[:2]), remake,
+         ".".join(info["gameVersion"].split(".")[:2]), int(is_remake(info)),
          zlib.compress(json.dumps(m).encode())),
     )
     for p in info["participants"]:
@@ -151,19 +153,19 @@ def save_match(db, platform, m):
              p["totalDamageDealtToChampions"], p["visionScore"],
              None if adv is None else int(adv)),
         )
-    for t in info["teams"]:
-        o = t["objectives"]
+    for t in info.get("teams", []):
+        o = t.get("objectives") or {}  # modes without Summoner's Rift objectives (e.g. Arena) may omit them
+        first = lambda key: int(bool((o.get(key) or {}).get("first")))
         db.execute(
             "INSERT OR REPLACE INTO teams VALUES (?,?,?,?,?,?,?)",
-            (mid, t["teamId"], int(t["win"]),
-             int(o["champion"]["first"]), int(o["tower"]["first"]),
-             int(o["dragon"]["first"]), int(o.get("riftHerald", {}).get("first", False))),
+            (mid, t["teamId"], int(bool(t.get("win"))),
+             first("champion"), first("tower"), first("dragon"), first("riftHerald")),
         )
     _save_bans(db, mid, info)
 
 
 def _save_bans(db, mid, info):
-    for t in info["teams"]:
+    for t in info.get("teams", []):
         for b in t.get("bans", []):
             if b["championId"] > 0:
                 db.execute("INSERT OR IGNORE INTO bans VALUES (?,?,?,?)",

@@ -196,7 +196,10 @@ class Riot:
                               allow_404=True)
 
     async def match_ids(self, platform, puuid, queue, count, start=0, start_time=None):
-        params = {"queue": queue, "start": start, "count": count}
+        """Newest-first match IDs; queue=None lists every queue."""
+        params = {"start": start, "count": count}
+        if queue is not None:
+            params["queue"] = queue
         if start_time:
             params["startTime"] = int(start_time)  # epoch seconds
         return await self.get(PLATFORMS[platform], f"/lol/match/v5/matches/by-puuid/{puuid}/ids", "match-ids", params)

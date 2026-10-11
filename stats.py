@@ -9,6 +9,8 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from statistics import NormalDist
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import store
 
@@ -43,33 +45,63 @@ def _snapshot(func):
 
 # --- probability helpers ------------------------------------------------------
 
+def _beta_cf(a, b, x):
+    """Continued fraction for the incomplete beta function (modified Lentz).
+
+    Converges in O(sqrt(max(a, b))) steps when x < (a + 1) / (a + b + 2)."""
+    tiny = 1e-300
+    c, d = 1.0, 1.0 - (a + b) * x / (a + 1)
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 10000):
+        delta = 1.0
+        for num in (m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m)),
+                    -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1))):
+            d = 1.0 + num * d
+            d = 1.0 / (d if abs(d) > tiny else tiny)
+            c = 1.0 + num / c
+            c = c if abs(c) > tiny else tiny
+            delta = d * c
+            h *= delta
+        if abs(delta - 1.0) < 1e-15:
+            break
+    return h
+
+
 def beta_sf(x, a, b):
-    """P(X > x) for X ~ Beta(a, b), integer a, b (exact via the binomial identity)."""
+    """P(X > x) for X ~ Beta(a, b): exact at any sample size (regularized incomplete beta)."""
     if x <= 0:
         return 1.0
     if x >= 1:
         return 0.0
-    if a + b > 400:  # normal approximation is excellent here and avoids huge sums
-        mean = a / (a + b)
-        sd = math.sqrt(a * b / ((a + b) ** 2 * (a + b + 1)))
-        return 0.5 * math.erfc((x - mean) / (sd * math.sqrt(2)))
-    n = a + b - 1
-    # P(X > x) = P(Binomial(n, x) <= a - 1), summed in log space
-    lx, l1x, lgn = math.log(x), math.log1p(-x), math.lgamma(n + 1)
-    return min(1.0, sum(
-        math.exp(lgn - math.lgamma(k + 1) - math.lgamma(n - k + 1) + k * lx + (n - k) * l1x)
-        for k in range(a)))
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+                     + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1) / (a + b + 2):
+        return 1.0 - front * _beta_cf(a, b, x) / a
+    return front * _beta_cf(b, a, 1.0 - x) / b  # the symmetric side, without cancellation
 
 
 def beta_quantile(q, a, b):
+    """x with P(X <= x) = q: Newton steps from a normal guess, kept inside a bisection bracket."""
+    mean = a / (a + b)
+    sd = math.sqrt(a * b / ((a + b) ** 2 * (a + b + 1)))
+    x = min(max(NormalDist(mean, sd).inv_cdf(q), 1e-12), 1 - 1e-12)
+    log_norm = math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
     lo, hi = 0.0, 1.0
-    for _ in range(40):
-        mid = (lo + hi) / 2
-        if 1 - beta_sf(mid, a, b) < q:
-            lo = mid
+    for _ in range(100):
+        cdf = 1.0 - beta_sf(x, a, b)
+        if cdf < q:
+            lo = x
         else:
-            hi = mid
-    return (lo + hi) / 2
+            hi = x
+        pdf = math.exp(log_norm + (a - 1) * math.log(x) + (b - 1) * math.log1p(-x))
+        nxt = x - (cdf - q) / pdf if pdf > 0 else lo
+        if not lo < nxt < hi:
+            nxt = (lo + hi) / 2
+        if abs(nxt - x) < 1e-12:
+            return nxt
+        x = nxt
+    return x
 
 
 def prob_greater(a1, b1, a2, b2, bins=500):
@@ -162,17 +194,6 @@ def _sessions(games):
     return sessions
 
 
-def session_index(games):
-    """match_id -> the session it belongs to (games < 30 min apart), with that session's record."""
-    out = {}
-    for i, session in enumerate(_sessions(games)):
-        info = {"id": i, "games": len(session), "wins": sum(g["win"] for g in session),
-                "start": session[0]["game_start"]}
-        for g in session:
-            out[g["match_id"]] = info
-    return out
-
-
 def _momentum(games):
     after_win, after_loss, after_2losses = [], [], []
     swap_after_win, swap_after_loss = [], []
@@ -223,8 +244,19 @@ def _lane_ahead(g):
     return None if g["lane_adv"] is None else bool(g["lane_adv"])
 
 
-def overview(games, tz_offset_min=0):
-    local = lambda g: datetime.fromtimestamp(g["game_start"] / 1000, timezone.utc) - timedelta(minutes=tz_offset_min)
+def local_zone(name=None, offset_min=0):
+    """The viewer's time zone: an IANA name follows daylight saving per game; else a fixed
+    offset in minutes behind UTC, as JavaScript's getTimezoneOffset() reports it."""
+    if name:
+        try:
+            return ZoneInfo(name)
+        except (ValueError, ZoneInfoNotFoundError):
+            pass
+    return timezone(-timedelta(minutes=offset_min))
+
+
+def overview(games, tz=timezone.utc):
+    local = lambda g: datetime.fromtimestamp(g["game_start"] / 1000, tz)
     by_role = defaultdict(list)
     for g in games:
         by_role[g["position"] or "UNKNOWN"].append(g)
@@ -340,9 +372,12 @@ def _patch_key(p):
     return tuple(int(x) for x in p.split(".") if x.isdigit())
 
 
-def latest_patch(db, queue=420):
+def latest_patch(db, queue=420, before=None):
+    """The newest patch with cached games (only patches older than `before`, if given)."""
     patches = [r[0] for r in db.execute(
         "SELECT DISTINCT patch FROM matches WHERE queue_id = ? AND remake = 0", (queue,))]
+    if before:
+        patches = [p for p in patches if _patch_key(p) < _patch_key(before)]
     return max(patches, key=_patch_key) if patches else None
 
 

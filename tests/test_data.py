@@ -1,9 +1,11 @@
 import asyncio
 import copy
+import math
 import sqlite3
 import tempfile
 import unittest
 from collections.abc import Callable, Sequence
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -170,6 +172,90 @@ class PickTests(unittest.TestCase):
                     self.assertRaisesRegex(ValueError, "finite and nonnegative"),
                 ):
                     stats.pick_probabilities(games, "TOP", alpha=alpha)
+
+
+def binomial_sf(x, a, b):
+    """Reference P(X > x) for X ~ Beta(a, b), integer a, b: P(Binomial(a + b - 1, x) <= a - 1)."""
+    n = a + b - 1
+    return sum(math.exp(math.lgamma(n + 1) - math.lgamma(k + 1) - math.lgamma(n - k + 1)
+                        + k * math.log(x) + (n - k) * math.log1p(-x)) for k in range(a))
+
+
+class ProbabilityTests(unittest.TestCase):
+    def test_beta_tail_matches_binomial_identity(self):
+        for a in (1, 2, 7, 30, 151, 401):
+            for b in (1, 3, 40, 249, 600):
+                for x in (0.001, 0.2, 0.5, 0.73, 0.999):
+                    with self.subTest(a=a, b=b, x=x):
+                        self.assertAlmostEqual(stats.beta_sf(x, a, b), binomial_sf(x, a, b), places=10)
+
+    def test_quantile_inverts_the_tail(self):
+        for a, b in ((1, 1), (2, 30), (6, 496), (151, 151), (5001, 4001)):
+            for q in (0.05, 0.5, 0.95):
+                with self.subTest(a=a, b=b, q=q):
+                    self.assertAlmostEqual(1 - stats.beta_sf(stats.beta_quantile(q, a, b), a, b), q, places=9)
+
+    def test_skewed_large_sample_interval_is_exact(self):
+        # 5 wins in 500 games: a normal approximation put the lower bound at 0.40%; the exact one is 0.52%
+        result = stats.winrate(5, 500)
+        self.assertAlmostEqual(binomial_sf(result["lo"], 6, 496), 0.95, places=8)
+        self.assertAlmostEqual(binomial_sf(result["hi"], 6, 496), 0.05, places=8)
+        self.assertAlmostEqual(result["lo"], 0.00523, places=5)
+
+    def test_probability_better_matches_exact_sum(self):
+        def exact(a1, b1, a2, b2):
+            log_b = lambda x, y: math.lgamma(x) + math.lgamma(y) - math.lgamma(x + y)
+            return sum(math.exp(math.lgamma(b1 + i) - math.lgamma(i + 1) - math.lgamma(b1)
+                                + log_b(a2 + i, b1 + b2) - log_b(a2, b2)) for i in range(a1))
+        for case in ((4, 3, 51, 51), (13, 9, 5001, 4801), (61, 41, 30001, 29001), (11, 2, 9001, 9001)):
+            with self.subTest(case=case):
+                self.assertAlmostEqual(stats.prob_greater(*case), exact(*case), places=3)
+
+
+class LocalTimeTests(unittest.TestCase):
+    @staticmethod
+    def game(utc):
+        return {"game_start": int(utc.timestamp() * 1000), "duration": 1800, "win": 1, "position": "MIDDLE",
+                "champion_id": 1, "first_blood": 0, "first_tower": 0, "first_dragon": 0, "deaths": 0,
+                "lane_adv": None, "match_id": utc.isoformat()}
+
+    def test_time_of_day_follows_daylight_saving_per_game(self):
+        # 17:30 in Oslo both times: 16:30 UTC in winter (CET), 15:30 UTC in summer (CEST)
+        games = [self.game(datetime(2026, 1, 20, 16, 30, tzinfo=timezone.utc)),
+                 self.game(datetime(2026, 7, 20, 15, 30, tzinfo=timezone.utc))]
+        buckets = {b["label"]: b["games"] for b in stats.overview(games, stats.local_zone("Europe/Oslo", -120))["time_of_day"]}
+        self.assertEqual(buckets["Afternoon 12–18"], 2)
+        # a summer offset alone would push the winter game to 18:30
+        fixed = {b["label"]: b["games"] for b in stats.overview(games, stats.local_zone(None, -120))["time_of_day"]}
+        self.assertEqual(fixed["Evening 18–24"], 1)
+
+    def test_unknown_zone_falls_back_to_offset(self):
+        self.assertEqual(stats.local_zone("Not/AZone", -60).utcoffset(None).total_seconds(), 3600)
+        self.assertEqual(stats.local_zone("../etc/passwd", 0).utcoffset(None).total_seconds(), 0)
+
+
+class PatchAndModeTests(unittest.TestCase):
+    def setUp(self):
+        self.db = fixture_db()
+        self.addCleanup(self.db.close)
+
+    def test_latest_patch_before(self):
+        for mid, patch in (("A", "16.9"), ("B", "16.10"), ("C", "16.11")):
+            self.db.execute("INSERT INTO matches VALUES (?, 'X', 420, 0, 0, ?, 0, NULL)", (mid, patch))
+        self.assertEqual(stats.latest_patch(self.db), "16.11")
+        self.assertEqual(stats.latest_patch(self.db, before="16.11"), "16.10")
+        self.assertIsNone(stats.latest_patch(self.db, before="16.9"))
+
+    def test_match_without_rift_objectives_is_saved(self):
+        match = match_fixture("ARENA_1")
+        match["info"].update(queueId=1700, teams=[])
+        store.save_match(self.db, "FIXTURE", match)
+        self.assertTrue(store.has_match(self.db, "ARENA_1"))
+        match = match_fixture("NO_OBJECTIVES")
+        for team in match["info"]["teams"]:
+            del team["objectives"]
+        store.save_match(self.db, "FIXTURE", match)
+        self.assertEqual(self.db.execute("SELECT SUM(first_tower) FROM teams WHERE match_id = 'NO_OBJECTIVES'").fetchone()[0], 0)
 
 
 class SnapshotTests(MemoryTests):

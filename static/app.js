@@ -9,12 +9,15 @@ const title = (s) => s[0] + s.slice(1).toLowerCase();
 const day = (ms) => new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 // Riot's API reports the internal version (16.20); players know it by the year-based name (26.20)
 const patchName = (v) => { const [major, minor] = String(v).split(".").map(Number); return major >= 15 && major < 20 ? `${major + 10}.${minor}` : v; };
-const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+const mmss = (secs) => { const s = Math.round(secs); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; };
+// the IANA zone lets the server bucket each game by the local time it was played (daylight saving included)
+const tzQuery = () => `tz=${new Date().getTimezoneOffset()}&tzname=${encodeURIComponent(Intl.DateTimeFormat().resolvedOptions().timeZone || "")}`;
+const ordinal = (n) => `${n}${{ 1: "st", 2: "nd", 3: "rd" }[n] || "th"}`;
 
 const ROLE_NAMES = { TOP: "Top", JUNGLE: "Jungle", MIDDLE: "Mid", BOTTOM: "Bot", UTILITY: "Support", UNKNOWN: "Unknown" };
 
 let META = null;
-const view = { landing: { tier: "", sort: "wr", role: "", all: false }, player: { tab: "champions", role: null } };
+const view = { landing: { tier: "", sort: "wr", role: "", all: false }, player: { tab: "champions", role: null, queue: "420" } };
 let PATCH = null;
 let DATA = null;
 let pollTimer = null;
@@ -120,7 +123,7 @@ function searchForm(cls) {
   return `<form class="search ${cls}">
     <input name="riot" aria-label="Riot ID" placeholder="Name#TAG" required autocomplete="off" value="${esc(last.riotId || "")}">
     <select name="platform" aria-label="Region">${META.platforms.map((p) => `<option ${p === (last.platform || "euw1") ? "selected" : ""}>${p}</option>`).join("")}</select>
-    <button class="btn" aria-label="Analyse player">${cls === "compact" ? "Go" : "Analyse"}</button></form>`;
+    <button class="btn" aria-label="Analyze player">${cls === "compact" ? "Go" : "Analyze"}</button></form>`;
 }
 
 function bindSearch(form) {
@@ -329,7 +332,7 @@ async function showPlayer(platform, riotId, range) {
   view.player.role = null;
   view.player.opp = "";
   view.player.liveForm = false;
-  view.player.matchesShown = 20;
+  view.player.mh = null;  // loaded match-history rows: { key, rows, next, total, error }
   view.player.open = new Set();
   const [name] = riotId.split("#");
   const label = META.ranges.find((r) => r.key === range)?.label.toLowerCase() || "recent games";
@@ -337,7 +340,7 @@ async function showPlayer(platform, riotId, range) {
     Looking up ${esc(name)} (${esc(label)}) — the newest games show in a few seconds, the rest fill in.</div>`;
   const token = nav;
   try {
-    const data = await api(`/api/player?platform=${platform}&riot_id=${encodeURIComponent(riotId)}&range=${range}&tz=${new Date().getTimezoneOffset()}`);
+    const data = await api(`/api/player?platform=${platform}&riot_id=${encodeURIComponent(riotId)}&range=${range}&${tzQuery()}`);
     if (token !== nav) return;
     DATA = data;
     renderPlayer();
@@ -379,7 +382,7 @@ function pollSync(puuid) {
 async function resumeSync() {
   const p = DATA.profile;
   const token = nav;
-  const data = await api(`/api/player?platform=${p.platform}&riot_id=${encodeURIComponent(`${p.name}#${p.tag}`)}&range=${view.player.range}&tz=${new Date().getTimezoneOffset()}`).catch(() => null);
+  const data = await api(`/api/player?platform=${p.platform}&riot_id=${encodeURIComponent(`${p.name}#${p.tag}`)}&range=${view.player.range}&${tzQuery()}`).catch(() => null);
   if (!data || token !== nav) return;
   DATA = data;
   renderPlayer();
@@ -391,7 +394,7 @@ document.addEventListener("visibilitychange", () => {
 
 async function refreshAnalysis() {
   const token = nav;
-  const data = await api(`/api/player/${DATA.puuid}/analysis?range=${view.player.range}&tz=${new Date().getTimezoneOffset()}`);
+  const data = await api(`/api/player/${DATA.puuid}/analysis?range=${view.player.range}&${tzQuery()}`);
   if (token !== nav) return;
   DATA = { ...data, live: DATA.live };  // the live flag only comes with the full lookup
   renderPlayer();
@@ -414,7 +417,7 @@ function renderSync() {
   const total = s.total ?? 0;
   const what = { listing: "Listing games", matches: "Games", timelines: "Timelines" }[s.phase] || "Working";
   const note = s.phase === "timelines" ? "Gold-lead stats fill in when it's done"
-    : `Stats below cover ${DATA.games_analysed} game${DATA.games_analysed === 1 ? "" : "s"} so far`;
+    : `Stats below cover ${DATA.games_analyzed} game${DATA.games_analyzed === 1 ? "" : "s"} so far`;
   const left = eta(s);
   el.innerHTML = `
     <div class="cell lead"><div class="label"><span class="live-dot"></span>Loading history</div><div class="sub">${note}</div></div>
@@ -456,13 +459,13 @@ function renderPlayer() {
       <div class="who">
         <div class="name ${(p.name + p.tag).length > 13 ? "long" : ""}">${esc(p.name)} <span>#${esc(p.tag)}</span></div>
         <div class="rank">${rankText}${season ? ` · season ${p.season_wins}W ${p.season_losses}L (${pct(p.season_wins / season)})` : ""} · ${p.platform}</div>
-        ${DATA.first_game ? `<div class="coverage">Analysing <b>${DATA.games_analysed}</b> games · ${day(DATA.first_game)} – ${day(DATA.last_game)}${
+        ${DATA.first_game ? `<div class="coverage">Analyzing <b>${DATA.games_analyzed}</b> games · ${day(DATA.first_game)} – ${day(DATA.last_game)}${
           DATA.overview ? ` · <b>${ROLE_NAMES[DATA.overview.roles[0].role] || ""}</b> main, plays like ${DATA.overview.roles[0].pool.effective_pool.toFixed(1)} champions` : ""}</div>` : ""}
       </div>
       <div class="actions">
         ${isMe ? `<span class="me-tag" title="Linked to your login">Your account</span><button class="btn ghost" id="unlink">Unlink</button>`
                : `<button class="btn ghost" id="link">This is me</button>`}
-        <select id="range" aria-label="Game range" title="Which ranked solo games to analyse">
+        <select id="range" aria-label="Game range" title="Which ranked solo games to analyze">
           <optgroup label="Games">${rangeOptions("count")}</optgroup>
           <optgroup label="Time">${rangeOptions("time")}</optgroup>
         </select>
@@ -560,7 +563,7 @@ function masteryText(champId) {
 // rank comparisons only once the rank sample can say something
 const MIN_RANK_GAMES = 20;
 const rankRate = (w, tier, min = MIN_RANK_GAMES) => (w.games >= min ? ` · ${tier} ${pct(w.wr)}` : "");
-const kpts = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
+const kpts = (n) => (n >= 999.5e3 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
 
 async function growSample() {
   const p = DATA.profile;
@@ -739,34 +742,71 @@ const ago = (ms) => {
 const golddiff = (n) => (n == null ? "–" : `${n > 0 ? "▲" : n < 0 ? "▼" : "="} ${Math.abs(n) >= 1000 ? `${(Math.abs(n) / 1000).toFixed(1)}k` : Math.abs(Math.round(n))}`);
 const sessionLabel = (ms) => new Date(ms).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
 
-async function tabMatches() {
-  const token = nav;
-  const puuid = DATA.puuid;
-  if (!$("#tab-body .mh")) $("#tab-body").innerHTML = `<div class="loading"><div class="spinner"></div>Loading matches…</div>`;
-  const res = await api(`/api/player/${puuid}/matches?range=${view.player.range}&limit=${view.player.matchesShown}`)
-    .catch((e) => ({ error: e.message }));
-  if (token !== nav || view.player.tab !== "matches" || DATA.puuid !== puuid) return;
-  renderMatches(res);
+const SOLO = "420";
+const MH_PAGE = 20;
+const SESSION_GAP_MS = 30 * 60 * 1000;
+
+// Ranked solo pages come from the synced range; other match types are listed from Riot page by page.
+async function fetchMatches(queue, offset, count) {
+  const out = { rows: [], next: offset, total: null, error: null };
+  while (out.next != null && out.next - offset < count) {
+    const limit = Math.min(100, count - (out.next - offset));
+    const res = await api(`/api/player/${DATA.puuid}/matches?range=${view.player.range}&queue=${queue}&offset=${out.next}&limit=${limit}`);
+    out.rows.push(...res.rows);
+    Object.assign(out, { next: res.next, total: res.total, error: res.error });
+  }
+  return out;
 }
 
-function renderMatches(res) {
-  const el = $("#tab-body");
-  if (res.error) { el.innerHTML = `<div class="card empty"><p class="error">${esc(res.error)}</p></div>`; return; }
-  if (!res.rows.length) { el.innerHTML = `<div class="card empty"><h2>No games in this range yet</h2></div>`; return; }
-  let html = `<div class="mh">`;
-  let session = null;
-  for (const g of res.rows) {
-    if (g.session.id !== session) {  // a header for each run of games played less than 30 min apart
-      session = g.session.id;
-      const s = g.session;
-      html += `<div class="mh-session">Session · ${sessionLabel(s.start)}<span>${s.games} game${s.games > 1 ? "s" : ""} · ${s.wins}W ${s.games - s.wins}L</span></div>`;
-    }
-    const kda = g.deaths ? ((g.kills + g.assists) / g.deaths).toFixed(1) : "Perfect";
-    const open = view.player.open.has(g.match_id);
-    html += `<button class="mh-row ${g.win ? "win" : "loss"} ${open ? "open" : ""}" data-mid="${g.match_id}" aria-expanded="${open}">
+async function tabMatches() {
+  const token = nav;
+  const { puuid } = DATA;
+  const { queue, range } = view.player;
+  const key = `${puuid}|${range}|${queue}`;
+  const loaded = view.player.mh?.key === key ? view.player.mh : null;
+  renderMatches({ loading: !loaded });
+  // only the ranked solo sync adds games while the profile is open: other types keep what's loaded
+  if (loaded && queue !== SOLO) return;
+  const res = await fetchMatches(queue, 0, Math.max(MH_PAGE, loaded?.rows.length || 0)).catch((e) => ({ rows: [], next: null, error: e.message }));
+  if (token !== nav || view.player.tab !== "matches" || DATA.puuid !== puuid || `${puuid}|${view.player.range}|${view.player.queue}` !== key) return;
+  view.player.mh = { key, ...res };
+  renderMatches();
+}
+
+async function moreMatches(button) {
+  const token = nav;
+  const mh = view.player.mh;
+  button.disabled = true;
+  button.textContent = "Loading…";
+  const res = await fetchMatches(view.player.queue, mh.next, MH_PAGE).catch((e) => ({ rows: [], next: mh.next, error: e.message }));
+  if (token !== nav || view.player.mh !== mh || view.player.tab !== "matches") return;
+  const seen = new Set(mh.rows.map((g) => g.match_id));
+  Object.assign(mh, { rows: [...mh.rows, ...res.rows.filter((g) => !seen.has(g.match_id))], next: res.next,
+    total: res.total ?? mh.total, error: res.error });
+  renderMatches();
+}
+
+// games less than 30 min apart form a session; rows are newest first
+function sessionsOf(rows) {
+  const out = [];
+  for (const g of rows) {
+    const s = out.at(-1);
+    if (s && s.start - (g.game_start + g.duration * 1000) <= SESSION_GAP_MS) s.games.push(g);
+    else out.push({ games: [g] });
+    out.at(-1).start = g.game_start;
+  }
+  return out;
+}
+
+function matchRow(g, queue) {
+  const kda = g.deaths ? ((g.kills + g.assists) / g.deaths).toFixed(1) : "Perfect";
+  const open = view.player.open.has(g.match_id);
+  const sub = [queue === "all" && esc(g.queue), g.placement ? `${ordinal(g.placement)} place` : ROLE_NAMES[g.position],
+    queue !== "all" && g.level && `lvl ${g.level}`].filter(Boolean).join(" · ") || "–";
+  return `<button class="mh-row ${g.win ? "win" : "loss"} ${open ? "open" : ""}" data-mid="${g.match_id}" aria-expanded="${open}">
       <span class="mh-res">${g.win ? "W" : "L"}</span>
       <span class="mh-champ">${icon(g.champion_id)}<span class="spells">${g.spells.map(spellIcon).join("")}</span>
-        <span><b>${esc(champ(g.champion_id).name)}</b><small>${ROLE_NAMES[g.position] || "–"}${g.level ? ` · lvl ${g.level}` : ""}</small></span></span>
+        <span><b>${esc(champ(g.champion_id).name)}</b><small>${sub}</small></span></span>
       <span class="mh-vs">${g.opp_champ ? `<small>vs</small>${icon(g.opp_champ)}` : ""}</span>
       <span class="mh-stat mh-kda"><b>${g.kills} / ${g.deaths} / ${g.assists}</b><small>${kda}${g.deaths ? " KDA" : ""}${g.kill_participation != null ? ` · ${pct(g.kill_participation)} KP` : ""}</small></span>
       <span class="mh-stat mh-cs"><b>${g.cs} CS</b><small>${(g.cs / (g.duration / 60)).toFixed(1)} / min</small></span>
@@ -775,12 +815,41 @@ function renderMatches(res) {
       <span class="mh-stat mh-when right"><b>${mmss(g.duration)}</b><small>${ago(g.game_start)}</small></span>
     </button>
     <div class="mh-detail" id="d-${g.match_id}" ${open ? "" : "hidden"}></div>`;
+}
+
+function renderMatches({ loading = false } = {}) {
+  const el = $("#tab-body");
+  const { queue } = view.player;
+  const types = [{ key: "all", label: "All" }, ...META.queues];
+  const label = types.find((t) => t.key === queue)?.label || "";
+  const chips = `<div class="chips mh-queues" role="group" aria-label="Match type">${types.map((t) => `<button class="chip ${t.key === queue ? "active" : ""}"
+      data-q="${t.key}" aria-pressed="${t.key === queue}">${esc(t.label)}</button>`).join("")}</div>
+    <p class="muted small mh-note">${queue === SOLO ? `Ranked solo games in the selected range — the games behind the stats.`
+      : "Newest games first, fetched from Riot a page at a time. The range only applies to ranked solo."}</p>`;
+  const mh = view.player.mh;
+  let body;
+  if (loading || !mh) body = `<div class="loading"><div class="spinner"></div>Loading ${queue === "all" ? "" : `${esc(label)} `}matches…</div>`;
+  else if (!mh.rows.length) {
+    body = mh.error && mh.next == null ? `<div class="card empty"><p class="error">${esc(mh.error)}</p></div>`
+      : `<div class="card empty"><h2>No ${queue === "all" ? "" : `${esc(label)} `}games ${queue === SOLO ? "in this range " : ""}yet</h2></div>`;
+  } else {
+    body = `${mh.error ? `<p class="error small">${esc(mh.error)}</p>` : ""}<div class="mh">${sessionsOf(mh.rows).map((s) => {
+      const wins = s.games.filter((g) => g.win).length;
+      return `<div class="mh-session">Session · ${sessionLabel(s.start)}<span>${s.games.length} game${s.games.length > 1 ? "s" : ""} · ${wins}W ${s.games.length - wins}L</span></div>
+        ${s.games.map((g) => matchRow(g, queue)).join("")}`;
+    }).join("")}</div>`;
+    if (mh.next != null) {
+      body += `<div class="table-foot"><button class="btn ghost" id="mh-more">Show more${mh.total != null ? ` (${mh.rows.length} of ${mh.total})` : ""}</button></div>`;
+    }
   }
-  html += `</div>`;
-  if (res.total > res.rows.length) html += `<div class="table-foot"><button class="btn ghost" id="mh-more">Show more (${res.rows.length} of ${res.total})</button></div>`;
-  el.innerHTML = html;
-  $$(".mh-row").forEach((b) => b.addEventListener("click", () => toggleMatch(b)));
-  $("#mh-more")?.addEventListener("click", () => { view.player.matchesShown += 20; tabMatches(); });
+  el.innerHTML = chips + body;
+  $$(".mh-queues .chip", el).forEach((b) => b.addEventListener("click", () => {
+    if (b.dataset.q === view.player.queue) return;
+    view.player.queue = b.dataset.q;
+    tabMatches();
+  }));
+  $$(".mh-row", el).forEach((b) => b.addEventListener("click", () => toggleMatch(b)));
+  $("#mh-more")?.addEventListener("click", (e) => moreMatches(e.currentTarget));
   view.player.open.forEach((mid) => loadMatchDetail(mid));
 }
 
@@ -802,8 +871,11 @@ async function loadMatchDetail(mid) {
   if (m.error) { el.innerHTML = `<p class="error">${esc(m.error)}</p>`; return; }
   el.dataset.loaded = "1";
   const maxDmg = Math.max(...m.teams.flatMap((t) => t.players.map((p) => p.damage)), 1);
-  el.innerHTML = m.teams.map((t) => `<div class="mh-team ${t.team_id === 100 ? "blue" : "red"}">
-    <div class="mh-team-head"><b>${t.win ? "Victory" : "Defeat"}</b><span>${t.team_id === 100 ? "Blue" : "Red"} side · ${t.kills} kills · ${t.towers} towers · ${t.dragons} dragons · ${t.barons} barons${t.gold15 != null ? ` · ${kpts(t.gold15)} gold at 15` : ""}</span>
+  const sides = { 100: ["blue", "Blue side"], 200: ["red", "Red side"] };  // Arena teams have no side
+  el.innerHTML = m.teams.map((t) => `<div class="mh-team ${sides[t.team_id]?.[0] || ""}">
+    <div class="mh-team-head"><b>${t.placement ? `${ordinal(t.placement)} place` : t.win ? "Victory" : "Defeat"}</b><span>${[sides[t.team_id]?.[1], `${t.kills} kills`,
+      t.towers != null && `${t.towers} towers`, t.dragons != null && `${t.dragons} dragons`, t.barons != null && `${t.barons} barons`,
+      t.gold15 != null && `${kpts(t.gold15)} gold at 15`].filter(Boolean).join(" · ")}</span>
       <span class="bans" title="Bans">${t.bans.map(icon).join("")}</span></div>
     <table><thead><tr><th>Player</th><th class="num">KDA</th><th class="num">CS</th><th>Damage</th><th class="num">Gold @15</th><th>Items</th></tr></thead>
     <tbody>${t.players.map((p) => `<tr class="${p.puuid === DATA.puuid ? "me" : ""}">
