@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Rift Odds: a percent sign — the wordmark's rose slash between two peach dots, on indigo -->
+  <rect width="64" height="64" rx="12" fill="#41436a"/>
+  <path d="M22 51 L42 13" stroke="#F64668" stroke-width="9" stroke-linecap="round"/>
+  <circle cx="19" cy="20" r="7.5" fill="#FE9677"/>
+  <circle cx="45" cy="44" r="7.5" fill="#FE9677"/>
+</svg>

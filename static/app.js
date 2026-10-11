@@ -6,16 +6,21 @@ const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&
 const pct = (x, d = 0) => (x == null ? "–" : `${(x * 100).toFixed(d)}%`);
 const pts = (x) => (x == null ? "–" : `${x > 0 ? "+" : ""}${(x * 100).toFixed(0)} pts`);
 const title = (s) => s[0] + s.slice(1).toLowerCase();
+const day = (ms) => new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
 const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
 
 const ROLE_NAMES = { TOP: "Top", JUNGLE: "Jungle", MIDDLE: "Mid", BOTTOM: "Bot", UTILITY: "Support", UNKNOWN: "Unknown" };
-const COUNTS = [20, 40, 70, 100];
 
 let META = null;
 const view = { landing: { tier: "", sort: "wr", role: "", all: false }, player: { tab: "champions", role: null } };
 let PATCH = null;
 let DATA = null;
 let pollTimer = null;
+let ME = null; // { username, account }
+let nav = 0;    // bumped on every route; async renders bail out if it changed
+
+const playerHash = (platform, riotId, range) => `#/p/${platform}/${encodeURIComponent(riotId)}/${range}`;
+const myHash = () => ME?.account && playerHash(ME.account.platform, `${ME.account.game_name}#${ME.account.tag_line}`, view.player.range || META.default_range);
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
@@ -116,21 +121,22 @@ function bindSearch(form) {
     const platform = form.platform.value;
     if (!riotId.includes("#")) { form.riot.setCustomValidity("Use the full Riot ID, e.g. Name#EUW"); form.riot.reportValidity(); return; }
     localStorage.setItem("last", JSON.stringify({ riotId, platform }));
-    location.hash = `#/p/${platform}/${encodeURIComponent(riotId)}/${view.player.count || 40}`;
+    location.hash = playerHash(platform, riotId, view.player.range || META.default_range);
   });
   form.riot.addEventListener("input", () => form.riot.setCustomValidity(""));
 }
 
 // ---------------------------------------------------------------- router
 async function route() {
+  nav++;
   clearInterval(pollTimer);
-  const m = (location.hash.slice(1) || "/").match(/^\/p\/([^/]+)\/([^/]+)(?:\/(\d+))?/);
+  const m = (location.hash.slice(1) || "/").match(/^\/p\/([^/]+)\/([^/]+)(?:\/(\w+))?/);
   const top = $("#top-search");
   top.hidden = !m;
   if (m) {
     top.outerHTML = searchForm("compact").replace("<form", '<form id="top-search"');
     bindSearch($("#top-search"));
-    showPlayer(m[1], decodeURIComponent(m[2]), +(m[3] || 40));
+    showPlayer(m[1], decodeURIComponent(m[2]), m[3] || META.default_range);
   } else {
     showLanding();
   }
@@ -145,19 +151,21 @@ async function showLanding() {
       <h1>What are<br>the <em>odds?</em></h1>
       <div class="side">
         <p class="lede">Look up a player to see how they pick, tilt and win. Or read the board below: what decides games on this patch.</p>
+        ${ME?.account ? `<a class="btn mine" href="${myHash()}">Open my profile · ${esc(ME.account.game_name)}#${esc(ME.account.tag_line)}</a>` : ""}
       </div>
       ${searchForm("big")}
     </section>
     <div id="patch-body"><div class="loading"><div class="spinner"></div>Loading patch stats…</div></div>`;
   bindSearch($(".search.big"));
+  const token = nav;
   await loadPatch();
-  pollTimer = setInterval(loadPatch, 30000);
+  if (token === nav) pollTimer = setInterval(loadPatch, 30000);
 }
 
 async function loadPatch() {
   try {
     PATCH = await api(`/api/patch${view.landing.tier ? `?tier=${view.landing.tier}` : ""}`);
-    renderPatch();
+    if ($("#patch-body")) renderPatch();
   } catch (e) {
     $("#patch-body").innerHTML = `<div class="card empty error">${esc(e.message)}</div>`;
   }
@@ -165,7 +173,8 @@ async function loadPatch() {
 
 function samplerLine(s) {
   if (!s || s.status === "off") return `<div class="sampler"><span class="dotlive off"></span>Background sampler is off (SAMPLER=0).</div>`;
-  const label = { sampling: `Sampling ${s.tier ? title(s.tier) : ""} games on ${s.platform}`, idle: "Sample complete for this patch",
+  const label = { sampling: s.tier ? `Sampling ${title(s.tier)} games on ${s.platform}` : "Fetching timelines for sampled games",
+    idle: "Sample complete for this patch", paused: "Paused while a player's history is fetched",
     error: "Sampler hit an error — retrying", "key rejected": "Sampler paused — Riot API key rejected" }[s.status] || s.status;
   return `<div class="sampler"><span class="dotlive ${s.status === "sampling" ? "" : "off"}"></span>${label}
     ${s.target ? `· ${s.matches ?? 0} / ${s.target} games ${bar((s.matches || 0) / s.target)}` : ""}</div>`;
@@ -178,7 +187,7 @@ function renderPatch() {
   if (!P.matches) {
     $("#patch-body").innerHTML = `<div class="card empty"><h2>No games sampled yet${L.tier ? ` for ${title(L.tier)}` : ""}</h2>
       <p>The background sampler pulls recent ranked games from random players in every tier.
-      Stats appear here as games come in (about 20–25 per minute with a development key).</p></div>${samplerLine(P.sampler)}`;
+      Stats appear here as games come in; how fast depends on your API key's rate limit.</p></div>${samplerLine(P.sampler)}`;
     return;
   }
   const totalByTier = Object.fromEntries(P.tiers.map((t) => [t.tier, t.matches]));
@@ -238,6 +247,7 @@ function renderPatch() {
       </table>
       ${rows.length > 15 ? `<div class="table-foot"><button class="btn ghost" id="show-all">${L.all ? "Show top 15" : `Show all ${rows.length}`}</button></div>` : ""}
     </div>
+    ${leadCard(P.leads)}
     ${samplerLine(P.sampler)}`;
 
   const chipGroup = (sel, key, refetch) => $$(`${sel} .chip`).forEach((b) => b.addEventListener("click", () => {
@@ -251,57 +261,198 @@ function renderPatch() {
   $("#show-all")?.addEventListener("click", () => { L.all = !L.all; renderPatch(); });
 }
 
+function leadCard(leads) {
+  if (!leads || !leads.games) return "";
+  return `<div class="card section">
+    <div class="card-head"><div><h2>How safe is a lead at 15?</h2>
+      <p>P(win | team gold difference at 15:00), from ${leads.games.toLocaleString()} games with timelines.</p></div></div>
+    <table><thead><tr><th>Gold at 15</th><th>How often</th><th>Win rate</th><th class="num"></th><th class="num">Fair odds</th></tr></thead>
+    <tbody>${leads.curve.map((b) => `<tr><td><b>${b.label}</b></td>
+      <td style="width:22%">${barCell(b.share ?? 0, pct(b.share))}</td>
+      <td style="width:34%" title="${esc(wrTip(b))}">${bar(b.wr ?? 0, { tick: 0.5, thick: true })}</td>
+      <td class="num"><b>${pct(b.wr, 1)}</b></td>
+      <td class="num muted">${b.wr ? `@ ${(1 / b.wr).toFixed(2)}` : "–"}</td></tr>`).join("")}</tbody></table>
+    ${legend([["sq", "background:var(--mag)", "Share of teams / win rate"], ["line", "background:var(--ink)", "50%"]])}
+  </div>`;
+}
+
 // ---------------------------------------------------------------- player
-async function showPlayer(platform, riotId, count) {
-  view.player.count = count;
+async function showPlayer(platform, riotId, range) {
+  view.player.range = range;
   view.player.role = null;
+  view.player.opp = "";
+  view.player.liveForm = false;
   const [name] = riotId.split("#");
+  const label = META.ranges.find((r) => r.key === range)?.label.toLowerCase() || "recent games";
   $("#app").innerHTML = `<div class="loading"><div class="spinner"></div>
-    Fetching ${esc(name)}'s last ${count} ranked games… the first load can take a minute with a development key.</div>`;
+    Looking up ${esc(name)} (${esc(label)}) — the newest games show in a few seconds, the rest fill in.</div>`;
+  const token = nav;
   try {
-    const tz = new Date().getTimezoneOffset();
-    DATA = await api(`/api/player?platform=${platform}&riot_id=${encodeURIComponent(riotId)}&count=${count}&tz=${tz}`);
+    const data = await api(`/api/player?platform=${platform}&riot_id=${encodeURIComponent(riotId)}&range=${range}&tz=${new Date().getTimezoneOffset()}`);
+    if (token !== nav) return;
+    DATA = data;
     renderPlayer();
+    if (DATA.sync?.running) pollSync(DATA.puuid);
   } catch (e) {
+    if (token !== nav) return;
     $("#app").innerHTML = `<div class="card empty section"><h2 class="error">Couldn't load ${esc(riotId)}</h2><p>${esc(e.message)}</p></div>`;
   }
 }
 
+// The first response only waits a few seconds; the sync keeps going in the background.
+// Poll its progress and re-render as games arrive (every quarter of the way, min. 10 games),
+// once more when matches are done (timelines follow), and at the end.
+function pollSync(puuid) {
+  clearInterval(pollTimer);
+  let shown = { phase: DATA.sync?.phase, done: DATA.sync?.done ?? 0 };
+  pollTimer = setInterval(async () => {
+    if (DATA?.puuid !== puuid) return clearInterval(pollTimer);
+    const sync = await api(`/api/sync/${puuid}`).catch(() => null);
+    if (!sync || DATA?.puuid !== puuid) return;
+    DATA.sync = sync;
+    if (!sync.running) {
+      clearInterval(pollTimer);
+      return sync.phase === "paused" ? resumeSync() : refreshAnalysis();
+    }
+    const busy = document.activeElement?.closest?.("#app select, #app input");  // don't yank an open control
+    const matchesDone = shown.phase === "matches" && sync.phase !== "matches";
+    const grew = sync.phase === "matches" && sync.done - (shown.phase === "matches" ? shown.done : 0) >= Math.max(10, Math.ceil(sync.total / 4));
+    if (!busy && (matchesDone || grew)) {
+      shown = { phase: sync.phase, done: sync.done };
+      return refreshAnalysis();
+    }
+    if (sync.phase !== shown.phase && !matchesDone) shown = { phase: sync.phase, done: 0 };
+    renderSync();
+  }, 2500);
+}
+
+// A sync stops when nobody polls it for a few minutes (e.g. a background tab). Pick it back up.
+async function resumeSync() {
+  const p = DATA.profile;
+  const token = nav;
+  const data = await api(`/api/player?platform=${p.platform}&riot_id=${encodeURIComponent(`${p.name}#${p.tag}`)}&range=${view.player.range}&tz=${new Date().getTimezoneOffset()}`).catch(() => null);
+  if (!data || token !== nav) return;
+  DATA = data;
+  renderPlayer();
+  if (DATA.sync?.running) pollSync(DATA.puuid);
+}
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && DATA?.sync?.phase === "paused" && !DATA.sync.running && location.hash.startsWith("#/p/")) resumeSync();
+});
+
+async function refreshAnalysis() {
+  const token = nav;
+  const data = await api(`/api/player/${DATA.puuid}/analysis?range=${view.player.range}&tz=${new Date().getTimezoneOffset()}`);
+  if (token !== nav) return;
+  DATA = { ...data, live: DATA.live };  // the live flag only comes with the full lookup
+  renderPlayer();
+}
+
+function renderSync() {
+  const el = $("#sync");
+  const s = DATA.sync;
+  if (!el) return;
+  if (!s || (!s.running && !s.error)) { el.hidden = true; return; }
+  el.hidden = false;
+  if (s.error) {
+    el.innerHTML = `<span class="error">History fetch stopped: ${esc(s.error)}</span>`;
+    return;
+  }
+  const total = s.total ?? 0;
+  const what = { listing: "Listing games…", matches: `Games ${s.done} / ${total}`, timelines: `Timelines ${s.done} / ${total}` }[s.phase] || "";
+  const note = s.phase === "timelines" ? "gold-lead stats fill in when it's done" : `stats below cover ${DATA.games_analysed} games so far`;
+  el.innerHTML = `<div class="sync-text"><b>Fetching history</b> · ${what}${eta(s)}
+      <span class="muted">— ${note}.</span></div>
+    ${bar(total ? s.done / total : 0, { thick: true })}
+    <button class="btn ghost" id="sync-now">Update now</button>`;
+  $("#sync-now").addEventListener("click", refreshAnalysis);
+}
+
+// rough time left from the last ~30 s of progress in the current phase
+const etaSamples = [];
+function eta(s) {
+  const now = Date.now();
+  if (etaSamples.length && (etaSamples.at(-1).phase !== s.phase || etaSamples.at(-1).done > s.done)) etaSamples.length = 0;
+  etaSamples.push({ t: now, done: s.done, phase: s.phase });
+  while (etaSamples.length > 2 && now - etaSamples[0].t > 30000) etaSamples.shift();
+  const first = etaSamples[0];
+  const rate = (s.done - first.done) / ((now - first.t) / 1000);
+  if (!s.total || !(rate > 0)) return "";
+  const secs = (s.total - s.done) / rate;
+  return ` · about ${secs < 90 ? `${Math.max(5, Math.round(secs / 5) * 5)} s` : `${Math.round(secs / 60)} min`} left`;
+}
+
+function rangeOptions(kind) {
+  return META.ranges.filter((r) => r.kind === kind)
+    .map((r) => `<option value="${r.key}" ${r.key === view.player.range ? "selected" : ""}>${esc(r.label)}</option>`).join("");
+}
+
 function renderPlayer() {
   const p = DATA.profile;
+  const isMe = ME?.account?.puuid === DATA.puuid;
   const rankText = p.tier === "UNRANKED" ? "<b>Unranked</b>" : `<b>${title(p.tier)} ${p.division}</b> · ${p.lp} LP`;
   const season = p.season_wins + p.season_losses;
   $("#app").innerHTML = `
     <section class="player-head">
-      <div class="badge">${p.tier === "UNRANKED" ? "–" : p.tier[0]}</div>
+      ${p.icon ? `<div class="avatar"><img src="${p.icon}" alt="">${p.level ? `<span class="lvl">${p.level}</span>` : ""}</div>`
+               : `<div class="badge">${p.tier === "UNRANKED" ? "–" : p.tier[0]}</div>`}
       <div class="who">
-        <div class="name">${esc(p.name)} <span>#${esc(p.tag)}</span></div>
+        <div class="name ${(p.name + p.tag).length > 13 ? "long" : ""}">${esc(p.name)} <span>#${esc(p.tag)}</span></div>
         <div class="rank">${rankText}${season ? ` · season ${p.season_wins}W ${p.season_losses}L (${pct(p.season_wins / season)})` : ""} · ${p.platform}</div>
+        ${DATA.first_game ? `<div class="coverage">Analysing <b>${DATA.games_analysed}</b> games · ${day(DATA.first_game)} – ${day(DATA.last_game)}${
+          DATA.overview ? ` · <b>${ROLE_NAMES[DATA.overview.roles[0].role] || ""}</b> main, plays like ${DATA.overview.roles[0].pool.effective_pool.toFixed(1)} champions` : ""}</div>` : ""}
       </div>
       <div class="actions">
-        <select id="count" title="Ranked solo games to analyse">${COUNTS.map((c) => `<option value="${c}" ${c === view.player.count ? "selected" : ""}>Last ${c} games</option>`).join("")}</select>
+        ${isMe ? `<span class="me-tag" title="Linked to your login">Your account</span><button class="btn ghost" id="unlink">Unlink</button>`
+               : `<button class="btn ghost" id="link">This is me</button>`}
+        <select id="range" title="Which ranked solo games to analyse">
+          <optgroup label="Games">${rangeOptions("count")}</optgroup>
+          <optgroup label="Time">${rangeOptions("time")}</optgroup>
+        </select>
         <button class="btn ghost" id="refresh">Refresh</button>
       </div>
     </section>
+    ${DATA.live ? `<button class="live-banner" id="live-banner"><span class="live-dot"></span><b>Live now</b> · ${esc(DATA.live.queue)}
+        ${DATA.live.champion_id ? `· ${icon(DATA.live.champion_id)} ${esc(champ(DATA.live.champion_id).name)}` : ""}
+        ${DATA.live.started ? `· ${Math.max(0, Math.round((Date.now() - DATA.live.started) / 60000))} min in` : "· loading in"}
+        <span class="go">See all ten players →</span></button>` : ""}
+    <div class="sync card" id="sync" hidden></div>
     <div id="player-body"></div>`;
-  $("#count").addEventListener("change", (e) => { location.hash = `#/p/${p.platform}/${encodeURIComponent(`${p.name}#${p.tag}`)}/${e.target.value}`; });
+  $("#live-banner")?.addEventListener("click", () => { view.player.tab = "live"; renderPlayer(); });
+  $("#range").addEventListener("change", (e) => { location.hash = playerHash(p.platform, `${p.name}#${p.tag}`, e.target.value); });
   $("#refresh").addEventListener("click", route);
+  $("#link")?.addEventListener("click", async () => {
+    ME.account = await api("/api/me/account", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ puuid: DATA.puuid }) });
+    renderUser();
+    renderPlayer();
+  });
+  $("#unlink")?.addEventListener("click", async () => {
+    await api("/api/me/account", { method: "DELETE" });
+    ME.account = null;
+    renderUser();
+    renderPlayer();
+  });
+  renderSync();
 
   if (!DATA.overview) {
-    $("#player-body").innerHTML = `<div class="card empty"><h2>No ranked solo games in this window</h2><p>Try a larger game count.</p></div>`;
+    $("#player-body").innerHTML = DATA.sync?.running
+      ? `<div class="loading"><div class="spinner"></div>Waiting for the first games to arrive…</div>`
+      : `<div class="card empty"><h2>No ranked solo games in this range</h2><p>Try a longer range.</p></div>`;
     return;
   }
   const o = DATA.overview;
   const m = o.momentum;
-  const main = o.roles[0];
+  const cb = DATA.leads.comeback;
   const tilt = m.after_win.games && m.after_loss.games ? m.after_win.wr - m.after_loss.wr : null;
   const best = DATA.vs_rank.rows.filter((r) => r.p_better != null && r.player.games >= 3).sort((a, b) => b.p_better - a.p_better)[0];
-  const tabs = [["champions", "Champions"], ["draft", "Draft"], ["habits", "Habits"], ["wincons", "Win conditions"]];
+  const tabs = [...(DATA.live ? [["live", "Live game"]] : []), ["champions", "Champions"], ["draft", "Draft"], ["habits", "Habits"], ["wincons", "Win conditions"]];
+  if (view.player.tab === "live" && !DATA.live) view.player.tab = "champions";
 
   $("#player-body").innerHTML = `
     <div class="tiles">
-      ${tile(`Win rate · last ${o.record.games}`, pct(o.record.wr), `90% likely true win rate ${pct(o.record.lo)}–${pct(o.record.hi)}`, "indigo")}
-      ${tile("Main role", `${ROLE_NAMES[main.role] || main.role}`, `${pct(main.share)} of games · plays like ${main.pool.effective_pool.toFixed(1)} champions`, "peach")}
+      ${tile(`Win rate · ${o.record.games} games`, pct(o.record.wr), `90% likely true win rate ${pct(o.record.lo)}–${pct(o.record.hi)}`, "indigo")}
+      ${cb.you.games ? tile("Comeback rate", pct(cb.you.wr), `wins when 1k+ gold behind at 15 (${cb.you.games} games)${rankRate(cb.rank, title(p.tier))}`, "peach")
+                     : tile("Comeback rate", "–", DATA.sync?.running ? "Timelines are still being fetched" : "No games 1k+ behind at 15", "peach")}
       ${tile("Tilt swing", pts(tilt), tilt == null ? "Not enough back-to-back games" : `win rate after a win vs after a loss`, "plum")}
       ${best ? tile(`Best vs ${p.tier === "UNRANKED" ? "rank" : title(p.tier)}`, `${icon(best.champion_id)}<span class="sm">${esc(champ(best.champion_id).name)}</span>`,
         `${pts(best.delta)} vs rank · ${pct(best.p_better)} sure you're better`) : tile("Best vs rank", "–", "Not enough data yet")}
@@ -317,7 +468,8 @@ function renderPlayer() {
 }
 
 function renderTab() {
-  ({ champions: tabChampions, draft: tabDraft, habits: tabHabits, wincons: tabWincons })[view.player.tab]();
+  clearInterval(livePoll);
+  ({ live: tabLive, champions: tabChampions, draft: tabDraft, habits: tabHabits, wincons: tabWincons })[view.player.tab]();
 }
 
 function tabChampions() {
@@ -329,8 +481,8 @@ function tabChampions() {
       <p>${tier} win rates come from ${v.sample_matches} cached ${tier} games (excluding you). P(better) is the chance your true win rate beats the rank's.</p></div>
       ${v.tier === "UNRANKED" ? "" : `<button class="btn ghost" id="grow">Sample more ${tier} games</button>`}</div>
     ${WR_LEGEND(`${tier} average`)}
-    <table><thead><tr><th>Champion</th><th class="num">Games</th><th>Win rate</th><th class="num">You</th><th class="num">${tier}</th><th>Difference</th><th class="num">P(better)</th></tr></thead>
-    <tbody>${v.rows.map((r) => `<tr><td>${champCell(r.champion_id)}</td><td class="num">${r.player.games}</td>
+    <table><thead><tr><th>Champion</th><th class="num">Mastery</th><th class="num">Games</th><th>Win rate</th><th class="num">You</th><th class="num">${tier}</th><th>Difference</th><th class="num">P(better)</th></tr></thead>
+    <tbody>${v.rows.map((r) => `<tr><td>${champCell(r.champion_id)}</td><td class="num">${masteryText(r.champion_id)}</td><td class="num">${r.player.games}</td>
       <td style="width:26%">${wrBar(r.player, r.baseline)}</td>
       <td class="num" title="${esc(wrTip(r.player))}">${pct(r.player.wr)}</td>
       <td class="num" title="${esc(wrTip(r.baseline))}">${r.baseline.games ? `${pct(r.baseline.wr)} <span class="muted small">${r.baseline.games}</span>` : `<span class="muted">no data</span>`}</td>
@@ -339,6 +491,15 @@ function tabChampions() {
     <p id="grow-status" class="muted small"></p></div>`;
   $("#grow")?.addEventListener("click", growSample);
 }
+
+function masteryText(champId) {
+  const m = DATA.mastery.by_champion[champId];
+  return m ? `${kpts(m.points)} <span class="muted small">M${m.level}</span>` : `<span class="muted">–</span>`;
+}
+// rank comparisons only once the rank sample can say something
+const MIN_RANK_GAMES = 20;
+const rankRate = (w, tier, min = MIN_RANK_GAMES) => (w.games >= min ? ` · ${tier} ${pct(w.wr)}` : "");
+const kpts = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
 
 async function growSample() {
   const p = DATA.profile;
@@ -368,29 +529,37 @@ function tabDraft() {
       <div class="controls">
         <label for="pick-opp">Lane opponent</label><select id="pick-opp"><option value="">Any opponent</option></select>
         <label for="pick-alpha" title="How strongly to lean on the overall role picks when there are few games vs this opponent">Smoothing <span style="text-transform:none">α</span></label>
-        <input id="pick-alpha" type="number" min="0" max="50" step="1" value="5" style="width:72px">
+        <input id="pick-alpha" type="number" min="0" max="50" step="1" value="${view.player.alpha ?? 5}" style="width:72px">
       </div>
       <div id="pick-out"><div class="loading"><div class="spinner"></div></div></div>
-    </div>`;
-  $$(".role-card").forEach((b) => b.addEventListener("click", () => { view.player.role = b.dataset.role; tabDraft(); }));
-  $("#pick-opp").addEventListener("change", updatePick);
-  $("#pick-alpha").addEventListener("change", updatePick);
+    </div>
+    ${DATA.mastery.pockets.length ? `<div class="card section">
+      <div class="card-head"><div><h2>Pocket picks</h2><p>High mastery, but not played in this range. Not in the predictor above — but they know these.</p></div></div>
+      <div class="pockets">${DATA.mastery.pockets.map((m) => `<div class="pocket">${icon(m.champion_id)}<div><b>${esc(champ(m.champion_id).name)}</b>
+        <div class="muted small">${kpts(m.points)} pts · M${m.level} · last played ${day(m.last_play)}</div></div></div>`).join("")}</div>
+    </div>` : ""}`;
+  $$(".role-card").forEach((b) => b.addEventListener("click", () => { view.player.role = b.dataset.role; view.player.opp = ""; tabDraft(); }));
+  $("#pick-opp").addEventListener("change", (e) => { view.player.opp = e.target.value; updatePick(); });
+  $("#pick-alpha").addEventListener("change", (e) => { view.player.alpha = e.target.value; updatePick(); });
   fillOpponents();
 }
 
 function fetchPick() {
-  const q = new URLSearchParams({ puuid: DATA.puuid, role: view.player.role, alpha: $("#pick-alpha").value || 0, match_ids: DATA.match_ids.join(",") });
+  const q = new URLSearchParams({ puuid: DATA.puuid, role: view.player.role, alpha: $("#pick-alpha").value || 0, range: view.player.range });
   if ($("#pick-opp").value) q.set("opp", $("#pick-opp").value);
   return api(`/api/pick?${q}`);
 }
 
 async function fillOpponents() {
+  const opp = view.player.opp;
+  $("#pick-opp").innerHTML = opp ? `<option value="${opp}" selected></option>` : "";  // so the first fetch keeps it
   const res = await fetchPick();
   const seen = new Set(res.opponents.map((o) => o.champion_id));
   const all = Object.entries(META.champions).sort((a, b) => a[1].name.localeCompare(b[1].name));
   $("#pick-opp").innerHTML = `<option value="">Any opponent</option>
     <optgroup label="Faced in this role">${res.opponents.map((o) => `<option value="${o.champion_id}">${esc(champ(o.champion_id).name)} (${o.games})</option>`).join("")}</optgroup>
     <optgroup label="All champions">${all.filter(([id]) => !seen.has(+id)).map(([id, c]) => `<option value="${id}">${esc(c.name)}</option>`).join("")}</optgroup>`;
+  $("#pick-opp").value = opp;
   renderPick(res);
 }
 
@@ -448,17 +617,100 @@ function tabWincons() {
       <td class="num" title="${esc(wrTip(r.yes))}">${wrText(r.yes)}</td>
       <td class="num" title="${esc(wrTip(r.no))}">${wrText(r.no)}</td>
       <td style="width:34%"><div class="barcell">${dbar(r.swing, maxAbs)}<span class="v delta">${r.swing == null ? "–" : pts(r.swing).replace(" pts", "")}</span></div></td></tr>`).join("")}
-    </tbody></table></div>`;
+    </tbody></table></div>
+    ${playerLeadCard()}`;
+}
+
+function playerLeadCard() {
+  const L = DATA.leads;
+  const tier = DATA.profile.tier === "UNRANKED" ? "Rank" : title(DATA.profile.tier);
+  if (!L.games_with_timeline) {
+    return `<div class="card section empty"><h2>Gold leads at 15</h2><p>${DATA.sync?.running ? "Timelines are still being fetched — this fills in when they're done."
+      : "No timelines for these games yet."}</p></div>`;
+  }
+  const lane = L.lane;
+  return `<div class="card section">
+    <div class="card-head"><div><h2>How safe are your leads?</h2>
+      <p>P(win | your team's gold difference at 15:00), across ${L.games_with_timeline} of your games${L.rank_games >= MIN_RANK_GAMES
+        ? `, against ${L.rank_games.toLocaleString()} ${tier} games` : `. The ${tier} comparison appears once the sampler has ${MIN_RANK_GAMES}+ ${tier} games with timelines (${L.rank_games} so far)`}.</p></div></div>
+    <div class="tiles" style="margin-bottom:18px">
+      ${tile("Comeback rate", pct(L.comeback.you.wr), `wins when 1k+ behind (${L.comeback.you.games} games)${rankRate(L.comeback.rank, tier)}`)}
+      ${tile("Close-out rate", pct(L.close_out.you.wr), `wins when 1k+ ahead (${L.close_out.you.games} games)${rankRate(L.close_out.rank, tier)}`)}
+      ${tile("Lane lead at 15", pct(lane.ahead_share), `ahead of the lane opponent · average ${lane.avg_diff == null ? "–" : `${lane.avg_diff > 0 ? "+" : ""}${Math.round(lane.avg_diff)} gold`}`)}
+    </div>
+    ${WR_LEGEND(`${tier} average`)}
+    <table><thead><tr><th>Gold at 15</th><th class="num">How often</th><th>Win rate</th><th class="num">You</th><th class="num">${tier}</th></tr></thead>
+    <tbody>${L.curve.map((b) => `<tr><td><b>${b.label}</b></td><td class="num">${pct(b.share)}</td>
+      <td style="width:38%">${wrBar(b.you, b.rank.games >= 10 ? b.rank : null)}</td>
+      <td class="num" title="${esc(wrTip(b.you))}">${wrText(b.you)}</td>
+      <td class="num" title="${esc(wrTip(b.rank))}">${b.rank.games >= 10 ? `${pct(b.rank.wr)} <span class="muted small">${b.rank.games}</span>` : "–"}</td></tr>`).join("")}</tbody></table>
+  </div>`;
+}
+
+// ---------------------------------------------------------------- live game
+let livePoll = null;
+
+async function tabLive() {
+  $("#tab-body").innerHTML = `<div class="loading"><div class="spinner"></div>Loading the live game…</div>`;
+  const token = nav;
+  const puuid = DATA.puuid;
+  const load = async () => {
+    const live = await api(`/api/live/${puuid}?form=${view.player.liveForm ? 1 : 0}`).catch((e) => ({ error: e.message }));
+    if (token !== nav || view.player.tab !== "live" || DATA.puuid !== puuid) return clearInterval(livePoll);
+    renderLive(live);
+    if (live.error || !live.in_game || !live.pending) clearInterval(livePoll);
+  };
+  await load();
+  clearInterval(livePoll);
+  livePoll = setInterval(load, 5000);
+}
+
+function renderLive(live) {
+  const el = $("#tab-body");
+  if (!el) return;
+  if (live.error) { el.innerHTML = `<div class="card empty"><p class="error">${esc(live.error)}</p></div>`; return; }
+  if (!live.in_game) { el.innerHTML = `<div class="card empty"><h2>Not in a game anymore</h2><p>The game has ended — refresh to include it.</p></div>`; return; }
+  const team = (id) => live.players.filter((p) => p.team === id);
+  const bans = (id) => live.bans.filter((b) => b.team === id).map((b) => icon(b.champion_id)).join("");
+  const rankText = (p) => p.tier === "UNRANKED" ? `<span class="muted">Unranked</span>` : `${title(p.tier)} ${p.division} <span class="muted small">${p.lp} LP</span>`;
+  const side = (id, name) => `<div class="card live-team ${id === 100 ? "blue" : "red"}">
+    <div class="card-head"><h2>${name}</h2><div class="bans" title="Bans">${bans(id)}</div></div>
+    <table><thead><tr><th>Player</th><th>Rank</th><th class="num">Mastery</th><th class="num">Form · last ${live.form_games}</th><th class="num">On this champ</th></tr></thead>
+    <tbody>${team(id).map((p) => p.hidden
+      ? `<tr><td>${champCell(p.champion_id, "Hidden player")}</td><td colspan="4" class="muted small">Hides their identity in live games</td></tr>`
+      : `<tr class="${p.is_me ? "me" : ""}">
+      <td>${champCell(p.champion_id, esc(p.riot_id))}</td>
+      <td>${rankText(p)}</td>
+      <td class="num">${p.mastery_points == null ? "–" : `${kpts(p.mastery_points)} <span class="muted small">M${p.mastery_level}</span>`}</td>
+      <td class="num" title="${esc(wrTip(p.form))}">${p.loading && !p.form.games ? `<span class="muted">loading…</span>` : p.cached_games ? wrText(p.form) : `<span class="muted">not loaded</span>`}</td>
+      <td class="num" title="${esc(wrTip(p.on_champ))}">${p.on_champ.games ? wrText(p.on_champ)
+        : p.loading ? `<span class="muted">loading…</span>` : p.cached_games ? `<span class="muted">none in ${p.cached_games}</span>` : "–"}</td></tr>`).join("")}</tbody></table>
+  </div>`;
+  el.innerHTML = `<div class="callout"><b>${esc(live.queue)}</b>${live.started ? ` · ${Math.round((Date.now() - live.started) / 60000)} min in` : " · loading in"}.
+      Form and champion records come from each player's cached ranked solo games${live.pending ? ` — <b>still fetching for ${live.pending} player${live.pending > 1 ? "s" : ""}</b>, this updates by itself` : ""}.
+      ${live.without_history && !live.pending ? `<button class="btn ghost" id="live-form">Load recent form for ${live.without_history} player${live.without_history > 1 ? "s" : ""}</button>
+        <span class="muted small">≈${live.without_history * (live.form_games + 1)} API requests</span>` : ""}</div>
+    ${side(100, "Blue side")}${side(200, "Red side")}`;
+  $("#live-form")?.addEventListener("click", () => { view.player.liveForm = true; tabLive(); });
 }
 
 // ---------------------------------------------------------------- boot
+function renderUser() {
+  $("#user").hidden = false;
+  $("#username").textContent = ME.username;
+  const mine = $("#my-profile");
+  mine.hidden = !ME.account;
+  if (ME.account) mine.href = myHash();
+}
+
 async function start() {
   try {
-    const me = await api("/api/me");
+    ME = await api("/api/me");
     META = await api("/api/meta");
-    $("#user").hidden = false;
-    $("#username").textContent = me.username;
-    route();
+    renderUser();
+    // a fresh visit with a linked account goes straight to it; "#/" still shows the patch page
+    if (!location.hash && ME.account) location.hash = myHash();
+    else route();
   } catch {
     // api() already showed the login view on 401
   }

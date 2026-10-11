@@ -50,6 +50,44 @@ b { font-weight: 600; }
 .search.compact:not([hidden]) + .user { margin-left: 0; }
 .user .btn { padding: 6px 12px; font-size: 15px; }
 
+.user a.btn { text-decoration: none; padding: 6px 12px; font-size: 15px; }
+
+/* ---------- history sync + account link ---------- */
+.card.sync { display: grid; grid-template-columns: 1fr minmax(120px, 260px) auto; gap: 16px; align-items: center;
+        margin-bottom: 16px; background: var(--peach-wash); border-color: var(--peach); padding: 12px 16px; }
+.sync .sync-text { font-size: 13px; }
+.player-head .name.long { font-size: clamp(36px, 5vw, 60px); }
+.player-head .coverage { margin-top: 4px; font-size: 13px; color: var(--muted); }
+.player-head .coverage b { color: var(--ink); }
+@media (max-width: 760px) { .card.sync { grid-template-columns: 1fr; } }
+.me-tag { font: 800 14px/1 var(--display); text-transform: uppercase; letter-spacing: .06em; background: var(--ink);
+          color: var(--peach); border-radius: var(--radius); padding: 8px 10px; align-self: center; }
+.player-head .actions { flex-wrap: wrap; justify-content: flex-end; }
+.hero .btn.mine { background: transparent; border-color: var(--peach); color: var(--peach); text-decoration: none;
+                  display: inline-block; margin-top: 16px; }
+.hero .btn.mine:hover { background: var(--peach); color: var(--ink); }
+
+/* ---------- player extras ---------- */
+.avatar { position: relative; width: 84px; height: 84px; flex: none; }
+.avatar img { width: 100%; height: 100%; border-radius: var(--radius); border: 3px solid var(--ink); display: block; }
+.avatar .lvl { position: absolute; left: 50%; bottom: -10px; transform: translateX(-50%); background: var(--ink); color: var(--peach);
+               font: 800 13px/1 var(--display); padding: 4px 7px; border-radius: var(--radius); }
+.live-banner { display: flex; align-items: center; gap: 8px; width: 100%; margin-bottom: 16px; padding: 12px 16px; cursor: pointer;
+               background: var(--ink); color: #fff; border: 0; border-radius: var(--radius); font: inherit; font-size: 15px; text-align: left; }
+.live-banner img { width: 24px; height: 24px; border-radius: var(--radius); vertical-align: middle; }
+.live-banner .go { margin-left: auto; font: 800 16px/1 var(--display); text-transform: uppercase; letter-spacing: .04em; color: var(--peach); }
+.live-banner:hover { background: var(--plum); }
+.live-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--rose); animation: pulse 1.2s ease-in-out infinite; }
+.live-team.blue { border-top: 6px solid #5b5fa8; }
+.live-team + .live-team { margin-top: 20px; }
+.live-team.red { border-top: 6px solid var(--rose); }
+.live-team .bans img { width: 24px; height: 24px; border-radius: var(--radius); margin-left: 4px; filter: grayscale(1); opacity: .7; }
+.live-team tr.me td { background: var(--peach-wash); }
+.live-team td:first-child .role { max-width: 150px; overflow: hidden; text-overflow: ellipsis; display: inline-block; }
+.pockets { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; }
+.pocket { display: flex; gap: 10px; align-items: center; }
+.pocket img { width: 40px; height: 40px; border-radius: var(--radius); }
+
 /* ---------- login ---------- */
 .login { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 380px); gap: 40px; align-items: end; padding-top: 72px; }
 .login h1 em { color: var(--rose); }
@@ -233,6 +271,7 @@ td.rank { font: 900 22px/1 var(--display); color: var(--plum); width: 36px; }
 
 .callout { background: var(--peach); border-radius: var(--radius); padding: 12px 16px; margin-bottom: 18px; }
 .callout .muted { color: var(--ink); opacity: .75; }
+.callout .btn { margin: 10px 8px 0 0; padding: 6px 12px; font-size: 15px; }
 .controls { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 16px; }
 .controls label { font: 800 14px/1 var(--display); text-transform: uppercase; letter-spacing: .06em; }
 

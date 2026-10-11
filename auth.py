@@ -33,6 +33,10 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
     token_hash TEXT PRIMARY KEY, username TEXT NOT NULL, expires INTEGER
 );
+-- the Riot account a user has marked as "this is me"
+CREATE TABLE IF NOT EXISTS accounts (
+    username TEXT PRIMARY KEY, platform TEXT, game_name TEXT, tag_line TEXT, puuid TEXT
+);
 """
 
 
@@ -103,6 +107,31 @@ def logout(token):
         db.commit()
 
 
+# --- linked Riot account -----------------------------------------------------
+
+def get_account(username):
+    row = connect().execute("SELECT platform, game_name, tag_line, puuid FROM accounts WHERE username = ?",
+                            (username,)).fetchone()
+    return dict(zip(("platform", "game_name", "tag_line", "puuid"), row)) if row else None
+
+
+def set_account(username, platform, game_name, tag_line, puuid):
+    db = connect()
+    db.execute("INSERT OR REPLACE INTO accounts VALUES (?, ?, ?, ?, ?)", (username, platform, game_name, tag_line, puuid))
+    db.commit()
+
+
+def all_accounts():
+    return [dict(zip(("username", "platform", "game_name", "tag_line", "puuid"), r))
+            for r in connect().execute("SELECT username, platform, game_name, tag_line, puuid FROM accounts")]
+
+
+def clear_account(username):
+    db = connect()
+    db.execute("DELETE FROM accounts WHERE username = ?", (username,))
+    db.commit()
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def _ask_password():
@@ -139,6 +168,7 @@ def main(argv):
             sys.exit(f"No user {name}.")
         db.execute("DELETE FROM users WHERE username = ?", (name,))
         db.execute("DELETE FROM sessions WHERE username = ?", (name,))
+        db.execute("DELETE FROM accounts WHERE username = ?", (name,))
         db.commit()
         print(f"Removed {name}.")
     else:

@@ -5,11 +5,29 @@ l losses, the true win rate ~ Beta(1 + w, 1 + l). That gives honest credible
 intervals and lets us say "P(this player is better than their rank on X)".
 """
 import math
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 
 ROLES = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 SESSION_GAP_MS = 30 * 60 * 1000  # a new "session" starts after 30 min idle
+
+
+# --- small TTL memo for rank-wide aggregates ------------------------------------
+# The lead curve scans every cached timeline in a tier; it barely moves minute to minute,
+# and a loading profile re-requests its stats several times. Cache it briefly. Only cache
+# values that are later *filtered* per player, never ones that get subtracted from.
+_memo = {}
+MEMO_TTL = 300
+
+
+def _memoized(key, compute):
+    hit = _memo.get(key)
+    if hit and time.time() - hit[0] < MEMO_TTL:
+        return hit[1]
+    value = compute()
+    _memo[key] = (time.time(), value)
+    return value
 
 
 # --- probability helpers ------------------------------------------------------
@@ -64,8 +82,9 @@ def prob_greater(a1, b1, a2, b2, bins=500):
 
 def winrate(wins, games, ci=0.9):
     """Observed WR plus a central credible interval from Beta(1+w, 1+l)."""
-    if games == 0:
+    if games <= 0:
         return {"games": 0, "wins": 0, "wr": None, "lo": None, "hi": None}
+    wins = min(max(wins, 0), games)
     a, b = 1 + wins, 1 + games - wins
     tail = (1 - ci) / 2
     return {"games": games, "wins": wins, "wr": wins / games,
@@ -175,6 +194,13 @@ def _conditional(games, label, pred):
     return {"label": label, "yes": wr_of(yes), "no": wr_of(no)}
 
 
+def _lane_ahead(g):
+    """Ahead of the lane opponent in gold at 15 (timeline), else Riot's coarse laning flag."""
+    if g.get("lane_diff15") is not None:
+        return g["lane_diff15"] > 0
+    return None if g["lane_adv"] is None else bool(g["lane_adv"])
+
+
 def overview(games, tz_offset_min=0):
     local = lambda g: datetime.fromtimestamp(g["game_start"] / 1000, timezone.utc) - timedelta(minutes=tz_offset_min)
     by_role = defaultdict(list)
@@ -198,7 +224,7 @@ def overview(games, tz_offset_min=0):
             _conditional(games, "Your team took first blood", lambda g: bool(g["first_blood"])),
             _conditional(games, "Your team took first tower", lambda g: bool(g["first_tower"])),
             _conditional(games, "Your team took first dragon", lambda g: bool(g["first_dragon"])),
-            _conditional(games, "You were ahead after laning", lambda g: None if g["lane_adv"] is None else bool(g["lane_adv"])),
+            _conditional(games, "You were ahead in lane at 15", _lane_ahead),
             _conditional(games, "You died 4 times or fewer", lambda g: g["deaths"] <= 4),
         ],
     }
@@ -244,6 +270,8 @@ def pick_probabilities(games, role, opp=None, alpha=5.0):
 
 def champions_vs_rank(db, games, puuid, tier, queue=420):
     """Player WR per champion vs. everyone else's WR on it in matches tagged with `tier`."""
+    # computed fresh: the player's own games arrive while their profile loads, so a cached
+    # total minus their current rows would go out of sync (and negative)
     base = {
         r["champion_id"]: (r["games"], r["wins"])
         for r in db.execute(
@@ -348,4 +376,115 @@ def patch_overview(db, patch, tier=None, queue=420):
         "blue_side": winrate(blue_wins or 0, blue_games),
         "objectives": objectives,
         "champions": champions,
+    }
+
+
+# --- gold leads at 15 (from timelines) -----------------------------------------
+
+LEAD_MINUTE = 15
+LEAD_BUCKETS = [  # team gold difference at 15:00
+    ("Behind 3k+", lambda d: d <= -3000),
+    ("Behind 1–3k", lambda d: -3000 < d <= -1000),
+    ("Even (±1k)", lambda d: -1000 < d < 1000),
+    ("Ahead 1–3k", lambda d: 1000 <= d < 3000),
+    ("Ahead 3k+", lambda d: d >= 3000),
+]
+
+
+def attach_gold(db, games, puuid):
+    """Add team_diff15 / lane_diff15 (player's team minus enemy, player minus lane opponent)."""
+    rows = db.execute(
+        """SELECT f.match_id, p.puuid, p.team_id, p.position, f.gold
+           FROM frames f JOIN participants p ON p.match_id = f.match_id AND p.puuid = f.puuid
+           WHERE f.minute = ? AND f.match_id IN (SELECT match_id FROM participants WHERE puuid = ?)""",
+        (LEAD_MINUTE, puuid)).fetchall()
+    by_match = defaultdict(list)
+    for mid, who, team, pos, gold in rows:
+        by_match[mid].append((who, team, pos, gold))
+    for g in games:
+        g["team_diff15"] = g["lane_diff15"] = None
+        ps = by_match.get(g["match_id"])
+        if not ps or len(ps) < 10:
+            continue
+        g["team_diff15"] = sum(gold if team == g["team_id"] else -gold for _, team, _, gold in ps)
+        mine = next((gold for who, *_ , gold in ps if who == puuid), None)
+        opp = next((gold for _, team, pos, gold in ps if team != g["team_id"] and pos == g["position"] and pos), None)
+        if mine is not None and opp is not None:
+            g["lane_diff15"] = mine - opp
+    return games
+
+
+def _team_leads(db, where, args):
+    """(match_id, gold diff at 15, win) for every team in matches matching `where` (alias m = matches)."""
+    return db.execute(
+        f"""WITH tg AS (
+              SELECT f.match_id, p.team_id, SUM(f.gold) AS gold, MAX(p.win) AS win, COUNT(*) AS n
+              FROM frames f
+              JOIN participants p ON p.match_id = f.match_id AND p.puuid = f.puuid
+              JOIN matches m ON m.match_id = f.match_id
+              WHERE f.minute = {LEAD_MINUTE} AND m.remake = 0 AND {where}
+              GROUP BY f.match_id, p.team_id)
+            SELECT a.match_id, a.gold - b.gold, a.win FROM tg a
+            JOIN tg b ON a.match_id = b.match_id AND a.team_id != b.team_id
+            WHERE a.n = 5 AND b.n = 5""", args).fetchall()
+
+
+def lead_curve(rows):
+    """P(win | gold-lead bucket at 15) and how often each bucket happens."""
+    n = len(rows)
+    out = []
+    for label, test in LEAD_BUCKETS:
+        hits = [w for d, w in rows if test(d)]
+        out.append({"label": label, "share": len(hits) / n if n else None, **winrate(sum(hits), len(hits))})
+    return out
+
+
+def player_leads(db, games, puuid, tier, queue=420):
+    """The player's lead-to-win curve vs their rank, plus comeback / close-out rates and laning."""
+    mine = [(g["team_diff15"], g["win"]) for g in games if g.get("team_diff15") is not None]
+    tier_rows = _memoized(("leads", tier, queue), lambda: _team_leads(
+        db, "m.queue_id = ? AND m.match_id IN (SELECT match_id FROM match_tier WHERE tier = ?)", (queue, tier)))
+    own_matches = {r[0] for r in db.execute("SELECT match_id FROM participants WHERE puuid = ?", (puuid,))}
+    rank = [(d, w) for mid, d, w in tier_rows if mid not in own_matches]
+    you, base = lead_curve(mine), lead_curve(rank)
+    rate = lambda rows, test: winrate(sum(w for d, w in rows if test(d)), sum(1 for d, _ in rows if test(d)))
+    behind, ahead = (lambda d: d <= -1000), (lambda d: d >= 1000)
+    lane = [g["lane_diff15"] for g in games if g.get("lane_diff15") is not None]
+    return {
+        "games_with_timeline": len(mine),
+        "rank_games": len(rank) // 2,
+        "curve": [{"label": y["label"], "share": y["share"], "you": {k: y[k] for k in ("games", "wins", "wr", "lo", "hi")},
+                   "rank": {k: b[k] for k in ("games", "wins", "wr", "lo", "hi")}} for y, b in zip(you, base)],
+        "comeback": {"you": rate(mine, behind), "rank": rate(rank, behind)},   # win when behind 1k+
+        "close_out": {"you": rate(mine, ahead), "rank": rate(rank, ahead)},    # win when ahead 1k+
+        "lane": {
+            "games": len(lane),
+            "ahead_share": sum(1 for d in lane if d > 0) / len(lane) if lane else None,
+            "avg_diff": sum(lane) / len(lane) if lane else None,
+        },
+    }
+
+
+def patch_lead_curve(db, patch, tier=None, queue=420):
+    where, args = "m.patch = ? AND m.queue_id = ?", [patch, queue]
+    if tier:
+        where += " AND m.match_id IN (SELECT match_id FROM match_tier WHERE tier = ?)"
+        args.append(tier)
+    rows = [(d, w) for _, d, w in _team_leads(db, where, args)]
+    return {"games": len(rows) // 2, "curve": lead_curve(rows)}
+
+
+# --- mastery --------------------------------------------------------------------
+
+def mastery(db, puuid, games, pockets=6):
+    """Mastery per champion, plus high-mastery champions not played in `games` ("pocket picks")."""
+    rows = db.execute("SELECT champion_id, level, points, last_play FROM mastery WHERE puuid = ? ORDER BY points DESC",
+                      (puuid,)).fetchall()
+    played = {g["champion_id"] for g in games}
+    by_champ = {c: {"level": lv, "points": pts, "last_play": lp} for c, lv, pts, lp in rows}
+    return {
+        "by_champion": by_champ,
+        "total_points": sum(r[2] for r in rows),
+        "pockets": [{"champion_id": c, "level": lv, "points": pts, "last_play": lp}
+                    for c, lv, pts, lp in rows if c not in played][:pockets],
     }
