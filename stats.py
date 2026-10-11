@@ -166,7 +166,7 @@ def player_games(db, puuid, queue=420):
 
 # --- overview -----------------------------------------------------------------
 
-SERIES_FIELDS = ("game_start", "win", "champion_id", "kills", "deaths", "assists", "cs", "gold", "damage",
+SERIES_FIELDS = ("match_id", "game_start", "win", "champion_id", "position", "kills", "deaths", "assists", "cs", "gold", "damage",
                  "vision", "duration", "team_kills", "lane_diff15", "team_diff15")
 
 

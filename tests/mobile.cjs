@@ -34,7 +34,7 @@ const leads = {
 };
 // 30 games for the form chart; every 4th has no timeline (no lane gold)
 const series = Array.from({ length: 30 }, (_, i) => ({
-  game_start: now - (30 - i) * 7200000, win: i % 3 !== 0, champion_id: (i % 3) + 1, kills: 3 + (i % 5), deaths: 1 + (i % 4),
+  match_id: `EUW1_${200 + i}`, position: "MIDDLE", game_start: now - (30 - i) * 7200000, win: i % 3 !== 0, champion_id: (i % 3) + 1, kills: 3 + (i % 5), deaths: 1 + (i % 4),
   assists: 5 + (i % 6), cs: 180 + i * 2, gold: 11000 + i * 50, damage: 20000 + i * 300, vision: 18 + (i % 7),
   duration: 1800 + (i % 5) * 60, team_kills: 25, lane_diff15: i % 4 === 0 ? null : i % 2 ? 600 : -400, team_diff15: null,
 }));
@@ -213,6 +213,30 @@ async function checkWidth(browser, width) {
     await noPageOverflow(page, `chart table ${width}`);
     await page.locator("#trend-view").click();
     await page.waitForSelector("#trend svg");
+
+    // clicking a game folds out its details: beside the chart on wide screens, below it on narrow ones
+    const before = await page.locator("#trend-plot").evaluate((el) => el.clientWidth);
+    await hover(0.5);
+    await page.mouse.down();
+    await page.mouse.up();
+    await page.waitForSelector("#trend-body.open #tg-more .tg-team");
+    await page.waitForTimeout(700);  // let the panel finish sliding
+    assert.equal(await page.locator('#trend-game [data-keys="lane"]').getAttribute("class"), "tg-stat current", "The charted stat is highlighted");
+    assert.equal(await page.locator("#trend .sel-dot").count(), 1, "The open game is marked in the chart");
+    const after = await page.locator("#trend-plot").evaluate((el) => el.clientWidth);
+    if (width >= 1000) assert(after < before - 300, `The chart should make room for the panel (${before}px -> ${after}px)`);
+    else assert.equal(after, before, "On narrow screens the panel opens below the chart");
+    await noPageOverflow(page, `game panel ${width}`);
+    if (process.env.SCREENSHOTS && [375, 1280].includes(width)) {
+      await page.locator("#trend").screenshot({ path: path.join(process.env.SCREENSHOTS, `trend-open-${width}.png`) });
+    }
+    await page.locator("#tg-close").click();
+    await page.waitForFunction(() => !document.querySelector("#trend-body").classList.contains("open"));
+    assert.equal(await page.locator("#trend .sel-dot").count(), 0);
+    await page.keyboard.press("Enter");  // focus went back to the chart: Enter opens the game under the cursor
+    await page.waitForSelector("#trend-body.open");
+    await page.keyboard.press("Escape");
+    await page.waitForFunction(() => !document.querySelector("#trend-body").classList.contains("open"));
     if (process.env.SCREENSHOTS && [375, 1280].includes(width)) {
       await page.locator('.trend-stats .chip[data-stat="cs"]').click();
       await page.waitForTimeout(1400);

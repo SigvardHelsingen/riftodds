@@ -336,6 +336,7 @@ async function showPlayer(platform, riotId, range) {
   view.player.opp = "";
   view.player.liveForm = false;
   view.player.mh = null;  // loaded match-history rows: { key, rows, next, total, error }
+  view.player.trendGame = null;  // match_id of the game open beside the form chart
   view.player.open = new Set();
   const [name] = riotId.split("#");
   const label = META.ranges.find((r) => r.key === range)?.label.toLowerCase() || "recent games";
@@ -782,22 +783,31 @@ function renderTrend() {
   if (!el) return;
   const stat = trendStat();
   const table = !!view.player.trendTable;
+  const open = !!view.player.trendGame;
   el.innerHTML = `
     <div class="card-head"><div><h2>Form over time</h2>
-      <p>Every ranked solo game in the range, oldest to newest. The line is the average of the last ${ROLL} games.</p></div>
+      <p>Every ranked solo game in the range, oldest to newest. The line is the average of the last ${ROLL} games.
+        Click a game to open it.</p></div>
       <button class="btn ghost" id="trend-view" aria-pressed="${table}">${table ? "Show chart" : "Show table"}</button></div>
     <div class="chips trend-stats" role="group" aria-label="Statistic">${TREND_STATS.map((st) => `<button class="chip ${st === stat ? "active" : ""}"
       data-stat="${st.key}" aria-pressed="${st === stat}">${st.label}</button>`).join("")}</div>
-    <div class="trend-figures" id="trend-figures"></div>
-    <div class="trend-plot" id="trend-plot"></div>
-    ${table ? "" : legend([["", "background:var(--pos)", "Win"], ["ring", "", "Loss"], ["stroke", "background:var(--mag)", `${ROLL}-game average`]])}`;
+    <div class="trend-body ${open ? "open" : ""}" id="trend-body">
+      <div class="trend-main">
+        <div class="trend-figures" id="trend-figures"></div>
+        <div class="trend-plot" id="trend-plot"></div>
+        ${table ? "" : legend([["", "background:var(--pos)", "Win"], ["ring", "", "Loss"], ["stroke", "background:var(--mag)", `${ROLL}-game average`]])}
+      </div>
+      <aside class="trend-game" id="trend-game" aria-label="Selected game" ${open ? "" : "inert"}><div class="trend-game-inner" id="trend-game-inner"></div></aside>
+    </div>`;
   $$(".trend-stats .chip", el).forEach((b) => b.addEventListener("click", () => {
     view.player.trendStat = b.dataset.stat;
     $$(".trend-stats .chip", el).forEach((x) => { x.classList.toggle("active", x === b); x.setAttribute("aria-pressed", x === b); });
     drawTrend();
+    markTrendStat();
   }));
   $("#trend-view").addEventListener("click", () => { view.player.trendTable = !table; trendDrawn = ""; renderTrend(); });
   drawTrend();
+  if (open) renderTrendGame();
 }
 
 function drawTrend() {
@@ -810,6 +820,7 @@ function drawTrend() {
   trendDrawn = key;
   trendResize?.disconnect();
   trendFigures(stat, pts, animate);
+  plot.redraw = null;
   if (pts.length < 2) {
     plot.innerHTML = `<p class="muted trend-empty">${stat.key === "lane" ? "Lane gold needs game timelines — they're still being fetched or aren't available yet."
       : "Not enough games with this stat yet."}</p>`;
@@ -818,15 +829,15 @@ function drawTrend() {
   if (view.player.trendTable) return trendTable(plot, stat, pts);
   plot.classList.toggle("animate", animate);
   drawTrendSvg(plot, stat, pts, animate);
-  trendResize = new ResizeObserver(() => {
-    if ($("#trend-plot") === plot && plot.clientWidth !== +plot.dataset.w) { plot.classList.remove("animate"); drawTrendSvg(plot, stat, pts, false); }
-  });
+  plot.redraw = () => { plot.classList.remove("animate"); drawTrendSvg(plot, stat, pts, false); };
+  // follows the card's width, and the panel sliding open beside the chart (which pushes it left)
+  trendResize = new ResizeObserver(() => { if ($("#trend-plot") === plot && plot.clientWidth !== +plot.dataset.w) plot.redraw(); });
   trendResize.observe(plot);
 }
 
 function drawTrendSvg(plot, stat, pts, animate) {
   const W = plot.clientWidth || 640;
-  const H = W < 520 ? 210 : 250;
+  const H = matchMedia("(max-width: 640px)").matches ? 210 : 250;
   const m = { l: 52, r: 12, t: 10, b: 28 };
   const iw = W - m.l - m.r;
   const ih = H - m.t - m.b;
@@ -843,19 +854,23 @@ function drawTrendSvg(plot, stat, pts, animate) {
   const ticksX = W < 520 ? 3 : 5;
   const labelsAt = [...new Set(Array.from({ length: ticksX }, (_, k) => Math.round((k * (n - 1)) / (ticksX - 1))))];
   const short = (ms) => new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  const sel = pts.findIndex((p) => p.g.match_id === view.player.trendGame);
+  const refocus = plot.contains(document.activeElement) ? (plot.at ?? n - 1) : null;  // redraws keep keyboard focus
   plot.dataset.w = W;
   plot.classList.toggle("dense", dense);
   plot.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">
       ${ticks.map((t) => `<line class="${stat.signed && t === 0 ? "zero" : "grid"}" x1="${m.l}" x2="${W - m.r}" y1="${y(t)}" y2="${y(t)}"/>
         <text class="ytick" x="${m.l - 8}" y="${y(t)}" text-anchor="end" dominant-baseline="middle">${showValue(stat, t)}</text>`).join("")}
+      ${sel < 0 ? "" : `<rect class="sel-band" x="${x(sel) - 8}" y="${m.t}" width="16" height="${ih}" rx="8"/>`}
       ${labelsAt.map((i, k) => `<text class="xtick" x="${x(i)}" y="${H - 8}" text-anchor="${k === 0 ? "start" : k === labelsAt.length - 1 ? "end" : "middle"}">${short(pts[i].g.game_start)}</text>`).join("")}
       ${pts.map((p, i) => `<circle class="dot ${p.g.win ? "win" : "loss"}" cx="${x(i)}" cy="${y(p.v)}" r="${r}" style="--d:${animate ? Math.round((i / n) * 700) : 0}ms"/>`).join("")}
       <path class="avg" pathLength="1" d="${pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.avg).toFixed(1)}`).join("")}"/>
       <circle class="avg-end" cx="${x(n - 1)}" cy="${y(pts[n - 1].avg)}" r="4"/>
+      ${sel < 0 ? "" : `<circle class="sel-dot" cx="${x(sel)}" cy="${y(pts[sel].v)}" r="${r + 5}"/>`}
       <line class="cross" x1="0" x2="0" y1="${m.t}" y2="${m.t + ih}" visibility="hidden"/>
       <circle class="focus-dot" r="${r + 4}" visibility="hidden"/>
     </svg>
-    <div class="trend-hit" tabindex="0" role="slider" aria-label="${esc(stat.label)} by game — arrow keys move between games"
+    <div class="trend-hit" tabindex="0" role="slider" aria-label="${esc(stat.label)} by game — arrow keys move between games, Enter opens one"
       aria-valuemin="1" aria-valuemax="${n}" style="left:${m.l}px;top:${m.t}px;width:${iw}px;height:${ih}px"></div>
     <div class="trend-tip" hidden aria-live="polite"></div>`;
 
@@ -865,7 +880,7 @@ function drawTrendSvg(plot, stat, pts, animate) {
   const ring = $(".focus-dot", plot);
   let at = null;
   const show = (i) => {
-    at = Math.max(0, Math.min(n - 1, i));
+    at = plot.at = Math.max(0, Math.min(n - 1, i));
     const p = pts[at];
     cross.setAttribute("x1", x(at)); cross.setAttribute("x2", x(at)); cross.setAttribute("visibility", "visible");
     ring.setAttribute("cx", x(at)); ring.setAttribute("cy", y(p.v)); ring.setAttribute("visibility", "visible");
@@ -889,10 +904,11 @@ function drawTrendSvg(plot, stat, pts, animate) {
     hit.setAttribute("aria-valuenow", at + 1);
     hit.setAttribute("aria-valuetext", `${value.textContent}, ${who.textContent}, ${when.textContent}`);
   };
-  const hide = () => { at = null; tip.hidden = true; cross.setAttribute("visibility", "hidden"); ring.setAttribute("visibility", "hidden"); };
+  const hide = () => { at = plot.at = null; tip.hidden = true; cross.setAttribute("visibility", "hidden"); ring.setAttribute("visibility", "hidden"); };
   const pick = (e) => show(Math.round(((e.clientX - hit.getBoundingClientRect().left) / iw) * (n - 1)));
   hit.addEventListener("pointermove", pick);
   hit.addEventListener("pointerdown", pick);  // a tap on touch screens
+  hit.addEventListener("click", (e) => { pick(e); selectTrendGame(pts[at].g.match_id); });
   hit.addEventListener("pointerleave", hide);
   hit.addEventListener("focus", () => show(at ?? n - 1));
   hit.addEventListener("blur", hide);
@@ -901,10 +917,12 @@ function drawTrendSvg(plot, stat, pts, animate) {
     if (step) show((at ?? n - 1) + step);
     else if (e.key === "Home") show(0);
     else if (e.key === "End") show(n - 1);
-    else if (e.key === "Escape") hide();
+    else if (e.key === "Enter" || e.key === " ") { if (at != null) selectTrendGame(pts[at].g.match_id); }
+    else if (e.key === "Escape") { hide(); if (view.player.trendGame) selectTrendGame(view.player.trendGame); }
     else return;
     e.preventDefault();
   });
+  if (refocus != null) { hit.focus({ preventScroll: true }); show(Math.min(refocus, n - 1)); }
 }
 
 function trendFigures(stat, points, animate) {
@@ -952,10 +970,87 @@ function trendTable(plot, stat, pts) {
   plot.classList.remove("animate");
   plot.innerHTML = `<table class="trend-table"><thead><tr><th>Date</th><th>Champion</th><th>Result</th>
       <th class="num">${esc(stat.label)}</th><th class="num">${ROLL}-game average</th></tr></thead>
-    <tbody>${pts.slice().reverse().map((p) => `<tr><td>${day(p.g.game_start)}</td><td>${champCell(p.g.champion_id)}</td>
+    <tbody>${pts.slice().reverse().map((p) => `<tr class="${p.g.match_id === view.player.trendGame ? "me" : ""}">
+      <td><button class="linkish" data-mid="${esc(p.g.match_id)}">${day(p.g.game_start)}</button></td><td>${champCell(p.g.champion_id)}</td>
       <td>${p.g.win ? "Win" : "Loss"}</td><td class="num">${esc(stat.per ? stat.per(p.g) : showValue(stat, p.v))}</td>
       <td class="num">${showValue(stat, p.avg)}</td></tr>`).join("")}</tbody></table>`;
   prepareTables(plot);
+  $$("[data-mid]", plot).forEach((b) => b.addEventListener("click", () => {
+    selectTrendGame(b.dataset.mid);
+    $$("tr", plot).forEach((tr) => tr.classList.toggle("me", tr.contains(b) && view.player.trendGame === b.dataset.mid));
+  }));
+}
+
+// ---- the game panel beside (or under) the chart
+const matchCache = new Map();  // matches never change: fetch each scoreboard once
+function matchDetail(mid) {
+  if (!matchCache.has(mid)) matchCache.set(mid, api(`/api/match/${mid}`).catch((e) => { matchCache.delete(mid); throw e; }));
+  return matchCache.get(mid);
+}
+const wideTrend = () => matchMedia("(min-width: 1000px)").matches;
+
+function selectTrendGame(mid) {
+  const body = $("#trend-body");
+  if (!body) return;
+  view.player.trendGame = mid === view.player.trendGame ? null : mid;  // the open game again closes it
+  const open = !!view.player.trendGame;
+  body.classList.toggle("open", open);
+  $("#trend-game").inert = !open;
+  if (open) renderTrendGame(true);
+  $("#trend-plot").redraw?.();  // moves the selection mark (a sliding panel also redraws via the resize observer)
+  if (open && !wideTrend()) {  // it folds out below the chart: bring it into view once it has opened
+    setTimeout(() => $("#trend-game")?.scrollIntoView({ block: "nearest", behavior: reducedMotion() ? "auto" : "smooth" }), 480);
+  }
+}
+
+function markTrendStat() {
+  const key = trendStat().key;
+  $$("#trend-game [data-keys]").forEach((el) => el.classList.toggle("current", el.dataset.keys.split(" ").includes(key)));
+}
+
+async function renderTrendGame(swap = false) {
+  const inner = $("#trend-game-inner");
+  const mid = view.player.trendGame;
+  const g = DATA.series.find((s) => s.match_id === mid);
+  if (!inner || !g) return;
+  const min = g.duration / 60;
+  const kp = g.team_kills ? (g.kills + g.assists) / g.team_kills : null;
+  const cell = (keys, label, value, sub) =>
+    `<div class="tg-stat" data-keys="${keys}"><div class="label">${label}</div><b>${value}</b><span>${sub}</span></div>`;
+  inner.innerHTML = `
+    <button class="tg-close" id="tg-close" aria-label="Close game details">×</button>
+    <div class="tg-head ${g.win ? "win" : "loss"}" data-keys="wr"><img src="${champ(g.champion_id).icon}" alt="">
+      <div><div class="tg-result">${g.win ? "Victory" : "Defeat"}</div>
+        <div><b>${esc(champ(g.champion_id).name)}</b>${ROLE_NAMES[g.position] ? ` · ${ROLE_NAMES[g.position]}` : ""}</div>
+        <div class="muted small">${day(g.game_start)} · ${mmss(g.duration)} · ${ago(g.game_start)}</div></div></div>
+    <div class="tg-stats">
+      ${cell("kda deaths", "KDA", ((g.kills + g.assists) / Math.max(1, g.deaths)).toFixed(1), `${g.kills} / ${g.deaths} / ${g.assists}`)}
+      ${cell("kp", "Kill part.", pct(kp), `of ${g.team_kills ?? "–"} kills`)}
+      ${cell("cs", "CS", g.cs, `${(g.cs / min).toFixed(1)} / min`)}
+      ${cell("gold", "Gold", kpts(g.gold), `${whole(g.gold / min)} / min`)}
+      ${cell("damage", "Damage", kpts(g.damage), `${whole(g.damage / min)} / min`)}
+      ${cell("vision", "Vision", g.vision, `${(g.vision / min).toFixed(2)} / min`)}
+      ${cell("lane", "Lane @15", golddiff(g.lane_diff15), "vs opponent")}
+      ${cell("", "Team @15", golddiff(g.team_diff15), "vs their team")}
+    </div>
+    <div id="tg-more"><div class="loading"><div class="spinner"></div></div></div>`;
+  $("#tg-close").addEventListener("click", () => { selectTrendGame(mid); $(".trend-hit")?.focus({ preventScroll: true }); });
+  markTrendStat();
+  if (swap) { inner.classList.remove("swap"); void inner.offsetWidth; inner.classList.add("swap"); }  // restart the fade
+
+  const m = await matchDetail(mid).catch((e) => ({ error: e.message }));
+  const more = $("#tg-more");
+  if (!more || view.player.trendGame !== mid) return;
+  if (m.error) { more.innerHTML = `<p class="error small">${esc(m.error)}</p>`; return; }
+  const me = m.teams.flatMap((t) => t.players).find((p) => p.puuid === DATA.puuid);
+  const sides = { 100: "Blue", 200: "Red" };
+  more.innerHTML = `
+    ${me ? `<div class="tg-items">${(me.spells || []).map(spellIcon).join("")}${items(me.items)}</div>` : ""}
+    ${m.teams.map((t) => `<div class="tg-team"><span class="tg-side">${sides[t.team_id] || "Team"} · ${t.win ? "W" : "L"}</span>
+      ${t.players.map((p) => `<a href="${playerHash(m.platform, p.riot_id, view.player.range)}" class="${p.puuid === DATA.puuid ? "me" : ""}"
+        title="${esc(`${p.riot_id} · ${champ(p.champion_id).name} · ${p.kills}/${p.deaths}/${p.assists}`)}"
+        aria-label="${esc(`${p.riot_id}, ${champ(p.champion_id).name}, ${p.kills}/${p.deaths}/${p.assists}`)}"><img src="${champ(p.champion_id).icon}" alt=""></a>`).join("")}</div>`).join("")}
+    <p class="muted small tg-foot">${[m.queue && esc(m.queue), m.patch && `Patch ${patchName(m.patch)}`].filter(Boolean).join(" · ")}</p>`;
 }
 
 // ---------------------------------------------------------------- match history
