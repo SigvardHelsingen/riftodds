@@ -1,0 +1,8 @@
+[project]
+name = "league-user-stats"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi[standard]>=0.143.0",
+    "httpx>=0.28.1",
+]
