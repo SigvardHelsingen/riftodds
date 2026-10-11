@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -179,6 +179,15 @@ async def sampler():
 @app.get("/")
 def index():
     return FileResponse(STATIC / "index.html")
+
+
+@app.get("/riot.txt")
+def riot_txt():
+    """Riot's site-verification file (needed for a production key). Public, read on every request."""
+    path = Path(__file__).with_name("riot.txt")
+    if not path.exists():
+        raise HTTPException(404, "riot.txt not found")
+    return PlainTextResponse(path.read_text())
 
 
 @app.get("/api/meta")
