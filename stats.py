@@ -147,6 +147,8 @@ def player_games(db, puuid, queue=420):
         SELECT m.match_id, m.game_start, m.duration, m.patch,
                p.champion_id, p.position, p.win, p.team_id, p.kills, p.deaths, p.assists,
                p.cs, p.gold, p.damage, p.vision, p.lane_adv,
+               (SELECT SUM(o.kills) FROM participants o
+                 WHERE o.match_id = p.match_id AND o.team_id = p.team_id) AS team_kills,
                (SELECT o.champion_id FROM participants o
                  WHERE o.match_id = p.match_id AND o.team_id != p.team_id
                    AND o.position = p.position AND o.position != '') AS opp_champ,
@@ -163,6 +165,15 @@ def player_games(db, puuid, queue=420):
 
 
 # --- overview -----------------------------------------------------------------
+
+SERIES_FIELDS = ("game_start", "win", "champion_id", "kills", "deaths", "assists", "cs", "gold", "damage",
+                 "vision", "duration", "team_kills", "lane_diff15", "team_diff15")
+
+
+def game_series(games):
+    """Per-game numbers for the profile chart, oldest first (the client derives KDA, per-minute rates...)."""
+    return [{k: g.get(k) for k in SERIES_FIELDS} for g in games]
+
 
 def _pool(games):
     """How predictable is the player's champion choice?"""

@@ -17,7 +17,8 @@ const ordinal = (n) => `${n}${{ 1: "st", 2: "nd", 3: "rd" }[n] || "th"}`;
 const ROLE_NAMES = { TOP: "Top", JUNGLE: "Jungle", MIDDLE: "Mid", BOTTOM: "Bot", UTILITY: "Support", UNKNOWN: "Unknown" };
 
 let META = null;
-const view = { landing: { tier: "", sort: "wr", role: "", all: false }, player: { tab: "champions", role: null, queue: "420" } };
+const view = { landing: { tier: "", sort: "wr", role: "", all: false }, player: { tab: "champions", role: null, queue: "420" },
+  admin: { days: 30, user: "" } };
 let PATCH = null;
 let DATA = null;
 let pollTimer = null;
@@ -173,6 +174,8 @@ async function route() {
     top.outerHTML = searchForm("compact").replace("<form", '<form id="top-search"');
     bindSearch($("#top-search"));
     showPlayer(m[1], decodeURIComponent(m[2]), m[3] || META.default_range);
+  } else if (location.hash === "#/admin") {
+    showAdmin();
   } else {
     showLanding();
   }
@@ -517,6 +520,7 @@ function renderPlayer() {
       ${best ? tile(`Best vs ${p.tier === "UNRANKED" ? "rank" : title(p.tier)}`, `${icon(best.champion_id)}<span class="sm">${esc(champ(best.champion_id).name)}</span>`,
         `${pts(best.delta)} vs rank · ${pct(best.p_better)} sure you're better`) : tile("Best vs rank", "–", "Not enough data yet")}
     </div>
+    ${DATA.series?.length ? `<section class="card section trend" id="trend" aria-label="Form over time"></section>` : ""}
     <nav class="tabs" aria-label="Player statistics">${tabs.map(([v, l]) => `<button data-tab="${v}" aria-pressed="${view.player.tab === v}" class="${view.player.tab === v ? "active" : ""}">${l}</button>`).join("")}</nav>
     <div id="tab-body"></div>`;
   $$(".tabs button").forEach((b) => b.addEventListener("click", () => {
@@ -527,6 +531,7 @@ function renderPlayer() {
     });
     renderTab();
   }));
+  renderTrend();
   renderTab();
 }
 
@@ -726,6 +731,231 @@ function playerLeadCard() {
       <td class="num" title="${esc(wrTip(b.you))}">${wrText(b.you)}</td>
       <td class="num" title="${esc(wrTip(b.rank))}">${b.rank.games >= 10 ? `${pct(b.rank.wr)} <span class="muted small">${b.rank.games}</span>` : "–"}</td></tr>`).join("")}</tbody></table>
   </div>`;
+}
+
+// ---------------------------------------------------------------- form chart (profile)
+const ROLL = 10;  // games in the rolling average
+const perMin = (key) => (g) => g[key] / (g.duration / 60);
+const whole = (v) => Math.round(v).toLocaleString();
+const TREND_STATS = [  // fmt formats a magnitude; `signed` stats get their sign added
+  { key: "wr", label: "Win rate", value: (g) => +g.win, fmt: (v) => pct(v), unit: [0, 1], per: (g) => (g.win ? "Win" : "Loss") },
+  { key: "kda", label: "KDA", value: (g) => (g.kills + g.assists) / Math.max(1, g.deaths), fmt: (v) => v.toFixed(1),
+    per: (g) => `${((g.kills + g.assists) / Math.max(1, g.deaths)).toFixed(1)} · ${g.kills}/${g.deaths}/${g.assists}` },
+  { key: "kp", label: "Kill participation", value: (g) => (g.team_kills ? (g.kills + g.assists) / g.team_kills : null), fmt: (v) => pct(v), unit: [0, 1] },
+  { key: "cs", label: "CS / min", value: perMin("cs"), fmt: (v) => v.toFixed(1) },
+  { key: "gold", label: "Gold / min", value: perMin("gold"), fmt: whole },
+  { key: "damage", label: "Damage / min", value: perMin("damage"), fmt: whole },
+  { key: "vision", label: "Vision / min", value: perMin("vision"), fmt: (v) => v.toFixed(2) },
+  { key: "deaths", label: "Deaths", value: (g) => g.deaths, fmt: (v) => String(Math.round(v * 10) / 10), lowerIsBetter: true },
+  { key: "lane", label: "Lane gold @15", value: (g) => g.lane_diff15, fmt: whole, signed: true },
+];
+const trendStat = () => TREND_STATS.find((s) => s.key === view.player.trendStat) || TREND_STATS[0];
+const showValue = (stat, v) => (stat.signed ? `${v > 0 ? "+" : v < 0 ? "−" : ""}${stat.fmt(Math.abs(v))}` : stat.fmt(v));
+const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
+let trendResize = null;
+let trendDrawn = "";  // the last animated puuid/range/stat: data refreshes redraw without replaying the animation
+
+// games with a value for `stat` (oldest first), each with the average of the last ROLL of them
+function trendPoints(stat) {
+  const out = DATA.series.map((g) => ({ g, v: stat.value(g) })).filter((p) => p.v != null && Number.isFinite(p.v));
+  let sum = 0;
+  out.forEach((p, i) => {
+    sum += p.v - (i >= ROLL ? out[i - ROLL].v : 0);
+    p.avg = sum / Math.min(i + 1, ROLL);
+  });
+  return out;
+}
+
+// round axis steps (1, 2, 2.5, 5 × 10^k) covering lo..hi
+function niceTicks(lo, hi, count = 4) {
+  if (lo === hi) { lo -= 1; hi += 1; }
+  const raw = (hi - lo) / count;
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  const step = [1, 2, 2.5, 5, 10].map((f) => f * mag).find((st) => st >= raw);
+  const ticks = [];
+  for (let k = Math.floor(lo / step); k <= Math.ceil(hi / step); k++) ticks.push(+(k * step).toFixed(10));
+  return ticks;
+}
+
+function renderTrend() {
+  const el = $("#trend");
+  if (!el) return;
+  const stat = trendStat();
+  const table = !!view.player.trendTable;
+  el.innerHTML = `
+    <div class="card-head"><div><h2>Form over time</h2>
+      <p>Every ranked solo game in the range, oldest to newest. The line is the average of the last ${ROLL} games.</p></div>
+      <button class="btn ghost" id="trend-view" aria-pressed="${table}">${table ? "Show chart" : "Show table"}</button></div>
+    <div class="chips trend-stats" role="group" aria-label="Statistic">${TREND_STATS.map((st) => `<button class="chip ${st === stat ? "active" : ""}"
+      data-stat="${st.key}" aria-pressed="${st === stat}">${st.label}</button>`).join("")}</div>
+    <div class="trend-figures" id="trend-figures"></div>
+    <div class="trend-plot" id="trend-plot"></div>
+    ${table ? "" : legend([["", "background:var(--pos)", "Win"], ["ring", "", "Loss"], ["stroke", "background:var(--mag)", `${ROLL}-game average`]])}`;
+  $$(".trend-stats .chip", el).forEach((b) => b.addEventListener("click", () => {
+    view.player.trendStat = b.dataset.stat;
+    $$(".trend-stats .chip", el).forEach((x) => { x.classList.toggle("active", x === b); x.setAttribute("aria-pressed", x === b); });
+    drawTrend();
+  }));
+  $("#trend-view").addEventListener("click", () => { view.player.trendTable = !table; trendDrawn = ""; renderTrend(); });
+  drawTrend();
+}
+
+function drawTrend() {
+  const plot = $("#trend-plot");
+  if (!plot) return;
+  const stat = trendStat();
+  const pts = trendPoints(stat);
+  const key = `${DATA.puuid}|${view.player.range}|${stat.key}|${!!view.player.trendTable}`;
+  const animate = key !== trendDrawn && !reducedMotion();
+  trendDrawn = key;
+  trendResize?.disconnect();
+  trendFigures(stat, pts, animate);
+  if (pts.length < 2) {
+    plot.innerHTML = `<p class="muted trend-empty">${stat.key === "lane" ? "Lane gold needs game timelines — they're still being fetched or aren't available yet."
+      : "Not enough games with this stat yet."}</p>`;
+    return;
+  }
+  if (view.player.trendTable) return trendTable(plot, stat, pts);
+  plot.classList.toggle("animate", animate);
+  drawTrendSvg(plot, stat, pts, animate);
+  trendResize = new ResizeObserver(() => {
+    if ($("#trend-plot") === plot && plot.clientWidth !== +plot.dataset.w) { plot.classList.remove("animate"); drawTrendSvg(plot, stat, pts, false); }
+  });
+  trendResize.observe(plot);
+}
+
+function drawTrendSvg(plot, stat, pts, animate) {
+  const W = plot.clientWidth || 640;
+  const H = W < 520 ? 210 : 250;
+  const m = { l: 52, r: 12, t: 10, b: 28 };
+  const iw = W - m.l - m.r;
+  const ih = H - m.t - m.b;
+  const n = pts.length;
+  const values = pts.map((p) => p.v);
+  let [lo, hi] = stat.unit || [Math.min(...values), Math.max(...values)];
+  if (stat.signed) { lo = Math.min(lo, 0); hi = Math.max(hi, 0); }
+  const ticks = niceTicks(lo, hi);
+  [lo, hi] = [ticks[0], ticks.at(-1)];
+  const x = (i) => m.l + (i / (n - 1)) * iw;
+  const y = (v) => m.t + ih - ((v - lo) / (hi - lo)) * ih;
+  const dense = n > 100;
+  const r = dense ? 2.5 : 4;
+  const ticksX = W < 520 ? 3 : 5;
+  const labelsAt = [...new Set(Array.from({ length: ticksX }, (_, k) => Math.round((k * (n - 1)) / (ticksX - 1))))];
+  const short = (ms) => new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  plot.dataset.w = W;
+  plot.classList.toggle("dense", dense);
+  plot.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">
+      ${ticks.map((t) => `<line class="${stat.signed && t === 0 ? "zero" : "grid"}" x1="${m.l}" x2="${W - m.r}" y1="${y(t)}" y2="${y(t)}"/>
+        <text class="ytick" x="${m.l - 8}" y="${y(t)}" text-anchor="end" dominant-baseline="middle">${showValue(stat, t)}</text>`).join("")}
+      ${labelsAt.map((i, k) => `<text class="xtick" x="${x(i)}" y="${H - 8}" text-anchor="${k === 0 ? "start" : k === labelsAt.length - 1 ? "end" : "middle"}">${short(pts[i].g.game_start)}</text>`).join("")}
+      ${pts.map((p, i) => `<circle class="dot ${p.g.win ? "win" : "loss"}" cx="${x(i)}" cy="${y(p.v)}" r="${r}" style="--d:${animate ? Math.round((i / n) * 700) : 0}ms"/>`).join("")}
+      <path class="avg" pathLength="1" d="${pts.map((p, i) => `${i ? "L" : "M"}${x(i).toFixed(1)},${y(p.avg).toFixed(1)}`).join("")}"/>
+      <circle class="avg-end" cx="${x(n - 1)}" cy="${y(pts[n - 1].avg)}" r="4"/>
+      <line class="cross" x1="0" x2="0" y1="${m.t}" y2="${m.t + ih}" visibility="hidden"/>
+      <circle class="focus-dot" r="${r + 4}" visibility="hidden"/>
+    </svg>
+    <div class="trend-hit" tabindex="0" role="slider" aria-label="${esc(stat.label)} by game — arrow keys move between games"
+      aria-valuemin="1" aria-valuemax="${n}" style="left:${m.l}px;top:${m.t}px;width:${iw}px;height:${ih}px"></div>
+    <div class="trend-tip" hidden aria-live="polite"></div>`;
+
+  const hit = $(".trend-hit", plot);
+  const tip = $(".trend-tip", plot);
+  const cross = $(".cross", plot);
+  const ring = $(".focus-dot", plot);
+  let at = null;
+  const show = (i) => {
+    at = Math.max(0, Math.min(n - 1, i));
+    const p = pts[at];
+    cross.setAttribute("x1", x(at)); cross.setAttribute("x2", x(at)); cross.setAttribute("visibility", "visible");
+    ring.setAttribute("cx", x(at)); ring.setAttribute("cy", y(p.v)); ring.setAttribute("visibility", "visible");
+    // labels are data: build with textContent, never innerHTML
+    const value = document.createElement("b");
+    value.textContent = stat.per ? stat.per(p.g) : showValue(stat, p.v);
+    const avg = document.createElement("div");
+    const key = document.createElement("i");
+    key.className = "key";
+    avg.append(key, `${Math.min(at + 1, ROLL)}-game average ${showValue(stat, p.avg)}`);
+    const who = document.createElement("div");
+    who.textContent = `${champ(p.g.champion_id).name} · ${p.g.win ? "Win" : "Loss"}`;
+    const when = document.createElement("div");
+    when.className = "muted";
+    when.textContent = `Game ${at + 1} of ${n} · ${day(p.g.game_start)}`;
+    tip.replaceChildren(value, avg, who, when);
+    tip.hidden = false;
+    const left = x(at) + 14;
+    tip.style.left = `${left + tip.offsetWidth > W ? x(at) - 14 - tip.offsetWidth : left}px`;
+    tip.style.top = `${m.t}px`;
+    hit.setAttribute("aria-valuenow", at + 1);
+    hit.setAttribute("aria-valuetext", `${value.textContent}, ${who.textContent}, ${when.textContent}`);
+  };
+  const hide = () => { at = null; tip.hidden = true; cross.setAttribute("visibility", "hidden"); ring.setAttribute("visibility", "hidden"); };
+  const pick = (e) => show(Math.round(((e.clientX - hit.getBoundingClientRect().left) / iw) * (n - 1)));
+  hit.addEventListener("pointermove", pick);
+  hit.addEventListener("pointerdown", pick);  // a tap on touch screens
+  hit.addEventListener("pointerleave", hide);
+  hit.addEventListener("focus", () => show(at ?? n - 1));
+  hit.addEventListener("blur", hide);
+  hit.addEventListener("keydown", (e) => {
+    const step = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1, PageDown: -ROLL, PageUp: ROLL }[e.key];
+    if (step) show((at ?? n - 1) + step);
+    else if (e.key === "Home") show(0);
+    else if (e.key === "End") show(n - 1);
+    else if (e.key === "Escape") hide();
+    else return;
+    e.preventDefault();
+  });
+}
+
+function trendFigures(stat, points, animate) {
+  const el = $("#trend-figures");
+  if (!el) return;
+  if (!points.length) { el.innerHTML = ""; return; }
+  const mean = (ps) => ps.reduce((a, p) => a + p.v, 0) / ps.length;
+  const recent = points.slice(-ROLL);
+  const avg = mean(points);
+  const last = mean(recent);
+  const d = last - avg;
+  const better = stat.lowerIsBetter ? d < 0 : d > 0;
+  const delta = Math.abs(d) < 1e-9 ? "Same as the range average"
+    : `${d > 0 ? "▲" : "▼"} ${stat.unit ? pts(d).replace("+", "") : stat.fmt(Math.abs(d))} vs the range average · ${better ? "better" : "worse"}`;
+  let third;
+  if (stat.key === "wr") {  // a best single game means nothing for a win rate: show the current streak
+    const won = !!points.at(-1).g.win;
+    const streak = points.length - 1 - points.findLastIndex((p) => !!p.g.win !== won);
+    third = figure("Current streak", `${streak} ${won ? (streak > 1 ? "wins" : "win") : streak > 1 ? "losses" : "loss"}`, "");
+  } else {
+    const best = points.reduce((b, p) => ((stat.lowerIsBetter ? p.v < b.v : p.v > b.v) ? p : b));
+    third = figure("Best game", `${icon(best.g.champion_id)}<span>${showValue(stat, best.v)}</span>`,
+      `${esc(champ(best.g.champion_id).name)} · ${day(best.g.game_start)}`);
+  }
+  el.innerHTML = figure("Range average", `<span data-count="${avg}">${showValue(stat, avg)}</span>`, `${points.length} game${points.length > 1 ? "s" : ""}`)
+    + figure(`Last ${recent.length}`, `<span data-count="${last}">${showValue(stat, last)}</span>`, delta) + third;
+  if (animate) $$("[data-count]", el).forEach((span) => countUp(span, +span.dataset.count, (v) => showValue(stat, v)));
+}
+
+const figure = (label, value, sub) =>
+  `<div class="trend-figure"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`;
+
+function countUp(el, to, format, ms = 700) {
+  const start = performance.now();
+  const step = (now) => {
+    const t = Math.min(1, (now - start) / ms);
+    el.textContent = format(to * (1 - (1 - t) ** 3));
+    if (t < 1 && el.isConnected) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+}
+
+// the chart's table twin: every value without hovering
+function trendTable(plot, stat, pts) {
+  plot.classList.remove("animate");
+  plot.innerHTML = `<table class="trend-table"><thead><tr><th>Date</th><th>Champion</th><th>Result</th>
+      <th class="num">${esc(stat.label)}</th><th class="num">${ROLL}-game average</th></tr></thead>
+    <tbody>${pts.slice().reverse().map((p) => `<tr><td>${day(p.g.game_start)}</td><td>${champCell(p.g.champion_id)}</td>
+      <td>${p.g.win ? "Win" : "Loss"}</td><td class="num">${esc(stat.per ? stat.per(p.g) : showValue(stat, p.v))}</td>
+      <td class="num">${showValue(stat, p.avg)}</td></tr>`).join("")}</tbody></table>`;
+  prepareTables(plot);
 }
 
 // ---------------------------------------------------------------- match history
@@ -939,10 +1169,72 @@ function renderLive(live) {
   prepareTables(el);
 }
 
+// ---------------------------------------------------------------- admin
+const ACTIVITY = { login: "Logged in", lookup: "Looked up", link: "Linked account", unlink: "Unlinked account", sample: "Sampled games" };
+
+async function showAdmin() {
+  const token = nav;
+  if (!$("#admin")) $("#app").innerHTML = `<div class="loading"><div class="spinner"></div>Loading member activity…</div>`;
+  try {
+    const data = await api(`/api/admin/activity?days=${view.admin.days}`);
+    if (token === nav) renderAdmin(data);
+  } catch (e) {
+    if (token === nav) $("#app").innerHTML = `<div class="card empty section"><h2 class="error">${esc(e.message)}</h2></div>`;
+  }
+}
+
+function renderAdmin(data) {
+  const A = view.admin;
+  const total = (kind) => data.users.reduce((n, u) => n + (u.counts[kind] || 0), 0);
+  const active = data.users.filter((u) => u.last_seen && Date.now() - u.last_seen * 1000 < 86400000).length;
+  const admins = data.users.filter((u) => u.role === "admin").length;
+  const events = data.events.filter((e) => !A.user || e.username === A.user);
+  const when = (sec) => (sec ? `<span title="${esc(new Date(sec * 1000).toLocaleString())}">${ago(sec * 1000)}</span>` : `<span class="muted">never</span>`);
+  $("#app").innerHTML = `
+    <section class="admin-head" id="admin">
+      <h1>Member<br><em>activity.</em></h1>
+      <div class="chips" id="admin-days" role="group" aria-label="Period"><span class="chips-label">Period</span>${[7, 30, 90].map((d) =>
+        `<button class="chip ${A.days === d ? "active" : ""}" data-days="${d}" aria-pressed="${A.days === d}">${d} days</button>`).join("")}</div>
+    </section>
+    <div class="tiles">
+      ${tile("Members", data.users.length, `${admins} admin${admins === 1 ? "" : "s"}`, "indigo")}
+      ${tile("Active today", active, "seen in the last 24 hours", "peach")}
+      ${tile("Logins", total("login"), `last ${data.days} days`, "plum")}
+      ${tile("Lookups", total("lookup"), `players looked up, last ${data.days} days`)}
+    </div>
+    <div class="card section">
+      <div class="card-head"><div><h2>Members</h2><p>Select a member to see only their activity. Roles are set on the server
+        with <code>auth.py role &lt;username&gt; admin</code> (or <code>member</code>).</p></div></div>
+      <table><thead><tr><th>Member</th><th>Role</th><th>Last seen</th><th class="num">Logins</th><th class="num">Lookups</th>
+        <th class="num">Sessions</th><th>Linked account</th><th>Joined</th></tr></thead>
+      <tbody>${data.users.map((u) => `<tr class="${A.user === u.username ? "me" : ""}">
+        <td><button class="linkish" data-user="${esc(u.username)}" aria-pressed="${A.user === u.username}">${esc(u.username)}</button></td>
+        <td>${u.role === "admin" ? `<span class="me-tag">Admin</span>` : "Member"}</td>
+        <td>${when(u.last_seen)}</td>
+        <td class="num">${u.counts.login || 0}</td><td class="num">${u.counts.lookup || 0}</td><td class="num">${u.sessions}</td>
+        <td>${u.account ? esc(u.account) : `<span class="muted">–</span>`}</td>
+        <td>${u.created ? day(u.created * 1000) : "–"}</td></tr>`).join("")}</tbody></table>
+    </div>
+    <div class="card section">
+      <div class="card-head"><div><h2>${A.user ? `Activity · ${esc(A.user)}` : "Recent activity"}</h2>
+        <p>Logins, player lookups and account changes in the last ${data.days} days, newest first.</p></div>
+        ${A.user ? `<button class="btn ghost" id="admin-everyone">Show everyone</button>` : ""}</div>
+      ${events.length ? `<table><thead><tr><th>When</th><th>Member</th><th>What</th><th>Details</th></tr></thead>
+        <tbody>${events.map((e) => `<tr><td>${when(e.at)}</td><td>${esc(e.username)}</td><td>${ACTIVITY[e.kind] || esc(e.kind)}</td>
+          <td>${esc(e.detail || "")}</td></tr>`).join("")}</tbody></table>`
+        : `<p class="muted">No activity in this period.</p>`}
+    </div>`;
+  $$("#admin-days .chip").forEach((b) => b.addEventListener("click", () => { A.days = +b.dataset.days; showAdmin(); }));
+  $$("[data-user]").forEach((b) => b.addEventListener("click", () => { A.user = A.user === b.dataset.user ? "" : b.dataset.user; renderAdmin(data); }));
+  $("#admin-everyone")?.addEventListener("click", () => { A.user = ""; renderAdmin(data); });
+  prepareTables();
+}
+
 // ---------------------------------------------------------------- boot
 function renderUser() {
   $("#user").hidden = false;
   $("#username").textContent = ME.username;
+  $("#admin-link").hidden = ME.role !== "admin";
   const mine = $("#my-profile");
   mine.hidden = !ME.account;
   if (ME.account) mine.href = myHash();

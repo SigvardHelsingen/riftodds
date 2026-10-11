@@ -58,6 +58,9 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(patch.dict(main.state, {"sampler": {"status": "off"}, "live": {}, "last_activity": 0}, clear=True))
         self.user_for = self.stack.enter_context(patch.object(main.auth, "user_for", return_value="alice"))
         self.stack.enter_context(patch.object(main.auth, "connect", side_effect=AssertionError("Real auth DB access forbidden")))
+        self.role_of = self.stack.enter_context(patch.object(main.auth, "role_of", return_value="member"))
+        self.record = self.stack.enter_context(patch.object(main.auth, "record"))
+        self.stack.enter_context(patch.object(main.auth, "seen"))
         self.store_connect = self.stack.enter_context(patch.object(main.store, "connect", side_effect=AssertionError("Real cache DB access forbidden")))
         self.transport = httpx.ASGITransport(app=main.app, client=("192.0.2.10", 12345))
         self.client = httpx.AsyncClient(transport=self.transport, base_url="http://test", cookies={main.auth.COOKIE: "dummy-session"})
@@ -214,6 +217,29 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("httponly", cookie)
                 self.assertIn("samesite=lax", cookie)
                 login.assert_called_once_with("alice", "valid-password", client="192.0.2.10")
+
+    async def test_admin_activity_requires_admin_role(self):
+        report = {"days": 7, "users": [], "events": []}
+        with patch.object(main.auth, "activity_report", return_value=report) as activity, \
+                patch.object(main, "linked_account", return_value=None):
+            self.assertEqual((await self.client.get("/api/me")).json()["role"], "member")
+            self.assertEqual((await self.client.get("/api/admin/activity")).status_code, 403)
+            activity.assert_not_called()
+            self.role_of.return_value = "admin"
+            response = await self.client.get("/api/admin/activity", params={"days": 7})
+            self.assertEqual((await self.client.get("/api/me")).json()["role"], "admin")
+        self.assertEqual((response.status_code, response.json()), (200, report))
+        activity.assert_called_once_with(7)
+
+    async def test_login_is_recorded_and_tracking_failures_never_break_requests(self):
+        body = {"username": " alice ", "password": "valid-password"}
+        with patch.object(main.auth, "login", return_value="dummy-token"):
+            self.assertEqual((await self.client.post("/api/login", json=body)).status_code, 200)
+            self.record.assert_called_once_with("alice", "login", "")
+            self.record.side_effect = sqlite3.OperationalError("database is locked")
+            with self.assertLogs("sampler", "WARNING"):
+                response = await self.client.post("/api/login", json=body)
+        self.assertEqual(response.status_code, 200)
 
     async def test_riot_key_errors_are_not_session_401_or_403(self):
         self.store_connect.side_effect = None
@@ -476,6 +502,8 @@ class MatchHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(main.store, "connect", side_effect=lambda: test_data.fixture_db(self.path)))
         self.stack.enter_context(patch.object(main.auth, "user_for", return_value="alice"))
+        for name in ("seen", "record", "role_of"):
+            self.stack.enter_context(patch.object(main.auth, name))
         self.riot = SimpleNamespace(match_ids=AsyncMock(), match=AsyncMock())
         self.stack.enter_context(patch.dict(main.state, {"riot": self.riot, "live": {}, "last_activity": 0}))
         self.client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test",

@@ -29,7 +29,8 @@ class AuthTests(unittest.TestCase):
         self.throttle_patch.start()
         self.addCleanup(self.throttle_patch.stop)
         with closing(auth.connect()) as db:
-            db.execute("INSERT INTO users VALUES (?, ?, ?)", ("alice", self.password_hash, int(time.time())))
+            db.execute("INSERT INTO users (username, password_hash, created) VALUES (?, ?, ?)",
+                       ("alice", self.password_hash, int(time.time())))
             db.commit()
 
     def test_login_logout_and_session_token_hash(self):
@@ -191,6 +192,56 @@ class AuthTests(unittest.TestCase):
             auth.main(["add", name])
         token = auth.login(name, password)
         self.assertEqual(auth.user_for(token), name)
+
+
+class RoleAndActivityTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.dir = Path(temp.name)
+        db_patch = patch.object(auth, "DB_PATH", self.dir / "users.db")
+        db_patch.start()
+        self.addCleanup(db_patch.stop)
+        with closing(auth.connect()) as db:
+            db.execute("INSERT INTO users (username, password_hash, created) VALUES ('alice', 'x', 0)")
+            db.commit()
+
+    def test_roles_default_to_member_and_cli_promotes(self):
+        self.assertEqual(auth.role_of("alice"), "member")
+        with redirect_stdout(io.StringIO()) as out:
+            auth.main(["role", "alice", "admin"])
+        self.assertEqual((auth.role_of("alice"), out.getvalue().strip()), ("admin", "alice is now an admin."))
+        for argv in (["role", "alice", "owner"], ["role", "alice"], ["role", "nobody", "admin"]):
+            with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                auth.main(argv)
+        self.assertEqual(auth.role_of("alice"), "admin")
+        self.assertIsNone(auth.role_of("nobody"))
+
+    def test_existing_database_gains_role_and_last_seen(self):
+        old = self.dir / "old.db"
+        with closing(sqlite3.connect(old)) as db:
+            db.execute("CREATE TABLE users (username TEXT PRIMARY KEY, password_hash TEXT NOT NULL, created INTEGER)")
+            db.execute("INSERT INTO users VALUES ('bob', 'x', 0)")
+            db.commit()
+        with patch.object(auth, "DB_PATH", old):
+            self.assertEqual(auth.role_of("bob"), "member")
+            auth.seen("bob")
+            self.assertIsNotNone(auth.activity_report()["users"][0]["last_seen"])
+
+    def test_report_counts_recent_events_and_old_ones_are_pruned(self):
+        with closing(auth.connect()) as db:
+            db.execute("INSERT INTO activity (username, at, kind, detail) VALUES ('alice', 0, 'login', '')")
+            db.commit()
+        auth.record("alice", "login")
+        auth.record("alice", "lookup", "Faker#KR1 (kr) · Last 20 games")
+        auth.record("alice", "login")
+        report = auth.activity_report(days=7)
+        self.assertEqual([(u["username"], u["role"], u["counts"], u["last_seen"]) for u in report["users"]],
+                         [("alice", "member", {"login": 2, "lookup": 1}, None)])
+        self.assertEqual([e["kind"] for e in report["events"]], ["login", "lookup", "login"])
+        with closing(auth.connect()) as db:  # the 1970 row was pruned, not just filtered out
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM activity WHERE at = 0").fetchone()[0], 0)
+        self.assertEqual(report["events"][1]["detail"], "Faker#KR1 (kr) · Last 20 games")
 
 
 class ThrottleTests(unittest.TestCase):

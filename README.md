@@ -14,6 +14,9 @@ interval, so "60% over 10 games" is shown with how sure it really is.
   comeback and close-out rates.
 - **Match history:** every game type (ranked, normals, ARAM, ARAM: Mayhem, Arena) with expandable scoreboards.
 - **Live game:** rank, mastery and recent form for all ten players in a player's current game.
+- **Form over time:** a chart on every profile of win rate, KDA, CS, gold, damage, vision or lane gold per game,
+  with a 10-game average.
+- **Admin page:** admins see each member's last visit, logins and player lookups.
 
 ## Running it yourself
 
@@ -24,6 +27,7 @@ echo "RIOT_API_KEY=RGAPI-..." > .env
 uv sync
 uv run fastapi dev main.py         # http://localhost:8000
 uv run python auth.py add <name>   # create a login (also: passwd, remove, list)
+uv run python auth.py role <name> admin   # or member; admins get the Admin page
 ```
 
 Optional settings in `.env`:

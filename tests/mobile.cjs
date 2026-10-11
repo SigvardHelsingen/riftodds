@@ -32,8 +32,23 @@ const leads = {
   close_out: { you: winrate(), rank: winrate(100, 60) },
   curve: ["1k–3k behind", "About even", "1k–3k ahead"].map((label) => ({ label, share: 0.3, you: winrate(), rank: winrate(100, 55) })),
 };
+// 30 games for the form chart; every 4th has no timeline (no lane gold)
+const series = Array.from({ length: 30 }, (_, i) => ({
+  game_start: now - (30 - i) * 7200000, win: i % 3 !== 0, champion_id: (i % 3) + 1, kills: 3 + (i % 5), deaths: 1 + (i % 4),
+  assists: 5 + (i % 6), cs: 180 + i * 2, gold: 11000 + i * 50, damage: 20000 + i * 300, vision: 18 + (i % 7),
+  duration: 1800 + (i % 5) * 60, team_kills: 25, lane_diff15: i % 4 === 0 ? null : i % 2 ? 600 : -400, team_diff15: null,
+}));
+const adminData = { days: 30, users: [
+  { username: me.username, role: "admin", created: now / 1000 - 40 * 86400, last_seen: now / 1000 - 60, sessions: 2,
+    account: "LongPlayerName#EUW12", counts: { login: 4, lookup: 12 } },
+  { username: "bob", role: "member", created: now / 1000 - 9 * 86400, last_seen: null, sessions: 0, account: null, counts: {} },
+], events: [
+  { username: "bob", at: now / 1000 - 3600, kind: "lookup", detail: "AVeryLongRiotIdName#EUW12 (euw1) · This season (since 2026-01-08)" },
+  { username: me.username, at: now / 1000 - 7200, kind: "login", detail: "" },
+  { username: "bob", at: now / 1000 - 9000, kind: "login", detail: "" },
+] };
 const data = {
-  puuid: "player", profile: {
+  puuid: "player", series, profile: {
     name: "LongPlayerName", tag: "EUW12", platform: "euw1", tier: "EMERALD", division: "II",
     lp: 42, season_wins: 100, season_losses: 80, level: 250, icon: "https://images.test/profile.png",
   },
@@ -110,7 +125,7 @@ async function fixturePage(browser, width, options = {}) {
   const context = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: "reduce" });
   const page = await context.newPage();
   const errors = [];
-  page.on("pageerror", (err) => errors.push(err.message));
+  page.on("pageerror", (err) => { errors.push(err.message); if (process.env.DEBUG) console.error(err); });
   const state = { authenticated: options.authenticated !== false, liveRequests: 0, pickAlphas: [], matchQueues: [] };
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
@@ -127,7 +142,11 @@ async function fixturePage(browser, width, options = {}) {
     if (url.pathname === "/api/login") { state.authenticated = true; body = { username: me.username }; }
     else if (url.pathname === "/api/logout") { state.authenticated = false; body = { ok: true }; }
     else if (!state.authenticated) { status = 401; body = { detail: "Not logged in" }; }
-    else if (url.pathname === "/api/me") body = me;
+    else if (url.pathname === "/api/me") body = options.admin ? { ...me, role: "admin" } : { ...me, role: "member" };
+    else if (url.pathname === "/api/admin/activity") {
+      if (!options.admin) return route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: "Admins only." }) });
+      body = adminData;
+    }
     else if (url.pathname === "/api/meta") body = meta;
     else if (url.pathname === "/api/patch") {
       if (options.patchDelay) await new Promise((resolve) => setTimeout(resolve, options.patchDelay));
@@ -175,6 +194,31 @@ async function checkWidth(browser, width) {
     await page.locator(".search.big button").click();
     await page.waitForSelector(".player-head");
     await noPageOverflow(page, `champions ${width}`);
+    assert.equal(await page.locator("#admin-link").isVisible(), false, "Members don't see the admin link");
+    assert.equal(await page.locator("#trend .dot").count(), 30);
+    await page.locator('.trend-stats .chip[data-stat="kda"]').click();
+    const hover = async (at) => {
+      await page.locator(".trend-hit").scrollIntoViewIfNeeded();
+      const box = await page.locator(".trend-hit").boundingBox();
+      await page.mouse.move(box.x + box.width * at, box.y + box.height / 2);
+    };
+    await hover(0.5);
+    await page.waitForSelector(".trend-tip:not([hidden])");
+    assert.match(await page.locator(".trend-tip b").textContent(), /^\d+\.\d · \d+\/\d+\/\d+$/);
+    await noPageOverflow(page, `chart ${width}`);
+    await page.locator('.trend-stats .chip[data-stat="lane"]').click();
+    assert.equal(await page.locator("#trend .dot").count(), 22, "Games without a timeline have no lane gold");
+    await page.locator("#trend-view").click();
+    assert.equal(await page.locator("#trend .trend-table tbody tr").count(), 22);
+    await noPageOverflow(page, `chart table ${width}`);
+    await page.locator("#trend-view").click();
+    await page.waitForSelector("#trend svg");
+    if (process.env.SCREENSHOTS && [375, 1280].includes(width)) {
+      await page.locator('.trend-stats .chip[data-stat="cs"]').click();
+      await page.waitForTimeout(1400);
+      await hover(0.7);
+      await page.locator("#trend").screenshot({ path: path.join(process.env.SCREENSHOTS, `trend-${width}.png`) });
+    }
     if (process.env.SCREENSHOTS && [375, 1280].includes(width)) {
       await page.screenshot({ path: path.join(process.env.SCREENSHOTS, `profile-${width}.png`), fullPage: true });
     }
@@ -230,6 +274,27 @@ async function checkWidth(browser, width) {
     assert.equal(state.liveRequests, requests, "Live polling should stop after leaving the live view");
     assert.deepEqual(errors, [], `Browser errors at ${width}px`);
     console.log(`PASS: landing, profile and all tabs at ${width}px`);
+  } finally { await context.close(); }
+}
+
+async function checkAdmin(browser, width) {
+  const { context, page, errors } = await fixturePage(browser, width, { admin: true });
+  try {
+    await page.goto("http://rift.test/#/");
+    await page.waitForSelector(".board");
+    await noPageOverflow(page, `admin topbar ${width}`);
+    await page.locator("#admin-link").click();
+    await page.waitForSelector("#admin");
+    await noPageOverflow(page, `admin ${width}`);
+    const activityRows = () => page.locator(".card:last-of-type tbody tr").count();
+    assert.equal(await activityRows(), 3);
+    await page.locator('[data-user="bob"]').click();
+    assert.equal(await activityRows(), 2, "Selecting a member filters the activity");
+    assert.match(await page.locator(".card:last-of-type h2").textContent(), /bob/);
+    await page.locator("#admin-everyone").click();
+    assert.equal(await activityRows(), 3);
+    if (process.env.SCREENSHOTS) await page.screenshot({ path: path.join(process.env.SCREENSHOTS, `admin-${width}.png`), fullPage: true });
+    assert.deepEqual(errors, [], `Browser errors on the admin page at ${width}px`);
   } finally { await context.close(); }
 }
 
@@ -304,6 +369,8 @@ async function checkStates(browser) {
   const browser = await browserType.launch({ headless: true, ...(process.env.PLAYWRIGHT_EXECUTABLE_PATH ? { executablePath: process.env.PLAYWRIGHT_EXECUTABLE_PATH } : {}) });
   try {
     for (const width of [320, 375, 390, 768, 1280]) await checkWidth(browser, width);
+    for (const width of [320, 1280]) await checkAdmin(browser, width);
+    console.log("PASS: admin page at 320px and 1280px");
     await checkStates(browser);
   } finally { await browser.close(); }
 })().catch((error) => { console.error(error); process.exitCode = 1; });

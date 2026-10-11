@@ -3,6 +3,7 @@
     uv run python auth.py add <username>       # prompts for a password
     uv run python auth.py passwd <username>
     uv run python auth.py remove <username>    # also logs them out everywhere
+    uv run python auth.py role <username> admin|member   # admins see everyone's activity
     uv run python auth.py list
 
 Passwords are hashed with scrypt; sessions are random tokens in an HttpOnly
@@ -91,13 +92,25 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS accounts (
     username TEXT PRIMARY KEY, platform TEXT, game_name TEXT, tag_line TEXT, puuid TEXT
 );
+-- what members do on the site (logins, player lookups), shown to admins
+CREATE TABLE IF NOT EXISTS activity (
+    id INTEGER PRIMARY KEY, username TEXT NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_activity_at ON activity(at);
 """
+# columns added after the first release; connect() adds them to older databases
+MIGRATIONS = [("users", "role", "TEXT NOT NULL DEFAULT 'member'"), ("users", "last_seen", "INTEGER")]
+ROLES = ("member", "admin")
+ACTIVITY_DAYS = 90  # activity older than this is deleted
 
 
 def connect():
     db = sqlite3.connect(DB_PATH)
     try:
         db.executescript(SCHEMA)
+        for table, col, kind in MIGRATIONS:
+            if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
     except BaseException:
         db.close()
         raise
@@ -204,6 +217,49 @@ def clear_account(username):
         db.commit()
 
 
+# --- roles and activity --------------------------------------------------------
+
+def role_of(username):
+    with closing(connect()) as db:
+        row = db.execute("SELECT role FROM users WHERE username = ?", (username,)).fetchone()
+    return row[0] if row else None
+
+
+def record(username, kind, detail=""):
+    """Append to the activity log, dropping entries older than ACTIVITY_DAYS."""
+    now = int(time.time())
+    with closing(connect()) as db:
+        db.execute("INSERT INTO activity (username, at, kind, detail) VALUES (?, ?, ?, ?)", (username, now, kind, detail))
+        db.execute("DELETE FROM activity WHERE at < ?", (now - ACTIVITY_DAYS * 86400,))
+        db.commit()
+
+
+def seen(username):
+    with closing(connect()) as db:
+        db.execute("UPDATE users SET last_seen = ? WHERE username = ?", (int(time.time()), username))
+        db.commit()
+
+
+def activity_report(days=30, limit=300):
+    """Every user with role, last visit and event counts over `days`, plus the newest events."""
+    now = int(time.time())
+    with closing(connect()) as db:
+        counts = {}
+        for user, kind, n in db.execute("SELECT username, kind, COUNT(*) FROM activity WHERE at >= ? GROUP BY 1, 2",
+                                        (now - days * 86400,)):
+            counts.setdefault(user, {})[kind] = n
+        sessions = dict(db.execute("SELECT username, COUNT(*) FROM sessions WHERE expires > ? GROUP BY 1", (now,)))
+        accounts = {u: f"{g}#{t}" for u, g, t in db.execute("SELECT username, game_name, tag_line FROM accounts")}
+        users = [{"username": u, "role": role, "created": created, "last_seen": last_seen,
+                  "sessions": sessions.get(u, 0), "account": accounts.get(u), "counts": counts.get(u, {})}
+                 for u, role, created, last_seen in db.execute(
+                     "SELECT username, role, created, last_seen FROM users ORDER BY last_seen IS NULL, last_seen DESC, username")]
+        events = [dict(zip(("username", "at", "kind", "detail"), r)) for r in db.execute(
+            "SELECT username, at, kind, detail FROM activity WHERE at >= ? ORDER BY at DESC, id DESC LIMIT ?",
+            (now - days * 86400, limit))]
+    return {"days": days, "users": users, "events": events}
+
+
 # --- CLI ---------------------------------------------------------------------
 
 def _ask_password():
@@ -223,12 +279,13 @@ def main(argv):
     with closing(connect()) as db:
         exists = name and db.execute("SELECT 1 FROM users WHERE username = ?", (name,)).fetchone()
         if cmd == "list":
-            for user, created in db.execute("SELECT username, created FROM users ORDER BY username"):
-                print(f"{user}\t(added {time.strftime('%Y-%m-%d', time.localtime(created))})")
+            for user, role, created in db.execute("SELECT username, role, created FROM users ORDER BY username"):
+                print(f"{user}\t{role}\t(added {time.strftime('%Y-%m-%d', time.localtime(created))})")
         elif cmd == "add" and name:
             if exists:
                 sys.exit(f"{name} already exists — use passwd to change the password.")
-            db.execute("INSERT INTO users VALUES (?, ?, ?)", (name, hash_password(_ask_password()), int(time.time())))
+            db.execute("INSERT INTO users (username, password_hash, created) VALUES (?, ?, ?)",
+                       (name, hash_password(_ask_password()), int(time.time())))
             db.commit()
             print(f"Added {name}.")
         elif cmd == "passwd" and name:
@@ -238,6 +295,15 @@ def main(argv):
             db.execute("DELETE FROM sessions WHERE username = ?", (name,))
             db.commit()
             print(f"Password changed for {name}; their existing sessions were logged out.")
+        elif cmd == "role" and name:
+            role = argv[2] if len(argv) > 2 else None
+            if role not in ROLES:
+                sys.exit(f"Usage: auth.py role <username> {'|'.join(ROLES)}")
+            if not exists:
+                sys.exit(f"No user {name}.")
+            db.execute("UPDATE users SET role = ? WHERE username = ?", (role, name))
+            db.commit()
+            print(f"{name} is now {'an admin' if role == 'admin' else 'a member'}.")
         elif cmd == "remove" and name:
             if not exists:
                 sys.exit(f"No user {name}.")

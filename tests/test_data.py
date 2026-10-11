@@ -258,6 +258,19 @@ class PatchAndModeTests(unittest.TestCase):
         self.assertEqual(self.db.execute("SELECT SUM(first_tower) FROM teams WHERE match_id = 'NO_OBJECTIVES'").fetchone()[0], 0)
 
 
+class SeriesTests(unittest.TestCase):
+    def test_chart_series_carries_team_kills_and_gold_leads(self):
+        db = fixture_db()
+        self.addCleanup(db.close)
+        save_fixture(db, "SERIES_1")
+        db.commit()
+        games = stats.attach_gold(db, stats.player_games(db, "fixture-player"), "fixture-player")
+        row = stats.game_series(games)[0]
+        self.assertEqual(set(row), set(stats.SERIES_FIELDS))
+        self.assertEqual((row["kills"], row["assists"], row["team_kills"], row["lane_diff15"], row["team_diff15"]),
+                         (2, 3, 10, 1000, 5000))
+
+
 class SnapshotTests(MemoryTests):
     def test_owned_snapshot_is_explicit_and_released(self):
         with store.read_snapshot(self.db):

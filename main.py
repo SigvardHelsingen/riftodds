@@ -57,8 +57,11 @@ DDRAGON_REFRESH = 1800   # re-check Riot's live version (patch, new champions) t
 MIN_PATCH_GAMES = 50     # games a new patch needs before the landing page switches its stats to it
 HISTORY_SHARE = 0.85  # player history syncs; leaves headroom so new lookups never queue
 
+SEEN_EVERY = 60  # seconds between "last seen" writes per user
+
 log = logging.getLogger("sampler")
 state = {"sampler": {"status": "off"}, "live": {}, "last_activity": 0.0}
+_seen = {}  # username -> when "last seen" was last written
 ACTIVE_PATHS = ("/api/player", "/api/sync", "/api/live", "/api/pick")
 
 
@@ -144,9 +147,20 @@ async def require_login(request: Request, call_next):
         if not user:
             return JSONResponse({"detail": "Not logged in"}, status_code=401)
         request.state.user = user
+        if time.time() - _seen.get(user, 0) > SEEN_EVERY:
+            _seen[user] = time.time()
+            await asyncio.to_thread(track, user, "seen")
         if request.url.path.startswith(ACTIVE_PATHS):
             state["last_activity"] = time.time()  # the sampler backs off while people use the site
     return await call_next(request)
+
+
+def track(username, kind, detail=""):
+    """Record activity for admins ("seen" only updates the user's last visit). Never fails the request."""
+    try:
+        auth.seen(username) if kind == "seen" else auth.record(username, kind, detail)
+    except Exception:
+        log.warning("could not record %s activity for %s", kind, username, exc_info=True)
 
 
 class Credentials(BaseModel):
@@ -160,6 +174,7 @@ def login(creds: Credentials, request: Request, response: Response):
     token = auth.login(creds.username.strip(), creds.password, client=client)
     if not token:
         raise HTTPException(401, "Wrong username or password.")
+    track(creds.username.strip(), "login")
     response.set_cookie(auth.COOKIE, token, max_age=auth.SESSION_DAYS * 86400, httponly=True,
                         samesite="lax", secure=(SESSION_COOKIE_SECURE == "1"
                                                   or (SESSION_COOKIE_SECURE == "auto" and request.url.scheme == "https")))
@@ -175,7 +190,8 @@ def logout(request: Request, response: Response):
 
 @app.get("/api/me")
 def me(request: Request):
-    return {"username": request.state.user, "account": linked_account(request.state.user)}
+    return {"username": request.state.user, "role": auth.role_of(request.state.user),
+            "account": linked_account(request.state.user)}
 
 
 def linked_account(username):
@@ -199,13 +215,23 @@ def link_account(body: AccountLink, request: Request):
     if not p:
         raise HTTPException(404, "Look the player up first.")
     auth.set_account(request.state.user, p["platform"], p["game_name"], p["tag_line"], p["puuid"])
+    track(request.state.user, "link", f'{p["game_name"]}#{p["tag_line"]}')
     return linked_account(request.state.user)
 
 
 @app.delete("/api/me/account")
 def unlink_account(request: Request):
     auth.clear_account(request.state.user)
+    track(request.state.user, "unlink")
     return {"ok": True}
+
+
+@app.get("/api/admin/activity")
+def admin_activity(request: Request, days: int = Query(30, ge=1, le=auth.ACTIVITY_DAYS)):
+    """Users, their last visit and recent activity. Admins only (`auth.py role <user> admin`)."""
+    if auth.role_of(request.state.user) != "admin":
+        raise HTTPException(403, "Admins only.")
+    return auth.activity_report(days)
 
 
 def riot_errors(e: RiotError):
@@ -394,13 +420,14 @@ def analysis(puuid, rng, tz):
             "vs_rank": stats.champions_vs_rank(db, games, puuid, p["tier"], SOLO_QUEUE),
             "leads": stats.player_leads(db, games, puuid, p["tier"], SOLO_QUEUE),
             "mastery": stats.mastery(db, puuid, games),
+            "series": stats.game_series(games),
             "sync": history.status(puuid),
         }
 
 
 @app.get("/api/player")
-async def player(platform: str, riot_id: str, range_: str = Query(history.DEFAULT_RANGE, alias="range"),
-                 tz: int = 0, tzname: str | None = None):
+async def player(request: Request, platform: str, riot_id: str,
+                 range_: str = Query(history.DEFAULT_RANGE, alias="range"), tz: int = 0, tzname: str | None = None):
     """Resolve the player, start syncing their history for the range, and return what's cached.
 
     Small ranges usually finish within the wait below; big ones keep running in the
@@ -437,6 +464,7 @@ async def player(platform: str, riot_id: str, range_: str = Query(history.DEFAUL
         state["live"][puuid] = {"at": time.time(), "game": game, "extra": None}
 
     rng = history.resolve(range_)
+    await asyncio.to_thread(track, request.state.user, "lookup", f"{game_name}#{tag_line} ({platform}) · {rng['label']}")
     history.start(riot.background(HISTORY_SHARE), platform, puuid, solo.get("tier", "UNRANKED"), rng)
     await history.wait_for_matches(puuid, FIRST_RESPONSE_WAIT)  # timelines keep loading in the background
     # stats queries are blocking SQLite work: keep them off the event loop that drives the fetches
@@ -677,7 +705,7 @@ def pick(puuid: str, role: str, opp: int | None = None, alpha: float = Query(5.0
 
 
 @app.post("/api/sample")
-async def sample(platform: str, tier: str, division: str = "", players: int = Query(4, ge=1, le=20),
+async def sample(request: Request, platform: str, tier: str, division: str = "", players: int = Query(4, ge=1, le=20),
                  per_player: int = Query(5, ge=1, le=20)):
     """Grow one tier's baseline now: recent solo games from random players in `tier`."""
     if platform not in PLATFORMS:
@@ -687,6 +715,7 @@ async def sample(platform: str, tier: str, division: str = "", players: int = Qu
         raise HTTPException(400, "Unknown tier")
     division = division or random.choice(["I", "II", "III", "IV"])
     riot = state["riot"]
+    await asyncio.to_thread(track, request.state.user, "sample", f"{tier.title()} {division} ({platform})")
     try:
         pool = await riot.tier_players(platform, tier, division, page=random.randint(1, 3))
         if not pool:

@@ -287,6 +287,51 @@ h2 { font: 800 26px/1 var(--display); text-transform: uppercase; letter-spacing:
 .tile.plum { background: var(--plum); border-color: var(--plum); color: #fff; }
 .tile.peach { background: var(--peach); border-color: var(--peach); color: var(--ink); }
 
+/* ---------- admin ---------- */
+.admin-head { display: flex; justify-content: space-between; align-items: end; gap: 20px; flex-wrap: wrap; padding: 36px 0 24px; }
+.admin-head h1 em { color: var(--rose); }
+.linkish { background: none; border: 0; padding: 0; font: inherit; font-weight: 600; color: inherit; cursor: pointer;
+           text-decoration: underline; text-underline-offset: 3px; }
+.linkish[aria-pressed="true"] { text-decoration-color: var(--rose); text-decoration-thickness: 2px; }
+code { font: 12px var(--mono); background: var(--track); padding: 1px 5px; border-radius: 4px; }
+
+/* ---------- form chart (profile) ---------- */
+.trend-stats { margin-bottom: 20px; }
+.trend-figures { display: flex; flex-wrap: wrap; gap: 14px 44px; margin-bottom: 16px; }
+.trend-figure { min-width: 0; }
+.trend-figure .label { font: 800 13px/1.1 var(--display); text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.trend-figure .value { font: 900 40px/1 var(--display); margin: 6px 0 4px; display: flex; align-items: center; gap: 8px; }
+.trend-figure .value img { width: 32px; height: 32px; border-radius: var(--radius); }
+.trend-figure .sub { font-size: 12px; color: var(--muted); }
+.trend-plot { position: relative; margin-bottom: 12px; }
+.trend-plot svg { display: block; overflow: visible; }
+.trend-plot .grid { stroke: var(--rule); stroke-width: 1; }
+.trend-plot .zero { stroke: var(--ref); stroke-width: 1; }
+.trend-plot text { font: 11px var(--mono); fill: var(--muted); font-variant-numeric: tabular-nums; }
+.trend-plot .dot.win { fill: var(--pos); stroke: var(--card); stroke-width: 3; paint-order: stroke; }  /* ring outside the 8px dot */
+.trend-plot .dot.loss { fill: var(--card); stroke: var(--neg); stroke-width: 2; }
+.trend-plot.dense .dot { stroke-width: 1; opacity: .6; }
+.trend-plot .avg { fill: none; stroke: var(--mag); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+.trend-plot .avg-end { fill: var(--mag); stroke: var(--card); stroke-width: 2; }
+.trend-plot .cross { stroke: var(--ink); stroke-width: 1; opacity: .45; }
+.trend-plot .focus-dot { fill: none; stroke: var(--ink); stroke-width: 2; }
+.trend-hit { position: absolute; cursor: crosshair; touch-action: pan-y; border-radius: 4px; }
+.trend-hit:focus-visible { outline: 2px solid var(--ink); outline-offset: 4px; }
+.trend-tip { position: absolute; z-index: 2; pointer-events: none; min-width: 170px; max-width: 240px; padding: 8px 10px;
+             background: var(--card); border: 2px solid var(--ink); border-radius: var(--radius); font-size: 12px; line-height: 1.45; }
+.trend-tip b { display: block; font: 600 17px/1.3 var(--mono); }
+.trend-tip .key { display: inline-block; width: 14px; height: 2px; margin-right: 6px; vertical-align: 3px; background: var(--mag); }
+.trend-empty { margin: 24px 0; }
+.trend-plot .table-scroll { max-height: 380px; overflow-y: auto; }
+/* draw the average, pop the games in left to right, fade the axes */
+.trend-plot.animate .avg { stroke-dasharray: 1; animation: trend-draw 1.1s cubic-bezier(.3, .7, .2, 1) .15s both; }
+.trend-plot.animate .avg-end { animation: trend-fade .3s ease-out 1.1s both; }
+.trend-plot.animate .dot { transform-box: fill-box; transform-origin: center; animation: trend-pop .4s cubic-bezier(.3, 1.5, .5, 1) var(--d) both; }
+.trend-plot.animate .grid, .trend-plot.animate .zero, .trend-plot.animate text { animation: trend-fade .5s ease-out both; }
+@keyframes trend-draw { from { stroke-dashoffset: 1; } to { stroke-dashoffset: 0; } }
+@keyframes trend-pop { from { opacity: 0; transform: scale(.2); } }
+@keyframes trend-fade { from { opacity: 0; } }
+
 /* ---------- tables (form guide) ---------- */
 .table-scroll { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; }
 .table-scroll:focus-visible { outline: 3px solid var(--rose); outline-offset: 2px; }
@@ -335,6 +380,8 @@ td.rank { font: 900 22px/1 var(--display); color: var(--plum); width: 36px; }
 .legend i.band { width: 16px; height: 6px; border-radius: 4px; opacity: .28; background: var(--you); vertical-align: 1px; }
 .legend i.line { width: 2px; height: 12px; border-radius: 0; vertical-align: -2px; }
 .legend i.sq { border-radius: 2px; }
+.legend i.ring { background: var(--card); border: 2px solid var(--neg); }
+.legend i.stroke { width: 16px; height: 2px; border-radius: 1px; vertical-align: 3px; }
 
 /* ---------- player ---------- */
 .player-head { display: flex; align-items: end; gap: 20px; padding: 36px 0 24px; flex-wrap: wrap; }
@@ -420,6 +467,9 @@ td.rank { font: 900 22px/1 var(--display); color: var(--plum); width: 36px; }
   .tile .value { font-size: clamp(30px, 8vw, 42px); flex-wrap: wrap; gap: 6px; }
   .tile .value .sm { font-size: 24px; }
   .tile .value img { width: 32px; height: 32px; }
+  .trend-figures { gap: 12px 24px; }
+  .trend-figure .value { font-size: 30px; }
+  .trend-figure .value img { width: 26px; height: 26px; }
   .player-head { display: grid; grid-template-columns: 64px minmax(0, 1fr); align-items: center; gap: 16px 12px; padding: 24px 0 20px; }
   .avatar, .badge { width: 64px; height: 64px; }
   .player-head .who { min-width: 0; }
@@ -453,4 +503,5 @@ td.rank { font: 900 22px/1 var(--display); color: var(--plum); width: 36px; }
 
 @media (prefers-reduced-motion: reduce) {
   .spinner, .live-dot, .sampler .dotlive { animation: none; }
+  .trend-plot.animate * { animation: none !important; }
 }
