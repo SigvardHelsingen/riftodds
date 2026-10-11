@@ -4,10 +4,13 @@ import copy
 import os
 import time
 from collections import deque
-from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+
+from config import load_env
+
+load_env()
 
 # platform -> regional routing for match-v5 / account-v1
 PLATFORMS = {
@@ -18,17 +21,7 @@ PLATFORMS = {
 }
 
 
-def _load_env():
-    env = Path(__file__).with_name(".env")
-    if env.exists():
-        for line in env.read_text().splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
-
-
-_load_env()
+RIOT_HOSTS = frozenset(PLATFORMS) | frozenset(PLATFORMS.values())
 
 
 class RiotError(Exception):
@@ -135,9 +128,9 @@ class Riot:
         key = os.environ.get("RIOT_API_KEY")
         if not key:
             raise RuntimeError("RIOT_API_KEY is not set (env or .env)")
+        self.limiter = RateLimiter(_parse_limits(os.environ.get("RIOT_RATE_LIMITS", "20:1,100:120")))
         self.http = httpx.AsyncClient(headers={"X-Riot-Token": key}, timeout=20,
                                       limits=httpx.Limits(max_connections=60))
-        self.limiter = RateLimiter(_parse_limits(os.environ.get("RIOT_RATE_LIMITS", "20:1,100:120")))
         self.share = 1.0
 
     def background(self, share=0.6):
@@ -147,6 +140,10 @@ class Riot:
         return bg
 
     async def get(self, host, path, method, params=None, allow_404=False):
+        if host not in RIOT_HOSTS:
+            raise RiotError(400, "Unknown Riot routing host")
+        if not path.startswith("/"):
+            raise RiotError(400, "Riot paths must start with /")
         url = f"https://{host}.api.riotgames.com{path}"
         for attempt in range(6):
             await self.limiter.acquire([("app", host), ("method", host, method)], self.share)
@@ -221,13 +218,29 @@ class Riot:
 
 
 DDRAGON = "https://ddragon.leagueoflegends.com"
+DDRAGON_ATTEMPTS = 3
+
+
+async def _ddragon_json(client, path):
+    for attempt in range(DDRAGON_ATTEMPTS):
+        try:
+            response = await client.get(f"{DDRAGON}{path}")
+            response.raise_for_status()
+            return response.json()
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code < 500 and e.response.status_code != 429:
+                raise
+            if attempt == DDRAGON_ATTEMPTS - 1:
+                raise
+            await asyncio.sleep(attempt + 1)
+    raise RuntimeError("Data Dragon retry attempts must be positive")
 
 
 async def load_champions():
     """(ddragon version, {championId: {name, icon}}) from Data Dragon."""
     async with httpx.AsyncClient(timeout=20) as c:
-        version = (await c.get(f"{DDRAGON}/api/versions.json")).json()[0]
-        data = (await c.get(f"{DDRAGON}/cdn/{version}/data/en_US/champion.json")).json()["data"]
+        version = (await _ddragon_json(c, "/api/versions.json"))[0]
+        data = (await _ddragon_json(c, f"/cdn/{version}/data/en_US/champion.json"))["data"]
     return version, {
         int(ch["key"]): {"name": ch["name"], "icon": f"{DDRAGON}/cdn/{version}/img/champion/{ch['id']}.png"}
         for ch in data.values()
@@ -237,7 +250,7 @@ async def load_champions():
 async def load_spells(version):
     """{summonerSpellId: icon url} from Data Dragon."""
     async with httpx.AsyncClient(timeout=20) as c:
-        data = (await c.get(f"{DDRAGON}/cdn/{version}/data/en_US/summoner.json")).json()["data"]
+        data = (await _ddragon_json(c, f"/cdn/{version}/data/en_US/summoner.json"))["data"]
     return {int(sp["key"]): f"{DDRAGON}/cdn/{version}/img/spell/{sp['image']['full']}" for sp in data.values()}
 
 

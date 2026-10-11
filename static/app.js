@@ -31,7 +31,10 @@ async function api(path, opts) {
     showLogin(); // session expired or user removed
     throw new Error("Not logged in");
   }
-  if (!r.ok) throw new Error(body.detail || `HTTP ${r.status}`);
+  if (!r.ok) {
+    const detail = Array.isArray(body.detail) ? body.detail.map((error) => error.msg).join("; ") : body.detail;
+    throw new Error(detail || `HTTP ${r.status}`);
+  }
   return body;
 }
 
@@ -40,17 +43,21 @@ const postJSON = (path, data) =>
 
 // ---------------------------------------------------------------- login
 function showLogin() {
+  nav++;
+  ME = null;
+  DATA = null;
   clearInterval(pollTimer);
+  clearInterval(livePoll);
   $("#top-search").hidden = true;
   $("#user").hidden = true;
   $("#app").innerHTML = `
     <section class="login">
       <h1>Members<br><em>only.</em></h1>
       <form class="card" id="login-form">
-        <label>Username<input name="username" autocomplete="username" required autofocus></label>
-        <label>Password<input name="password" type="password" autocomplete="current-password" required></label>
+        <label>Username<input name="username" autocomplete="username" maxlength="64" required autofocus></label>
+        <label>Password<input name="password" type="password" autocomplete="current-password" minlength="8" maxlength="1024" required></label>
         <button class="btn">Log in</button>
-        <p class="error small" id="login-error"></p>
+        <p class="error small" id="login-error" aria-live="polite"></p>
       </form>
     </section>`;
   const form = $("#login-form");
@@ -111,9 +118,9 @@ const WR_LEGEND = (refLabel) => legend([
 function searchForm(cls) {
   const last = JSON.parse(localStorage.getItem("last") || "{}");
   return `<form class="search ${cls}">
-    <input name="riot" placeholder="Riot ID — Name#TAG" required autocomplete="off" value="${esc(last.riotId || "")}">
-    <select name="platform">${META.platforms.map((p) => `<option ${p === (last.platform || "euw1") ? "selected" : ""}>${p}</option>`).join("")}</select>
-    <button class="btn">Analyse</button></form>`;
+    <input name="riot" aria-label="Riot ID" placeholder="Name#TAG" required autocomplete="off" value="${esc(last.riotId || "")}">
+    <select name="platform" aria-label="Region">${META.platforms.map((p) => `<option ${p === (last.platform || "euw1") ? "selected" : ""}>${p}</option>`).join("")}</select>
+    <button class="btn" aria-label="Analyse player">${cls === "compact" ? "Go" : "Analyse"}</button></form>`;
 }
 
 function bindSearch(form) {
@@ -128,10 +135,34 @@ function bindSearch(form) {
   form.riot.addEventListener("input", () => form.riot.setCustomValidity(""));
 }
 
+function prepareTables(root = $("#app")) {
+  if (!root) return;
+  $$("table", root).forEach((table) => {
+    if (table.parentElement.classList.contains("table-scroll")) return;
+    const heading = table.closest(".mh-team")?.querySelector(".mh-team-head b")?.textContent
+      || table.closest(".card")?.querySelector("h2")?.textContent || "Statistics";
+    const wrapper = document.createElement("div");
+    wrapper.className = "table-scroll";
+    wrapper.tabIndex = 0;
+    wrapper.setAttribute("role", "region");
+    wrapper.setAttribute("aria-label", `${heading} table, scroll horizontally for more columns`);
+    table.before(wrapper);
+    wrapper.append(table);
+    if (table.rows[0]?.cells.length > 3) {
+      const hint = document.createElement("p");
+      hint.className = "table-hint";
+      hint.textContent = "Swipe the table to see all stats →";
+      hint.setAttribute("aria-hidden", "true");
+      wrapper.after(hint);
+    }
+  });
+}
+
 // ---------------------------------------------------------------- router
 async function route() {
   nav++;
   clearInterval(pollTimer);
+  clearInterval(livePoll);
   const m = (location.hash.slice(1) || "/").match(/^\/p\/([^/]+)\/([^/]+)(?:\/(\w+))?/);
   const top = $("#top-search");
   top.hidden = !m;
@@ -164,12 +195,19 @@ async function showLanding() {
   if (token === nav) pollTimer = setInterval(loadPatch, 30000);
 }
 
+let patchRequest = 0;
 async function loadPatch() {
+  const token = nav;
+  const request = ++patchRequest;
   try {
-    PATCH = await api(`/api/patch${view.landing.tier ? `?tier=${view.landing.tier}` : ""}`);
-    if ($("#patch-body")) renderPatch();
+    const data = await api(`/api/patch${view.landing.tier ? `?tier=${view.landing.tier}` : ""}`);
+    if (token !== nav || request !== patchRequest || !$("#patch-body")) return;
+    PATCH = data;
+    renderPatch();
   } catch (e) {
-    $("#patch-body").innerHTML = `<div class="card empty error">${esc(e.message)}</div>`;
+    if (token === nav && request === patchRequest && $("#patch-body")) {
+      $("#patch-body").innerHTML = `<div class="card empty error">${esc(e.message)}</div>`;
+    }
   }
 }
 
@@ -267,6 +305,7 @@ function renderPatch() {
   chipGroup("#sort-chips", "sort");
   chipGroup("#role-chips", "role");
   $("#show-all")?.addEventListener("click", () => { L.all = !L.all; renderPatch(); });
+  prepareTables($("#patch-body"));
 }
 
 function leadCard(leads) {
@@ -423,7 +462,7 @@ function renderPlayer() {
       <div class="actions">
         ${isMe ? `<span class="me-tag" title="Linked to your login">Your account</span><button class="btn ghost" id="unlink">Unlink</button>`
                : `<button class="btn ghost" id="link">This is me</button>`}
-        <select id="range" title="Which ranked solo games to analyse">
+        <select id="range" aria-label="Game range" title="Which ranked solo games to analyse">
           <optgroup label="Games">${rangeOptions("count")}</optgroup>
           <optgroup label="Time">${rangeOptions("time")}</optgroup>
         </select>
@@ -475,11 +514,14 @@ function renderPlayer() {
       ${best ? tile(`Best vs ${p.tier === "UNRANKED" ? "rank" : title(p.tier)}`, `${icon(best.champion_id)}<span class="sm">${esc(champ(best.champion_id).name)}</span>`,
         `${pts(best.delta)} vs rank · ${pct(best.p_better)} sure you're better`) : tile("Best vs rank", "–", "Not enough data yet")}
     </div>
-    <nav class="tabs">${tabs.map(([v, l]) => `<button data-tab="${v}" class="${view.player.tab === v ? "active" : ""}">${l}</button>`).join("")}</nav>
+    <nav class="tabs" aria-label="Player statistics">${tabs.map(([v, l]) => `<button data-tab="${v}" aria-pressed="${view.player.tab === v}" class="${view.player.tab === v ? "active" : ""}">${l}</button>`).join("")}</nav>
     <div id="tab-body"></div>`;
   $$(".tabs button").forEach((b) => b.addEventListener("click", () => {
     view.player.tab = b.dataset.tab;
-    $$(".tabs button").forEach((x) => x.classList.toggle("active", x === b));
+    $$(".tabs button").forEach((x) => {
+      x.classList.toggle("active", x === b);
+      x.setAttribute("aria-pressed", x === b);
+    });
     renderTab();
   }));
   renderTab();
@@ -488,6 +530,7 @@ function renderPlayer() {
 function renderTab() {
   clearInterval(livePoll);
   ({ live: tabLive, champions: tabChampions, matches: tabMatches, draft: tabDraft, habits: tabHabits, wincons: tabWincons })[view.player.tab]();
+  prepareTables($("#tab-body"));
 }
 
 function tabChampions() {
@@ -547,7 +590,7 @@ function tabDraft() {
       <div class="controls">
         <label for="pick-opp">Lane opponent</label><select id="pick-opp"><option value="">Any opponent</option></select>
         <label for="pick-alpha" title="How strongly to lean on the overall role picks when there are few games vs this opponent">Smoothing <span style="text-transform:none">α</span></label>
-        <input id="pick-alpha" type="number" min="0" max="50" step="1" value="${view.player.alpha ?? 5}" style="width:72px">
+        <input id="pick-alpha" type="number" min="0" max="50" step="1" value="${view.player.alpha ?? 5}">
       </div>
       <div id="pick-out"><div class="loading"><div class="spinner"></div></div></div>
     </div>
@@ -568,20 +611,36 @@ function fetchPick() {
   return api(`/api/pick?${q}`);
 }
 
-async function fillOpponents() {
+function fillOpponents() {
   const opp = view.player.opp;
-  $("#pick-opp").innerHTML = opp ? `<option value="${opp}" selected></option>` : "";  // so the first fetch keeps it
-  const res = await fetchPick();
-  const seen = new Set(res.opponents.map((o) => o.champion_id));
-  const all = Object.entries(META.champions).sort((a, b) => a[1].name.localeCompare(b[1].name));
-  $("#pick-opp").innerHTML = `<option value="">Any opponent</option>
-    <optgroup label="Faced in this role">${res.opponents.map((o) => `<option value="${o.champion_id}">${esc(champ(o.champion_id).name)} (${o.games})</option>`).join("")}</optgroup>
-    <optgroup label="All champions">${all.filter(([id]) => !seen.has(+id)).map(([id, c]) => `<option value="${id}">${esc(c.name)}</option>`).join("")}</optgroup>`;
-  $("#pick-opp").value = opp;
-  renderPick(res);
+  $("#pick-opp").innerHTML = opp ? `<option value="${esc(opp)}" selected></option>` : "";  // so the first fetch keeps it
+  return updatePick(true);
 }
 
-async function updatePick() { renderPick(await fetchPick()); }
+let pickRequest = 0;
+async function updatePick(fill = false) {
+  const output = $("#pick-out");
+  if (!output) return;
+  const token = nav;
+  const request = ++pickRequest;
+  const opp = view.player.opp;
+  const current = () => token === nav && request === pickRequest && output.isConnected && view.player.tab === "draft";
+  try {
+    const res = await fetchPick();
+    if (!current()) return;
+    if (fill) {
+      const seen = new Set(res.opponents.map((o) => o.champion_id));
+      const all = Object.entries(META.champions).sort((a, b) => a[1].name.localeCompare(b[1].name));
+      $("#pick-opp").innerHTML = `<option value="">Any opponent</option>
+        <optgroup label="Faced in this role">${res.opponents.map((o) => `<option value="${o.champion_id}">${esc(champ(o.champion_id).name)} (${o.games})</option>`).join("")}</optgroup>
+        <optgroup label="All champions">${all.filter(([id]) => !seen.has(+id)).map(([id, c]) => `<option value="${id}">${esc(c.name)}</option>`).join("")}</optgroup>`;
+      $("#pick-opp").value = opp;
+    }
+    renderPick(res);
+  } catch (e) {
+    if (current()) output.innerHTML = `<p class="error">${esc(e.message)}</p>`;
+  }
+}
 
 function renderPick(res) {
   const hasOpp = res.opp != null;
@@ -601,6 +660,7 @@ function renderPick(res) {
       <td style="width:50%" title="${pct(p(r), 1)}${hasOpp ? ` · usual ${pct(r.p_role, 1)}` : ""}">${barCell(p(r), pct(p(r), 1), { tick: hasOpp ? r.p_role : null, thick: true })}</td>
       <td class="num">${hasOpp ? `${r.games_vs} <span class="muted small">/ ${r.games}</span>` : r.games}</td>
       <td class="num" title="${esc(wrTip(hasOpp ? r.wr_vs : r.wr))}">${wrText(hasOpp ? r.wr_vs : r.wr)}</td></tr>`).join("")}</tbody></table>`;
+  prepareTables($("#pick-out"));
 }
 
 function wrTable(head, rows) {
@@ -753,24 +813,28 @@ async function loadMatchDetail(mid) {
       <td style="width:20%">${barCell(p.damage / maxDmg, kpts(p.damage))}</td>
       <td class="num">${p.gold15 == null ? "–" : kpts(p.gold15)}</td>
       <td>${items(p.items)}</td></tr>`).join("")}</tbody></table></div>`).join("");
+  prepareTables(el);
 }
 
 // ---------------------------------------------------------------- live game
 let livePoll = null;
+let liveRequest = 0;
 
 async function tabLive() {
   $("#tab-body").innerHTML = `<div class="loading"><div class="spinner"></div>Loading the live game…</div>`;
   const token = nav;
   const puuid = DATA.puuid;
+  const request = ++liveRequest;
+  let timer;
   const load = async () => {
     const live = await api(`/api/live/${puuid}?form=${view.player.liveForm ? 1 : 0}`).catch((e) => ({ error: e.message }));
-    if (token !== nav || view.player.tab !== "live" || DATA.puuid !== puuid) return clearInterval(livePoll);
+    if (token !== nav || request !== liveRequest || view.player.tab !== "live" || DATA?.puuid !== puuid) return clearInterval(timer);
     renderLive(live);
-    if (live.error || !live.in_game || !live.pending) clearInterval(livePoll);
+    if (live.error || !live.in_game || !live.pending) clearInterval(timer);
   };
-  await load();
   clearInterval(livePoll);
-  livePoll = setInterval(load, 5000);
+  livePoll = timer = setInterval(load, 5000);
+  await load();
 }
 
 function renderLive(live) {
@@ -800,6 +864,7 @@ function renderLive(live) {
         <span class="muted small">≈${live.without_history * (live.form_games + 1)} API requests</span>` : ""}</div>
     ${side(100, "Blue side")}${side(200, "Red side")}`;
   $("#live-form")?.addEventListener("click", () => { view.player.liveForm = true; tabLive(); });
+  prepareTables(el);
 }
 
 // ---------------------------------------------------------------- boot
@@ -828,5 +893,5 @@ $("#logout").addEventListener("click", async () => {
   await postJSON("/api/logout", {});
   showLogin();
 });
-window.addEventListener("hashchange", () => META && route());
+window.addEventListener("hashchange", () => ME && META && route());
 start();

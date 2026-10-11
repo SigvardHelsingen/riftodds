@@ -7,6 +7,7 @@ import json
 import sqlite3
 import time
 import zlib
+from contextlib import contextmanager
 from pathlib import Path
 
 DB_PATH = Path(__file__).with_name("cache.db")
@@ -76,13 +77,30 @@ MIGRATIONS = [("players", "profile_icon", "INTEGER"), ("players", "level", "INTE
 
 def connect():
     db = sqlite3.connect(DB_PATH, timeout=30)
-    db.row_factory = sqlite3.Row
-    db.execute("PRAGMA journal_mode=WAL")  # stats reads don't block (or wait on) history writes
-    db.executescript(SCHEMA)
-    for table, col, kind in MIGRATIONS:
-        if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
-            db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+    try:
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")  # stats reads don't block (or wait on) history writes
+        db.executescript(SCHEMA)
+        for table, col, kind in MIGRATIONS:
+            if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+    except BaseException:
+        db.close()
+        raise
     return db
+
+
+@contextmanager
+def read_snapshot(db):
+    """Use one read snapshot, leaving any caller-owned transaction untouched."""
+    owned = not db.in_transaction
+    if owned:
+        db.execute("BEGIN")  # sqlite3 does not implicitly BEGIN for SELECTs
+    try:
+        yield db
+    finally:
+        if owned:
+            db.rollback()
 
 
 def archive(reason):

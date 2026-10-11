@@ -84,6 +84,16 @@ def any_running():
     return any(j["running"] for j in jobs.values())
 
 
+def _finish(j, task=None):
+    if not j["running"]:
+        return
+    if task is not None and task.cancelled():
+        j["phase"] = "cancelled"
+    j["running"] = False
+    j["finished"] = time.time()
+    j["matches_ready"].set()
+
+
 def start(riot, platform, puuid, tier, rng, replace=True, timelines=True):
     """Start a sync job for this player, or reuse the running one.
 
@@ -95,12 +105,15 @@ def start(riot, platform, puuid, tier, rng, replace=True, timelines=True):
         if j["range"] == rng["key"] or not replace:
             return j["task"]
         j["task"].cancel()  # switched range: anything already fetched stays cached
-    elif j and not replace and time.time() - j["finished"] < RESYNC_AFTER:
+    elif (j and not replace and j["phase"] == "done" and not j["error"]
+          and time.time() - j["finished"] < RESYNC_AFTER):
         return j["task"]  # e.g. live-view polling: don't re-list a player every few seconds
     j = jobs[puuid] = {"range": rng["key"], "phase": "listing", "total": None, "done": 0, "running": True,
                        "error": None, "finished": 0, "seen": time.time(), "incidental": not replace,
                        "matches_ready": asyncio.Event()}  # set once every match is cached (timelines may follow)
     j["task"] = asyncio.create_task(_run(riot, platform, puuid, tier, rng, j, timelines, queued=not replace))
+    # Cancellation before the coroutine first runs cannot reach its finally block.
+    j["task"].add_done_callback(lambda task: _finish(j, task))
     return j["task"]
 
 
@@ -114,23 +127,63 @@ async def _list_ids(riot, platform, puuid, rng):
             return ids
 
 
+class FetchChunkError(RuntimeError):
+    def __init__(self, errors, completed):
+        self.errors = tuple(errors)
+        self.completed = completed
+        super().__init__("Failed to cache results: " + "; ".join(errors))
+
+
 async def fetch_chunk(riot, db, platform, ids, tier, timelines=True):
-    """Fetch whatever is missing (match and/or timeline) for `ids` in parallel, then save."""
-    need_match = [m for m in ids if not store.has_match(db, m)]
-    need_tl = [m for m in ids if timelines and not store.has_timeline(db, m)]
-    results = await asyncio.gather(*(riot.match(platform, m) for m in need_match),
-                                   *(riot.timeline(platform, m) for m in need_tl), return_exceptions=True)
-    matches, tls = results[:len(need_match)], results[len(need_match):]
-    for m in matches:
-        if isinstance(m, dict):
-            store.save_match(db, platform, m)
-    for mid, tl in zip(need_tl, tls):
-        if not isinstance(tl, Exception) and store.has_match(db, mid):
-            store.save_timeline(db, mid, tl)
-    for mid in ids:
-        if tier and store.has_match(db, mid):
-            store.tag_tier(db, mid, tier)
-    db.commit()
+    """Commit valid results, then raise FetchChunkError for failed IDs.
+
+    This function owns the chunk's commit/rollback, but not the connection. No
+    transaction is left open on return or failure, including cancellation.
+    """
+    errors = []
+    try:
+        need_match = [m for m in ids if not store.has_match(db, m)]
+        need_tl = [m for m in ids if timelines and not store.has_timeline(db, m)]
+        results = await asyncio.gather(*(riot.match(platform, m) for m in need_match),
+                                       *(riot.timeline(platform, m) for m in need_tl), return_exceptions=True)
+        matches, tls = results[:len(need_match)], results[len(need_match):]
+        if not db.in_transaction:
+            db.execute("BEGIN")
+        for kind, needed, fetched in (("match", need_match, matches), ("timeline", need_tl, tls)):
+            for mid, result in zip(needed, fetched):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                if isinstance(result, Exception):
+                    errors.append(f"{kind} {mid}: {type(result).__name__}: {result}")
+                    continue
+                if kind == "timeline" and not store.has_match(db, mid):
+                    continue  # the corresponding match failure is already reported
+                db.execute("SAVEPOINT fetch_item")
+                try:
+                    if kind == "match":
+                        if not isinstance(result, dict) or result.get("metadata", {}).get("matchId") != mid:
+                            raise ValueError("expected a match object with the requested matchId")
+                        store.save_match(db, platform, result)
+                    else:
+                        if result is not None and (not isinstance(result, dict) or not result):
+                            raise ValueError("expected a timeline object or an unavailable response")
+                        store.save_timeline(db, mid, result)
+                except Exception as e:
+                    db.execute("ROLLBACK TO fetch_item")
+                    errors.append(f"{kind} {mid}: {type(e).__name__}: {e}")
+                finally:
+                    db.execute("RELEASE fetch_item")
+        for mid in ids:
+            if tier and store.has_match(db, mid):
+                store.tag_tier(db, mid, tier)
+        completed = sum(store.has_match(db, mid) and (not timelines or store.has_timeline(db, mid))
+                        for mid in ids)
+        db.commit()
+    except BaseException:
+        db.rollback()
+        raise
+    if errors:
+        raise FetchChunkError(errors, completed)
 
 
 async def _phase(j, name, todo, step):
@@ -140,22 +193,28 @@ async def _phase(j, name, todo, step):
         if not j["incidental"] and time.time() - j["seen"] > ORPHAN_AFTER:
             j["phase"] = "paused"  # nobody is watching; what's fetched stays cached, next visit resumes
             return False
-        await step(todo[i:i + CHUNK])
-        j["done"] += len(todo[i:i + CHUNK])
+        chunk = todo[i:i + CHUNK]
+        try:
+            await step(chunk)
+        except FetchChunkError as e:
+            j["done"] += e.completed
+            raise
+        j["done"] += len(chunk)
     return True
 
 
 async def _run(riot, platform, puuid, tier, rng, j, timelines, queued=False):
     global _incidental
-    if queued:
-        _incidental = _incidental or asyncio.Semaphore(2)
-        async with _incidental:
-            return await _run(riot, platform, puuid, tier, rng, j, timelines)
+    db, slot = None, None
     try:
+        if queued:
+            _incidental = _incidental or asyncio.Semaphore(2)
+            await _incidental.acquire()
+            slot = _incidental
         ids = await _list_ids(riot, platform, puuid, rng)
         db = store.connect()
         for m in ids:
-            if store.has_match(db, m):
+            if tier and store.has_match(db, m):
                 store.tag_tier(db, m, tier)
         db.commit()
         if not await _phase(j, "matches", [m for m in ids if not store.has_match(db, m)],
@@ -169,11 +228,19 @@ async def _run(riot, platform, puuid, tier, rng, j, timelines, queued=False):
                 return
         j["phase"] = "done"
     except asyncio.CancelledError:
+        j["phase"] = "cancelled"
         raise
     except Exception as e:  # surfaced to the UI via status()
         j["error"] = str(e)
         log.exception("history sync failed for %s", puuid)
     finally:
-        j["running"] = False
-        j["finished"] = time.time()
-        j["matches_ready"].set()
+        try:
+            if db is not None:
+                try:
+                    db.rollback()
+                finally:
+                    db.close()
+        finally:
+            if slot is not None:
+                slot.release()
+            _finish(j)

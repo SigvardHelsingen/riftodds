@@ -10,13 +10,17 @@ import logging
 import os
 import random
 import time
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+from config import load_env
+
+load_env()
 
 import auth
 import history
@@ -28,6 +32,9 @@ SOLO_QUEUE = 420
 TIERS = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND",
          "MASTER", "GRANDMASTER", "CHALLENGER"]
 STATIC = Path(__file__).with_name("static")
+SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "auto").strip().lower()
+if SESSION_COOKIE_SECURE not in {"auto", "0", "1"}:
+    raise RuntimeError("SESSION_COOKIE_SECURE must be auto, 0 or 1")
 
 SAMPLER = {
     "enabled": os.environ.get("SAMPLER", "1") != "0",
@@ -54,20 +61,24 @@ ACTIVE_PATHS = ("/api/player", "/api/sync", "/api/live", "/api/pick")
 
 @asynccontextmanager
 async def lifespan(app):
-    state["riot"] = Riot()
-    state["ddragon"], state["champions"] = await load_champions()
-    state["spells"] = await load_spells(state["ddragon"])
-    await ensure_cache_matches_key(state["riot"])
-    store.backfill_bans(store.connect())
-    tasks = [asyncio.create_task(refresh_ddragon())]
-    if SAMPLER["enabled"]:
-        tasks.append(asyncio.create_task(sampler()))
-    yield
-    for task in tasks:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
-    await state["riot"].http.aclose()
+    riot = state["riot"] = Riot()
+    tasks = []
+    try:
+        state["ddragon"], state["champions"] = await load_champions()
+        state["spells"] = await load_spells(state["ddragon"])
+        await ensure_cache_matches_key(riot)
+        store.backfill_bans(store.connect())
+        tasks.append(asyncio.create_task(refresh_ddragon()))
+        if SAMPLER["enabled"]:
+            tasks.append(asyncio.create_task(sampler()))
+        yield
+    finally:
+        for task in tasks:
+            task.cancel()
+        try:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        finally:
+            await riot.http.aclose()
 
 
 async def refresh_ddragon():
@@ -109,8 +120,11 @@ async def ensure_cache_matches_key(riot):
         try:
             acc = await riot.account(link["platform"], link["game_name"], link["tag_line"])
             auth.set_account(link["username"], link["platform"], acc["gameName"], acc["tagLine"], acc["puuid"])
-        except RiotError:
-            auth.clear_account(link["username"])
+        except RiotError as e:
+            if e.status == 404:
+                auth.clear_account(link["username"])
+            else:
+                log.warning("could not re-resolve linked account for %s: %s", link["username"], e)
 
 
 app = FastAPI(lifespan=lifespan)
@@ -123,7 +137,7 @@ PUBLIC_API = {"/api/login", "/api/logout"}
 async def require_login(request: Request, call_next):
     """Every /api route except login/logout needs a valid session. The page shell is public."""
     if request.url.path.startswith("/api/") and request.url.path not in PUBLIC_API:
-        user = auth.user_for(request.cookies.get(auth.COOKIE))
+        user = await asyncio.to_thread(auth.user_for, request.cookies.get(auth.COOKIE))
         if not user:
             return JSONResponse({"detail": "Not logged in"}, status_code=401)
         request.state.user = user
@@ -133,17 +147,19 @@ async def require_login(request: Request, call_next):
 
 
 class Credentials(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=auth.MAX_USERNAME_LENGTH)
+    password: str = Field(min_length=auth.MIN_PASSWORD_LENGTH, max_length=auth.MAX_PASSWORD_LENGTH)
 
 
 @app.post("/api/login")
 def login(creds: Credentials, request: Request, response: Response):
-    token = auth.login(creds.username.strip(), creds.password)
+    client = request.client.host if request.client else "unknown"
+    token = auth.login(creds.username.strip(), creds.password, client=client)
     if not token:
         raise HTTPException(401, "Wrong username or password.")
     response.set_cookie(auth.COOKIE, token, max_age=auth.SESSION_DAYS * 86400, httponly=True,
-                        samesite="lax", secure=request.url.scheme == "https")
+                        samesite="lax", secure=(SESSION_COOKIE_SECURE == "1"
+                                                  or (SESSION_COOKIE_SECURE == "auto" and request.url.scheme == "https")))
     return {"username": creds.username.strip()}
 
 
@@ -193,20 +209,20 @@ def riot_errors(e: RiotError):
     bad_key = "Riot API key rejected (dev keys expire every 24h — refresh RIOT_API_KEY in .env and restart)."
     msg = {401: bad_key, 403: bad_key,
            404: "Not found on Riot's side — check the Riot ID and region."}.get(e.status, str(e))
-    return HTTPException(e.status if e.status in (401, 403, 404) else 502, msg)
+    return HTTPException(404 if e.status == 404 else 502, msg)
 
 
 async def fetch_matches(riot, platform, ids, tier, chunk=40, stop=None):
     """Fetch uncached matches + timelines for `ids` and tag them with the rank population.
 
     `stop()` is checked between chunks so background work can give way mid-batch."""
-    db = store.connect()
-    before = sum(1 for m in ids if store.has_match(db, m))
-    for i in range(0, len(ids), chunk):
-        if stop and stop():
-            break
-        await history.fetch_chunk(riot, db, platform, ids[i:i + chunk], tier)
-    return sum(1 for m in ids if store.has_match(db, m)) - before
+    with closing(store.connect()) as db:
+        before = sum(1 for m in ids if store.has_match(db, m))
+        for i in range(0, len(ids), chunk):
+            if stop and stop():
+                break
+            await history.fetch_chunk(riot, db, platform, ids[i:i + chunk], tier)
+        return sum(1 for m in ids if store.has_match(db, m)) - before
 
 
 def patch_matches(db, patch):
@@ -330,39 +346,39 @@ def meta():
 def patch(tier: str | None = None):
     """Stats for the live patch — or, right after a patch drops, the previous one until the
     sampler has enough games on the new one (`patch` vs `current_patch` tells the client)."""
-    db = store.connect()
-    current = current_patch(db)
-    current_games = patch_matches(db, current)
-    shown = current if current_games >= MIN_PATCH_GAMES else (stats.latest_patch(db) or current)
-    overview = stats.patch_overview(db, shown, tier) if shown else {"patch": None, "matches": 0, "tiers": []}
-    if shown and overview["matches"]:
-        overview["leads"] = stats.patch_lead_curve(db, shown, tier)
-    return {**overview, "current_patch": current, "current_patch_games": current_games, "sampler": state["sampler"]}
+    with closing(store.connect()) as db, store.read_snapshot(db):
+        current = current_patch(db)
+        current_games = patch_matches(db, current)
+        shown = current if current_games >= MIN_PATCH_GAMES else (stats.latest_patch(db) or current)
+        overview = stats.patch_overview(db, shown, tier) if shown else {"patch": None, "matches": 0, "tiers": []}
+        if shown and overview["matches"]:
+            overview["leads"] = stats.patch_lead_curve(db, shown, tier)
+        return {**overview, "current_patch": current, "current_patch_games": current_games, "sampler": state["sampler"]}
 
 
 def analysis(puuid, rng, tz):
     """Stats for the player's cached games in `rng` — cheap, no Riot calls."""
-    db = store.connect()
-    p = store.get_player(db, puuid)
-    if not p:
-        raise HTTPException(404, "Unknown player")
-    games = stats.attach_gold(db, history.window(stats.player_games(db, puuid, SOLO_QUEUE), rng), puuid)
-    return {
-        "puuid": puuid,
-        "profile": {"name": p["game_name"], "tag": p["tag_line"], "platform": p["platform"],
-                    "tier": p["tier"], "division": p["division"], "lp": p["lp"],
-                    "season_wins": p["wins"], "season_losses": p["losses"], "level": p["level"],
-                    "icon": profile_icon(state["ddragon"], p["profile_icon"]) if p["profile_icon"] is not None else None},
-        "range": {"key": rng["key"], "label": rng["label"]},
-        "games_analysed": len(games),
-        "first_game": games[0]["game_start"] if games else None,
-        "last_game": games[-1]["game_start"] if games else None,
-        "overview": stats.overview(games, tz) if games else None,
-        "vs_rank": stats.champions_vs_rank(db, games, puuid, p["tier"], SOLO_QUEUE),
-        "leads": stats.player_leads(db, games, puuid, p["tier"], SOLO_QUEUE),
-        "mastery": stats.mastery(db, puuid, games),
-        "sync": history.status(puuid),
-    }
+    with closing(store.connect()) as db, store.read_snapshot(db):
+        p = store.get_player(db, puuid)
+        if not p:
+            raise HTTPException(404, "Unknown player")
+        games = stats.attach_gold(db, history.window(stats.player_games(db, puuid, SOLO_QUEUE), rng), puuid)
+        return {
+            "puuid": puuid,
+            "profile": {"name": p["game_name"], "tag": p["tag_line"], "platform": p["platform"],
+                        "tier": p["tier"], "division": p["division"], "lp": p["lp"],
+                        "season_wins": p["wins"], "season_losses": p["losses"], "level": p["level"],
+                        "icon": profile_icon(state["ddragon"], p["profile_icon"]) if p["profile_icon"] is not None else None},
+            "range": {"key": rng["key"], "label": rng["label"]},
+            "games_analysed": len(games),
+            "first_game": games[0]["game_start"] if games else None,
+            "last_game": games[-1]["game_start"] if games else None,
+            "overview": stats.overview(games, tz) if games else None,
+            "vs_rank": stats.champions_vs_rank(db, games, puuid, p["tier"], SOLO_QUEUE),
+            "leads": stats.player_leads(db, games, puuid, p["tier"], SOLO_QUEUE),
+            "mastery": stats.mastery(db, puuid, games),
+            "sync": history.status(puuid),
+        }
 
 
 @app.get("/api/player")
@@ -574,7 +590,7 @@ def sync_status(puuid: str):
 
 
 @app.get("/api/pick")
-def pick(puuid: str, role: str, opp: int | None = None, alpha: float = 5.0,
+def pick(puuid: str, role: str, opp: int | None = None, alpha: float = Query(5.0, ge=0, allow_inf_nan=False),
          range_: str = Query(history.DEFAULT_RANGE, alias="range")):
     games = history.window(stats.player_games(store.connect(), puuid, SOLO_QUEUE), history.resolve(range_))
     return stats.pick_probabilities(games, role, opp, alpha)
@@ -584,6 +600,8 @@ def pick(puuid: str, role: str, opp: int | None = None, alpha: float = 5.0,
 async def sample(platform: str, tier: str, division: str = "", players: int = Query(4, ge=1, le=20),
                  per_player: int = Query(5, ge=1, le=20)):
     """Grow one tier's baseline now: recent solo games from random players in `tier`."""
+    if platform not in PLATFORMS:
+        raise HTTPException(400, "Unknown platform")
     tier = tier.upper()
     if tier not in TIERS:
         raise HTTPException(400, "Unknown tier")
@@ -595,9 +613,12 @@ async def sample(platform: str, tier: str, division: str = "", players: int = Qu
             pool = await riot.tier_players(platform, tier, division, page=1)
         picked = random.sample(pool, min(players, len(pool)))
         id_lists = await asyncio.gather(*(riot.match_ids(platform, p, SOLO_QUEUE, per_player) for p in picked))
+        ids = sorted({m for lst in id_lists for m in lst})
+        fetched = await fetch_matches(riot, platform, ids, tier)
     except RiotError as e:
         raise riot_errors(e)
-    ids = sorted({m for lst in id_lists for m in lst})
-    fetched = await fetch_matches(riot, platform, ids, tier)
+    except history.FetchChunkError as e:
+        raise HTTPException(502, "Sampling was incomplete. Any valid results were cached; "
+                            f"retry to fetch missing matches/timelines. {e}") from e
     return {"tier": tier, "division": division, "players": len(picked), "matches": len(ids),
             "newly_fetched": fetched}

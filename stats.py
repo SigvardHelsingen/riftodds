@@ -8,6 +8,9 @@ import math
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+from functools import wraps
+
+import store
 
 ROLES = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 SESSION_GAP_MS = 30 * 60 * 1000  # a new "session" starts after 30 min idle
@@ -28,6 +31,14 @@ def _memoized(key, compute):
     value = compute()
     _memo[key] = (time.time(), value)
     return value
+
+
+def _snapshot(func):
+    @wraps(func)
+    def wrapped(db, *args, **kwargs):
+        with store.read_snapshot(db):
+            return func(db, *args, **kwargs)
+    return wrapped
 
 
 # --- probability helpers ------------------------------------------------------
@@ -250,6 +261,8 @@ def pick_probabilities(games, role, opp=None, alpha=5.0):
     Dirichlet(alpha * prior) pseudo-count, so 1-2 games vs a champion don't
     produce a 100% prediction:  (k + alpha * P(c|role)) / (n + alpha).
     """
+    if not math.isfinite(alpha) or alpha < 0:
+        raise ValueError("alpha must be finite and nonnegative")
     in_role = [g for g in games if g["position"] == role]
     n = len(in_role)
     if n == 0:
@@ -265,7 +278,7 @@ def pick_probabilities(games, role, opp=None, alpha=5.0):
         if opp is not None:
             kv = vs_counts.get(champ, 0)
             row["games_vs"] = kv
-            row["p_vs"] = (kv + alpha * p_role) / (len(vs) + alpha)
+            row["p_vs"] = (kv + alpha * p_role) / (len(vs) + alpha) if vs or alpha else p_role
             row["wr_vs"] = wr_of([g for g in vs if g["champion_id"] == champ])
         rows.append(row)
     rows.sort(key=lambda r: -(r.get("p_vs", r["p_role"])))
@@ -279,6 +292,7 @@ def pick_probabilities(games, role, opp=None, alpha=5.0):
 
 # --- champion vs rank baseline ------------------------------------------------
 
+@_snapshot
 def champions_vs_rank(db, games, puuid, tier, queue=420):
     """Player WR per champion vs. everyone else's WR on it in matches tagged with `tier`."""
     # computed fresh: the player's own games arrive while their profile loads, so a cached
@@ -332,6 +346,7 @@ def latest_patch(db, queue=420):
     return max(patches, key=_patch_key) if patches else None
 
 
+@_snapshot
 def patch_overview(db, patch, tier=None, queue=420):
     """Population stats for one patch, optionally restricted to games tagged with `tier`."""
     where = "m.patch = ? AND m.queue_id = ? AND m.remake = 0"
@@ -404,14 +419,21 @@ LEAD_BUCKETS = [  # team gold difference at 15:00
 
 def attach_gold(db, games, puuid):
     """Add team_diff15 / lane_diff15 (player's team minus enemy, player minus lane opponent)."""
-    rows = db.execute(
-        """SELECT f.match_id, p.puuid, p.team_id, p.position, f.gold
-           FROM frames f JOIN participants p ON p.match_id = f.match_id AND p.puuid = f.puuid
-           WHERE f.minute = ? AND f.match_id IN (SELECT match_id FROM participants WHERE puuid = ?)""",
-        (LEAD_MINUTE, puuid)).fetchall()
+    if not games:
+        return games
+    match_ids = list(dict.fromkeys(g["match_id"] for g in games))
     by_match = defaultdict(list)
-    for mid, who, team, pos, gold in rows:
-        by_match[mid].append((who, team, pos, gold))
+    with store.read_snapshot(db):
+        for i in range(0, len(match_ids), 500):  # stay below SQLite's legacy 999-variable limit
+            chunk = match_ids[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.execute(
+                f"""SELECT f.match_id, p.puuid, p.team_id, p.position, f.gold
+                    FROM frames f JOIN participants p ON p.match_id = f.match_id AND p.puuid = f.puuid
+                    WHERE f.minute = ? AND f.match_id IN ({placeholders})""",
+                (LEAD_MINUTE, *chunk)).fetchall()
+            for mid, who, team, pos, gold in rows:
+                by_match[mid].append((who, team, pos, gold))
     for g in games:
         g["team_diff15"] = g["lane_diff15"] = None
         ps = by_match.get(g["match_id"])
@@ -453,9 +475,13 @@ def lead_curve(rows):
 def player_leads(db, games, puuid, tier, queue=420):
     """The player's lead-to-win curve vs their rank, plus comeback / close-out rates and laning."""
     mine = [(g["team_diff15"], g["win"]) for g in games if g.get("team_diff15") is not None]
-    tier_rows = _memoized(("leads", tier, queue), lambda: _team_leads(
-        db, "m.queue_id = ? AND m.match_id IN (SELECT match_id FROM match_tier WHERE tier = ?)", (queue, tier)))
-    own_matches = {r[0] for r in db.execute("SELECT match_id FROM participants WHERE puuid = ?", (puuid,))}
+    use_memo = not db.in_transaction
+    with store.read_snapshot(db):
+        load_rows = lambda: _team_leads(
+            db, "m.queue_id = ? AND m.match_id IN (SELECT match_id FROM match_tier WHERE tier = ?)", (queue, tier))
+        # A caller's transaction may contain uncommitted rows: don't publish them to the memo.
+        tier_rows = _memoized(("leads", tier, queue), load_rows) if use_memo else load_rows()
+        own_matches = {r[0] for r in db.execute("SELECT match_id FROM participants WHERE puuid = ?", (puuid,))}
     rank = [(d, w) for mid, d, w in tier_rows if mid not in own_matches]
     you, base = lead_curve(mine), lead_curve(rank)
     rate = lambda rows, test: winrate(sum(w for d, w in rows if test(d)), sum(1 for d, _ in rows if test(d)))
@@ -487,6 +513,7 @@ def patch_lead_curve(db, patch, tier=None, queue=420):
 
 # --- mastery --------------------------------------------------------------------
 
+@_snapshot
 def mastery(db, puuid, games, pockets=6):
     """Mastery per champion, plus high-mastery champions not played in `games` ("pocket picks")."""
     rows = db.execute("SELECT champion_id, level, points, last_play FROM mastery WHERE puuid = ? ORDER BY points DESC",
