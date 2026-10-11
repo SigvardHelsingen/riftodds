@@ -110,6 +110,65 @@ b { font-weight: 600; }
 .pocket { display: flex; gap: 10px; align-items: center; }
 .pocket img { width: 40px; height: 40px; border-radius: var(--radius); }
 
+/* ---------- match history ---------- */
+.mh-session { display: flex; align-items: baseline; gap: 12px; margin: 26px 0 10px; font: 800 16px/1 var(--display);
+              text-transform: uppercase; letter-spacing: .05em; }
+.mh-session:first-child { margin-top: 0; }
+.mh-session span { font: 500 13px/1 var(--mono); text-transform: none; letter-spacing: 0; color: var(--muted); }
+.mh-row { display: grid; grid-template-columns: 30px minmax(170px, 1.4fr) 54px minmax(110px, 1fr) minmax(80px, .8fr) minmax(110px, 1fr) auto 78px;
+          gap: 14px; align-items: center; width: 100%; margin-bottom: 8px; padding: 8px 14px 8px 12px; cursor: pointer;
+          background: var(--card); color: inherit; font: inherit; text-align: left;
+          border: 2px solid var(--ink); border-left-width: 8px; border-radius: var(--radius); }
+.mh-row.win { border-left-color: var(--pos); }
+.mh-row.loss { border-left-color: var(--neg); }
+.mh-row:hover, .mh-row.open { background: var(--peach-wash); }
+.mh-row.open { border-bottom-left-radius: 0; border-bottom-right-radius: 0; margin-bottom: 0; }
+.mh-res { font: 900 28px/1 var(--display); }
+.mh-champ { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.mh-champ > img { width: 40px; height: 40px; border-radius: var(--radius); }
+.mh-champ .spells { display: grid; gap: 2px; }
+.mh-champ .spells img, .mh-champ .spells .slot { width: 18px; height: 18px; border-radius: 4px; }
+.mh-champ b, .mh-stat b { display: block; font-weight: 600; white-space: nowrap; }
+.mh-champ small, .mh-stat small { display: block; color: var(--muted); font-size: 12px; white-space: nowrap; }
+.mh-stat b { font-family: var(--mono); font-size: 14px; }
+.mh-stat.right { text-align: right; }
+.mh-vs { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+.mh-vs img { width: 28px; height: 28px; border-radius: var(--radius); }
+.items { display: inline-flex; gap: 3px; }
+.items img, .items .slot { width: 24px; height: 24px; border-radius: 4px; background: var(--track); display: inline-block; }
+.items img:last-child, .items .slot:last-child { margin-left: 4px; }  /* trinket */
+.mh-detail { border: 2px solid var(--ink); border-top: 0; border-radius: 0 0 var(--radius) var(--radius);
+             background: var(--card); padding: 12px 16px 16px; margin-bottom: 8px; }
+.mh-team + .mh-team { margin-top: 18px; }
+.mh-team-head { display: flex; align-items: center; gap: 12px; padding: 6px 0 10px; border-top: 5px solid var(--ref); }
+.mh-team.blue .mh-team-head { border-top-color: #5b5fa8; }
+.mh-team.red .mh-team-head { border-top-color: var(--rose); }
+.mh-team-head b { font: 900 22px/1 var(--display); text-transform: uppercase; }
+.mh-team-head span { font-size: 13px; color: var(--muted); }
+.mh-team-head .bans { margin-left: auto; display: flex; gap: 3px; }
+.mh-team-head .bans img { width: 22px; height: 22px; border-radius: 4px; filter: grayscale(1); opacity: .7; }
+.mh-team tr.me td { background: var(--peach-wash); }
+/* same column widths in both team tables, so the two scoreboards line up */
+.mh-team table { table-layout: fixed; min-width: 760px; }
+.mh-team th:nth-child(1) { width: 28%; } .mh-team th:nth-child(2) { width: 9%; } .mh-team th:nth-child(3) { width: 7%; }
+.mh-team th:nth-child(4) { width: 21%; } .mh-team th:nth-child(5) { width: 9%; } .mh-team th:nth-child(6) { width: 26%; }
+.mh-team td:first-child .champ { max-width: 100%; overflow: hidden; }
+.mh-team td .role a { color: var(--muted); }
+.mh-team td .role a:hover { color: var(--ink); }
+@media (max-width: 900px) {
+  .mh-row { grid-template-columns: 26px 1fr 1fr; row-gap: 10px;
+            grid-template-areas: "res champ champ" "res kda cs" "res gold when" "res items items"; }
+  .mh-res { grid-area: res; align-self: start; }
+  .mh-champ { grid-area: champ; }
+  .mh-kda { grid-area: kda; } .mh-cs { grid-area: cs; } .mh-gold { grid-area: gold; } .mh-when { grid-area: when; }
+  .mh-row .items { grid-area: items; }
+  .mh-vs { display: none; }
+  .mh-stat.right { text-align: left; }
+  .mh-detail { overflow-x: auto; padding: 10px; }
+  .tabs { overflow-x: auto; gap: 20px; scrollbar-width: none; }
+  .tabs button { flex: none; white-space: nowrap; font-size: 20px; }
+}
+
 /* ---------- login ---------- */
 .login { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 380px); gap: 40px; align-items: end; padding-top: 72px; }
 .login h1 em { color: var(--rose); }

@@ -102,6 +102,12 @@ def oldest_participant(db):
            ORDER BY m.game_start LIMIT 1""").fetchone()
 
 
+def match_raw(db, match_id):
+    """The full match JSON as Riot returned it (kept compressed in the cache)."""
+    row = db.execute("SELECT raw FROM matches WHERE match_id=?", (match_id,)).fetchone()
+    return json.loads(zlib.decompress(row[0])) if row else None
+
+
 def has_match(db, match_id):
     return db.execute("SELECT 1 FROM matches WHERE match_id=?", (match_id,)).fetchone() is not None
 

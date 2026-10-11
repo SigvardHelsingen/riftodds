@@ -290,6 +290,8 @@ async function showPlayer(platform, riotId, range) {
   view.player.role = null;
   view.player.opp = "";
   view.player.liveForm = false;
+  view.player.matchesShown = 20;
+  view.player.open = new Set();
   const [name] = riotId.split("#");
   const label = META.ranges.find((r) => r.key === range)?.label.toLowerCase() || "recent games";
   $("#app").innerHTML = `<div class="loading"><div class="spinner"></div>
@@ -461,7 +463,7 @@ function renderPlayer() {
   const cb = DATA.leads.comeback;
   const tilt = m.after_win.games && m.after_loss.games ? m.after_win.wr - m.after_loss.wr : null;
   const best = DATA.vs_rank.rows.filter((r) => r.p_better != null && r.player.games >= 3).sort((a, b) => b.p_better - a.p_better)[0];
-  const tabs = [...(DATA.live ? [["live", "Live game"]] : []), ["champions", "Champions"], ["draft", "Draft"], ["habits", "Habits"], ["wincons", "Win conditions"]];
+  const tabs = [...(DATA.live ? [["live", "Live game"]] : []), ["champions", "Champions"], ["matches", "Matches"], ["draft", "Draft"], ["habits", "Habits"], ["wincons", "Win conditions"]];
   if (view.player.tab === "live" && !DATA.live) view.player.tab = "champions";
 
   $("#player-body").innerHTML = `
@@ -485,7 +487,7 @@ function renderPlayer() {
 
 function renderTab() {
   clearInterval(livePoll);
-  ({ live: tabLive, champions: tabChampions, draft: tabDraft, habits: tabHabits, wincons: tabWincons })[view.player.tab]();
+  ({ live: tabLive, champions: tabChampions, matches: tabMatches, draft: tabDraft, habits: tabHabits, wincons: tabWincons })[view.player.tab]();
 }
 
 function tabChampions() {
@@ -661,6 +663,96 @@ function playerLeadCard() {
       <td class="num" title="${esc(wrTip(b.you))}">${wrText(b.you)}</td>
       <td class="num" title="${esc(wrTip(b.rank))}">${b.rank.games >= 10 ? `${pct(b.rank.wr)} <span class="muted small">${b.rank.games}</span>` : "–"}</td></tr>`).join("")}</tbody></table>
   </div>`;
+}
+
+// ---------------------------------------------------------------- match history
+const ITEM_CDN = () => `https://ddragon.leagueoflegends.com/cdn/${META.ddragon}/img/item/`;
+const itemIcon = (id) => (id ? `<img src="${ITEM_CDN()}${id}.png" alt="" loading="lazy">` : `<span class="slot"></span>`);
+const spellIcon = (id) => (META.spells[id] ? `<img src="${META.spells[id]}" alt="" loading="lazy">` : `<span class="slot"></span>`);
+const items = (ids) => `<span class="items">${ids.map(itemIcon).join("")}</span>`;
+const ago = (ms) => {
+  const min = (Date.now() - ms) / 60000;
+  return min < 60 ? `${Math.max(1, Math.round(min))} min ago` : min < 1440 ? `${Math.round(min / 60)} h ago`
+    : min < 2880 ? "yesterday" : `${Math.round(min / 1440)} days ago`;
+};
+// gold difference with a direction glyph, so the sign never relies on colour
+const golddiff = (n) => (n == null ? "–" : `${n > 0 ? "▲" : n < 0 ? "▼" : "="} ${Math.abs(n) >= 1000 ? `${(Math.abs(n) / 1000).toFixed(1)}k` : Math.abs(Math.round(n))}`);
+const sessionLabel = (ms) => new Date(ms).toLocaleString(undefined, { weekday: "short", day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+
+async function tabMatches() {
+  const token = nav;
+  const puuid = DATA.puuid;
+  if (!$("#tab-body .mh")) $("#tab-body").innerHTML = `<div class="loading"><div class="spinner"></div>Loading matches…</div>`;
+  const res = await api(`/api/player/${puuid}/matches?range=${view.player.range}&limit=${view.player.matchesShown}`)
+    .catch((e) => ({ error: e.message }));
+  if (token !== nav || view.player.tab !== "matches" || DATA.puuid !== puuid) return;
+  renderMatches(res);
+}
+
+function renderMatches(res) {
+  const el = $("#tab-body");
+  if (res.error) { el.innerHTML = `<div class="card empty"><p class="error">${esc(res.error)}</p></div>`; return; }
+  if (!res.rows.length) { el.innerHTML = `<div class="card empty"><h2>No games in this range yet</h2></div>`; return; }
+  let html = `<div class="mh">`;
+  let session = null;
+  for (const g of res.rows) {
+    if (g.session.id !== session) {  // a header for each run of games played less than 30 min apart
+      session = g.session.id;
+      const s = g.session;
+      html += `<div class="mh-session">Session · ${sessionLabel(s.start)}<span>${s.games} game${s.games > 1 ? "s" : ""} · ${s.wins}W ${s.games - s.wins}L</span></div>`;
+    }
+    const kda = g.deaths ? ((g.kills + g.assists) / g.deaths).toFixed(1) : "Perfect";
+    const open = view.player.open.has(g.match_id);
+    html += `<button class="mh-row ${g.win ? "win" : "loss"} ${open ? "open" : ""}" data-mid="${g.match_id}" aria-expanded="${open}">
+      <span class="mh-res">${g.win ? "W" : "L"}</span>
+      <span class="mh-champ">${icon(g.champion_id)}<span class="spells">${g.spells.map(spellIcon).join("")}</span>
+        <span><b>${esc(champ(g.champion_id).name)}</b><small>${ROLE_NAMES[g.position] || "–"}${g.level ? ` · lvl ${g.level}` : ""}</small></span></span>
+      <span class="mh-vs">${g.opp_champ ? `<small>vs</small>${icon(g.opp_champ)}` : ""}</span>
+      <span class="mh-stat mh-kda"><b>${g.kills} / ${g.deaths} / ${g.assists}</b><small>${kda}${g.deaths ? " KDA" : ""}${g.kill_participation != null ? ` · ${pct(g.kill_participation)} KP` : ""}</small></span>
+      <span class="mh-stat mh-cs"><b>${g.cs} CS</b><small>${(g.cs / (g.duration / 60)).toFixed(1)} / min</small></span>
+      <span class="mh-stat mh-gold" title="Gold difference at 15:00 — vs your lane opponent, and your team vs theirs"><b>${golddiff(g.lane_diff15)}</b><small>lane @15 · team ${golddiff(g.team_diff15)}</small></span>
+      ${items(g.items)}
+      <span class="mh-stat mh-when right"><b>${mmss(g.duration)}</b><small>${ago(g.game_start)}</small></span>
+    </button>
+    <div class="mh-detail" id="d-${g.match_id}" ${open ? "" : "hidden"}></div>`;
+  }
+  html += `</div>`;
+  if (res.total > res.rows.length) html += `<div class="table-foot"><button class="btn ghost" id="mh-more">Show more (${res.rows.length} of ${res.total})</button></div>`;
+  el.innerHTML = html;
+  $$(".mh-row").forEach((b) => b.addEventListener("click", () => toggleMatch(b)));
+  $("#mh-more")?.addEventListener("click", () => { view.player.matchesShown += 20; tabMatches(); });
+  view.player.open.forEach((mid) => loadMatchDetail(mid));
+}
+
+function toggleMatch(row) {
+  const mid = row.dataset.mid;
+  const open = !view.player.open.has(mid);
+  open ? view.player.open.add(mid) : view.player.open.delete(mid);
+  row.classList.toggle("open", open);
+  row.setAttribute("aria-expanded", open);
+  $(`#d-${CSS.escape(mid)}`).hidden = !open;
+  if (open) loadMatchDetail(mid);
+}
+
+async function loadMatchDetail(mid) {
+  const el = $(`#d-${CSS.escape(mid)}`);
+  if (!el || el.dataset.loaded) return;
+  el.innerHTML = `<div class="loading"><div class="spinner"></div></div>`;
+  const m = await api(`/api/match/${mid}`).catch((e) => ({ error: e.message }));
+  if (m.error) { el.innerHTML = `<p class="error">${esc(m.error)}</p>`; return; }
+  el.dataset.loaded = "1";
+  const maxDmg = Math.max(...m.teams.flatMap((t) => t.players.map((p) => p.damage)), 1);
+  el.innerHTML = m.teams.map((t) => `<div class="mh-team ${t.team_id === 100 ? "blue" : "red"}">
+    <div class="mh-team-head"><b>${t.win ? "Victory" : "Defeat"}</b><span>${t.team_id === 100 ? "Blue" : "Red"} side · ${t.kills} kills · ${t.towers} towers · ${t.dragons} dragons · ${t.barons} barons${t.gold15 != null ? ` · ${kpts(t.gold15)} gold at 15` : ""}</span>
+      <span class="bans" title="Bans">${t.bans.map(icon).join("")}</span></div>
+    <table><thead><tr><th>Player</th><th class="num">KDA</th><th class="num">CS</th><th>Damage</th><th class="num">Gold @15</th><th>Items</th></tr></thead>
+    <tbody>${t.players.map((p) => `<tr class="${p.puuid === DATA.puuid ? "me" : ""}">
+      <td>${champCell(p.champion_id, `<a href="${playerHash(m.platform, p.riot_id, view.player.range)}">${esc(p.riot_id)}</a>`)}</td>
+      <td class="num">${p.kills}/${p.deaths}/${p.assists}</td>
+      <td class="num">${p.cs}</td>
+      <td style="width:20%">${barCell(p.damage / maxDmg, kpts(p.damage))}</td>
+      <td class="num">${p.gold15 == null ? "–" : kpts(p.gold15)}</td>
+      <td>${items(p.items)}</td></tr>`).join("")}</tbody></table></div>`).join("");
 }
 
 // ---------------------------------------------------------------- live game

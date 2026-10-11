@@ -234,5 +234,12 @@ async def load_champions():
     }
 
 
+async def load_spells(version):
+    """{summonerSpellId: icon url} from Data Dragon."""
+    async with httpx.AsyncClient(timeout=20) as c:
+        data = (await c.get(f"{DDRAGON}/cdn/{version}/data/en_US/summoner.json")).json()["data"]
+    return {int(sp["key"]): f"{DDRAGON}/cdn/{version}/img/spell/{sp['image']['full']}" for sp in data.values()}
+
+
 def profile_icon(version, icon_id):
     return f"{DDRAGON}/cdn/{version}/img/profileicon/{icon_id}.png"

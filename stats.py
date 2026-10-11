@@ -103,7 +103,7 @@ def player_games(db, puuid, queue=420):
         """
         SELECT m.match_id, m.game_start, m.duration, m.patch,
                p.champion_id, p.position, p.win, p.team_id, p.kills, p.deaths, p.assists,
-               p.cs, p.lane_adv,
+               p.cs, p.gold, p.damage, p.vision, p.lane_adv,
                (SELECT o.champion_id FROM participants o
                  WHERE o.match_id = p.match_id AND o.team_id != p.team_id
                    AND o.position = p.position AND o.position != '') AS opp_champ,
@@ -149,6 +149,17 @@ def _sessions(games):
     if current:
         sessions.append(current)
     return sessions
+
+
+def session_index(games):
+    """match_id -> the session it belongs to (games < 30 min apart), with that session's record."""
+    out = {}
+    for i, session in enumerate(_sessions(games)):
+        info = {"id": i, "games": len(session), "wins": sum(g["win"] for g in session),
+                "start": session[0]["game_start"]}
+        for g in session:
+            out[g["match_id"]] = info
+    return out
 
 
 def _momentum(games):

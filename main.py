@@ -22,7 +22,7 @@ import auth
 import history
 import stats
 import store
-from riot import PLATFORMS, Riot, RiotError, load_champions, profile_icon
+from riot import PLATFORMS, Riot, RiotError, load_champions, load_spells, profile_icon
 
 SOLO_QUEUE = 420
 TIERS = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND",
@@ -56,6 +56,7 @@ ACTIVE_PATHS = ("/api/player", "/api/sync", "/api/live", "/api/pick")
 async def lifespan(app):
     state["riot"] = Riot()
     state["ddragon"], state["champions"] = await load_champions()
+    state["spells"] = await load_spells(state["ddragon"])
     await ensure_cache_matches_key(state["riot"])
     store.backfill_bans(store.connect())
     tasks = [asyncio.create_task(refresh_ddragon())]
@@ -75,6 +76,7 @@ async def refresh_ddragon():
         await asyncio.sleep(DDRAGON_REFRESH)
         try:
             state["ddragon"], state["champions"] = await load_champions()
+            state["spells"] = await load_spells(state["ddragon"])
         except Exception:
             log.warning("could not refresh Data Dragon; keeping %s", state["ddragon"])
 
@@ -321,7 +323,7 @@ def meta():
             "ranges": [{"key": k, "label": r["label"], "kind": "count" if "count" in r else "time"}
                        for k, r in history.RANGES.items()],
             "default_range": history.DEFAULT_RANGE,
-            "ddragon": state["ddragon"], "champions": state["champions"]}
+            "ddragon": state["ddragon"], "champions": state["champions"], "spells": state["spells"]}
 
 
 @app.get("/api/patch")
@@ -495,6 +497,74 @@ async def live(puuid: str, form: bool = False):
 def player_analysis(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias="range"), tz: int = 0):
     history.touch(puuid)
     return analysis(puuid, history.resolve(range_), tz)
+
+
+ITEM_SLOTS = [f"item{i}" for i in range(7)]  # item6 is the trinket
+POSITION_ORDER = {"TOP": 0, "JUNGLE": 1, "MIDDLE": 2, "BOTTOM": 3, "UTILITY": 4}
+
+
+@app.get("/api/player/{puuid}/matches")
+def player_matches(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias="range"),
+                   offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)):
+    """One page of the player's games in the range, newest first, with items and session info.
+
+    Items/spells come from the raw match JSON, so only the requested page is decoded."""
+    history.touch(puuid)
+    db = store.connect()
+    games = stats.attach_gold(db, history.window(stats.player_games(db, puuid, SOLO_QUEUE),
+                                                 history.resolve(range_)), puuid)
+    sessions = stats.session_index(games)
+    rows = []
+    for g in games[::-1][offset:offset + limit]:
+        raw = store.match_raw(db, g["match_id"])
+        info = raw["info"] if raw else {"participants": [], "teams": []}
+        me = next((p for p in info["participants"] if p["puuid"] == puuid), {})
+        team_kills = next((t["objectives"]["champion"]["kills"] for t in info["teams"] if t["teamId"] == g["team_id"]), 0)
+        rows.append({
+            **{k: g[k] for k in ("match_id", "game_start", "duration", "champion_id", "position", "win", "kills",
+                                 "deaths", "assists", "cs", "gold", "damage", "vision", "opp_champ",
+                                 "team_diff15", "lane_diff15")},
+            "items": [me.get(slot, 0) for slot in ITEM_SLOTS],
+            "spells": [me.get("summoner1Id"), me.get("summoner2Id")],
+            "level": me.get("champLevel"),
+            "kill_participation": (g["kills"] + g["assists"]) / team_kills if team_kills else None,
+            "session": sessions[g["match_id"]],
+        })
+    return {"total": len(games), "offset": offset, "rows": rows}
+
+
+@app.get("/api/match/{match_id}")
+def match_detail(match_id: str):
+    """Full scoreboard for one cached match: both teams, objectives, bans, gold at 15."""
+    db = store.connect()
+    raw = store.match_raw(db, match_id)
+    if not raw:
+        raise HTTPException(404, "Match not in the cache")
+    info = raw["info"]
+    platform = db.execute("SELECT platform FROM matches WHERE match_id = ?", (match_id,)).fetchone()[0]
+    gold15 = dict(db.execute("SELECT puuid, gold FROM frames WHERE match_id = ? AND minute = 15", (match_id,)).fetchall())
+    teams = []
+    for t in info["teams"]:
+        o = t["objectives"]
+        players = sorted((p for p in info["participants"] if p["teamId"] == t["teamId"]),
+                         key=lambda p: POSITION_ORDER.get(p.get("teamPosition"), 9))
+        teams.append({
+            "team_id": t["teamId"], "win": t["win"],
+            "kills": o["champion"]["kills"], "towers": o["tower"]["kills"], "dragons": o["dragon"]["kills"],
+            "barons": o["baron"]["kills"], "grubs": o.get("horde", {}).get("kills", 0),
+            "gold15": sum(gold15.get(p["puuid"], 0) for p in players) if len(gold15) == 10 else None,
+            "bans": [b["championId"] for b in t.get("bans", []) if b["championId"] > 0],
+            "players": [{
+                "puuid": p["puuid"], "champion_id": p["championId"], "position": p.get("teamPosition") or "",
+                "riot_id": f'{p.get("riotIdGameName") or p.get("summonerName") or "?"}#{p.get("riotIdTagline") or ""}',
+                "level": p.get("champLevel"), "kills": p["kills"], "deaths": p["deaths"], "assists": p["assists"],
+                "cs": p["totalMinionsKilled"] + p["neutralMinionsKilled"], "damage": p["totalDamageDealtToChampions"],
+                "gold": p["goldEarned"], "vision": p["visionScore"], "gold15": gold15.get(p["puuid"]),
+                "items": [p.get(slot, 0) for slot in ITEM_SLOTS], "spells": [p.get("summoner1Id"), p.get("summoner2Id")],
+            } for p in players],
+        })
+    return {"match_id": match_id, "platform": platform, "game_start": info["gameStartTimestamp"],
+            "duration": info["gameDuration"], "patch": ".".join(info["gameVersion"].split(".")[:2]), "teams": teams}
 
 
 @app.get("/api/sync/{puuid}")
