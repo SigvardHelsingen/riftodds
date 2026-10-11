@@ -181,6 +181,8 @@ h2 { font: 800 26px/1 var(--display); text-transform: uppercase; letter-spacing:
   .hero .search .btn { flex: 1; }
 }
 
+.patch-note { margin: 24px 0 0; padding: 10px 14px; border-radius: var(--radius); background: var(--peach); font-size: 14px; }
+
 /* the board: headline numbers in ruled cells */
 .board { display: grid; grid-template-columns: repeat(4, 1fr); border: 2px solid var(--ink); border-radius: var(--radius);
          overflow: hidden; background: var(--card); }

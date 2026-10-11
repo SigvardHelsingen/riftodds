@@ -7,6 +7,8 @@ const pct = (x, d = 0) => (x == null ? "–" : `${(x * 100).toFixed(d)}%`);
 const pts = (x) => (x == null ? "–" : `${x > 0 ? "+" : ""}${(x * 100).toFixed(0)} pts`);
 const title = (s) => s[0] + s.slice(1).toLowerCase();
 const day = (ms) => new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short", year: "numeric" });
+// Riot's API reports the internal version (16.20); players know it by the year-based name (26.20)
+const patchName = (v) => { const [major, minor] = String(v).split(".").map(Number); return major >= 15 && major < 20 ? `${major + 10}.${minor}` : v; };
 const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
 
 const ROLE_NAMES = { TOP: "Top", JUNGLE: "Jungle", MIDDLE: "Mid", BOTTOM: "Bot", UTILITY: "Support", UNKNOWN: "Unknown" };
@@ -183,7 +185,12 @@ function samplerLine(s) {
 function renderPatch() {
   const P = PATCH;
   const L = view.landing;
-  $("#hero-stamp").textContent = P.patch ? `Patch ${P.patch}` : "Ranked solo";
+  const live = P.current_patch || P.patch;
+  $("#hero-stamp").textContent = live ? `Patch ${patchName(live)}` : "Ranked solo";
+  // right after a patch drops, the numbers still come from the previous patch: say so
+  const stale = P.patch && live && P.patch !== live
+    ? `<p class="patch-note"><b>Patch ${patchName(live)} is live.</b> The numbers below are from ${patchName(P.patch)} until enough
+        ${patchName(live)} games are sampled (${P.current_patch_games} so far).</p>` : "";
   if (!P.matches) {
     $("#patch-body").innerHTML = `<div class="card empty"><h2>No games sampled yet${L.tier ? ` for ${title(L.tier)}` : ""}</h2>
       <p>The background sampler pulls recent ranked games from random players in every tier.
@@ -206,6 +213,7 @@ function renderPatch() {
   const presence = [...P.champions].sort((a, b) => b.pick_rate + b.ban_rate - (a.pick_rate + a.ban_rate)).slice(0, 6);
 
   $("#patch-body").innerHTML = `
+    ${stale}
     <div class="chips section" id="tier-chips"><span class="chips-label">Tier</span>${tierChips.map(([v, l, n]) => `<button class="chip ${L.tier === v ? "active" : ""}" data-v="${v}">${l}<span class="count">${n}</span></button>`).join("")}</div>
 
     <div class="board" style="margin-top:14px">

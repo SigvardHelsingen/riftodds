@@ -43,6 +43,8 @@ LIVE_FORM_GAMES = 10  # recent games synced per live participant (matches only, 
 PROFILE_TTL = 6 * 3600  # Riot ID -> PUUID, profile icon, level and mastery are reused this long
 FIRST_RESPONSE_WAIT = 3  # seconds a lookup waits for its sync before answering with what's cached
 SAMPLER_QUIET = 120      # the sampler stays off this long after any user activity (= Riot's long window)
+DDRAGON_REFRESH = 1800   # re-check Riot's live version (patch, new champions) this often
+MIN_PATCH_GAMES = 50     # games a new patch needs before the landing page switches its stats to it
 HISTORY_SHARE = 0.85  # player history syncs; leaves headroom so new lookups never queue
 
 log = logging.getLogger("sampler")
@@ -56,13 +58,32 @@ async def lifespan(app):
     state["ddragon"], state["champions"] = await load_champions()
     await ensure_cache_matches_key(state["riot"])
     store.backfill_bans(store.connect())
-    task = asyncio.create_task(sampler()) if SAMPLER["enabled"] else None
+    tasks = [asyncio.create_task(refresh_ddragon())]
+    if SAMPLER["enabled"]:
+        tasks.append(asyncio.create_task(sampler()))
     yield
-    if task:
+    for task in tasks:
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
     await state["riot"].http.aclose()
+
+
+async def refresh_ddragon():
+    """The server runs for weeks: pick up a new patch (and new champions) without a restart."""
+    while True:
+        await asyncio.sleep(DDRAGON_REFRESH)
+        try:
+            state["ddragon"], state["champions"] = await load_champions()
+        except Exception:
+            log.warning("could not refresh Data Dragon; keeping %s", state["ddragon"])
+
+
+def current_patch(db):
+    """The live patch: Riot's client version, or newer if games from a newer patch are already cached."""
+    live = ".".join(state["ddragon"].split(".")[:2])
+    cached = stats.latest_patch(db)
+    return max(filter(None, (live, cached)), key=stats._patch_key)
 
 
 async def ensure_cache_matches_key(riot):
@@ -305,12 +326,16 @@ def meta():
 
 @app.get("/api/patch")
 def patch(tier: str | None = None):
+    """Stats for the live patch — or, right after a patch drops, the previous one until the
+    sampler has enough games on the new one (`patch` vs `current_patch` tells the client)."""
     db = store.connect()
-    latest = stats.latest_patch(db)
-    overview = stats.patch_overview(db, latest, tier) if latest else {"patch": None, "matches": 0, "tiers": []}
-    if latest and overview["matches"]:
-        overview["leads"] = stats.patch_lead_curve(db, latest, tier)
-    return {**overview, "sampler": state["sampler"]}
+    current = current_patch(db)
+    current_games = patch_matches(db, current)
+    shown = current if current_games >= MIN_PATCH_GAMES else (stats.latest_patch(db) or current)
+    overview = stats.patch_overview(db, shown, tier) if shown else {"patch": None, "matches": 0, "tiers": []}
+    if shown and overview["matches"]:
+        overview["leads"] = stats.patch_lead_curve(db, shown, tier)
+    return {**overview, "current_patch": current, "current_patch_games": current_games, "sampler": state["sampler"]}
 
 
 def analysis(puuid, rng, tz):
