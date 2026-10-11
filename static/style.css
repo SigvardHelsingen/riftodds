@@ -53,13 +53,35 @@ b { font-weight: 600; }
 .user a.btn { text-decoration: none; padding: 6px 12px; font-size: 15px; }
 
 /* ---------- history sync + account link ---------- */
-.card.sync { display: grid; grid-template-columns: 1fr minmax(120px, 260px) auto; gap: 16px; align-items: center;
-        margin-bottom: 16px; background: var(--peach-wash); border-color: var(--peach); padding: 12px 16px; }
-.sync .sync-text { font-size: 13px; }
+/* history progress: a ruled strip in the same language as the landing board */
+.syncbar { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, .7fr) auto;
+           border: 2px solid var(--ink); border-radius: var(--radius); overflow: hidden; background: var(--card);
+           margin-bottom: 16px; }
+.syncbar .cell { padding: 12px 16px; border-left: 2px solid var(--ink); display: flex; flex-direction: column; justify-content: center; gap: 4px; }
+.syncbar .cell:first-child { border-left: 0; }
+.syncbar .lead { background: var(--peach); }
+.syncbar .label { font: 800 14px/1.1 var(--display); text-transform: uppercase; letter-spacing: .06em;
+                  display: flex; align-items: center; gap: 8px; }
+.syncbar .sub { font-size: 12px; }
+.syncbar .value { font: 900 34px/1 var(--display); font-variant-numeric: tabular-nums; }
+.syncbar .value span { font-size: 20px; color: var(--muted); }
+.syncbar .count .bar { margin-top: 6px; }
+.syncbar .act { align-items: center; }
+.syncbar.is-error { grid-template-columns: minmax(0, 1fr) auto; }
+.syncbar.is-error .lead { background: var(--ink); color: #fff; }
+.syncbar.is-error .lead .label { color: var(--peach); }
+@media (max-width: 760px) {
+  .syncbar, .syncbar.is-error { grid-template-columns: 1fr 1fr; }
+  .syncbar .lead, .syncbar .act { grid-column: 1 / -1; }
+  .syncbar .cell:nth-child(2), .syncbar .act { border-left: 0; }
+  .syncbar .cell:nth-child(n+2) { border-top: 2px solid var(--ink); }
+  .syncbar .act .btn { width: 100%; }
+  .live-banner { flex-wrap: wrap; }
+  .live-banner .go { width: 100%; margin-left: 0; }
+}
 .player-head .name.long { font-size: clamp(36px, 5vw, 60px); }
 .player-head .coverage { margin-top: 4px; font-size: 13px; color: var(--muted); }
 .player-head .coverage b { color: var(--ink); }
-@media (max-width: 760px) { .card.sync { grid-template-columns: 1fr; } }
 .me-tag { font: 800 14px/1 var(--display); text-transform: uppercase; letter-spacing: .06em; background: var(--ink);
           color: var(--peach); border-radius: var(--radius); padding: 8px 10px; align-self: center; }
 .player-head .actions { flex-wrap: wrap; justify-content: flex-end; }

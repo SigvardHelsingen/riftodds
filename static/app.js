@@ -354,17 +354,25 @@ function renderSync() {
   if (!el) return;
   if (!s || (!s.running && !s.error)) { el.hidden = true; return; }
   el.hidden = false;
+  el.classList.toggle("is-error", !!s.error);
   if (s.error) {
-    el.innerHTML = `<span class="error">History fetch stopped: ${esc(s.error)}</span>`;
+    el.innerHTML = `<div class="cell lead"><div class="label">History stopped</div><div class="sub">${esc(s.error)}</div></div>
+      <div class="cell act"><button class="btn" id="sync-now">Retry</button></div>`;
+    $("#sync-now").addEventListener("click", resumeSync);
     return;
   }
+  // a ruled strip like the landing board: what's happening | count + bar | time left | action
   const total = s.total ?? 0;
-  const what = { listing: "Listing games…", matches: `Games ${s.done} / ${total}`, timelines: `Timelines ${s.done} / ${total}` }[s.phase] || "";
-  const note = s.phase === "timelines" ? "gold-lead stats fill in when it's done" : `stats below cover ${DATA.games_analysed} games so far`;
-  el.innerHTML = `<div class="sync-text"><b>Fetching history</b> · ${what}${eta(s)}
-      <span class="muted">— ${note}.</span></div>
-    ${bar(total ? s.done / total : 0, { thick: true })}
-    <button class="btn ghost" id="sync-now">Update now</button>`;
+  const what = { listing: "Listing games", matches: "Games", timelines: "Timelines" }[s.phase] || "Working";
+  const note = s.phase === "timelines" ? "Gold-lead stats fill in when it's done"
+    : `Stats below cover ${DATA.games_analysed} game${DATA.games_analysed === 1 ? "" : "s"} so far`;
+  const left = eta(s);
+  el.innerHTML = `
+    <div class="cell lead"><div class="label"><span class="live-dot"></span>Loading history</div><div class="sub">${note}</div></div>
+    <div class="cell count"><div class="label">${what}</div>
+      <div class="value">${s.total == null ? "…" : `${s.done}<span>/${total}</span>`}</div>${bar(total ? s.done / total : 0, { thick: true })}</div>
+    <div class="cell"><div class="label">Time left</div><div class="value">${left || "…"}</div></div>
+    <div class="cell act"><button class="btn" id="sync-now">Update now</button></div>`;
   $("#sync-now").addEventListener("click", refreshAnalysis);
 }
 
@@ -379,7 +387,7 @@ function eta(s) {
   const rate = (s.done - first.done) / ((now - first.t) / 1000);
   if (!s.total || !(rate > 0)) return "";
   const secs = (s.total - s.done) / rate;
-  return ` · about ${secs < 90 ? `${Math.max(5, Math.round(secs / 5) * 5)} s` : `${Math.round(secs / 60)} min`} left`;
+  return secs < 90 ? `${Math.max(5, Math.round(secs / 5) * 5)}s` : `~${Math.round(secs / 60)}m`;
 }
 
 function rangeOptions(kind) {
@@ -416,7 +424,7 @@ function renderPlayer() {
         ${DATA.live.champion_id ? `· ${icon(DATA.live.champion_id)} ${esc(champ(DATA.live.champion_id).name)}` : ""}
         ${DATA.live.started ? `· ${Math.max(0, Math.round((Date.now() - DATA.live.started) / 60000))} min in` : "· loading in"}
         <span class="go">See all ten players →</span></button>` : ""}
-    <div class="sync card" id="sync" hidden></div>
+    <div class="syncbar" id="sync" hidden></div>
     <div id="player-body"></div>`;
   $("#live-banner")?.addEventListener("click", () => { view.player.tab = "live"; renderPlayer(); });
   $("#range").addEventListener("change", (e) => { location.hash = playerHash(p.platform, `${p.name}#${p.tag}`, e.target.value); });
