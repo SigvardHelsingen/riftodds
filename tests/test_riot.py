@@ -122,6 +122,39 @@ class DataDragonTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(requests), 1)
         sleep.assert_not_awaited()
 
+    async def ddragon(self, payload, load):
+        with patch.object(riot.httpx, "AsyncClient", side_effect=self.client_factory(lambda request: httpx.Response(200, json=payload))):
+            return await load("26.20.1")
+
+    async def test_items_are_classified_for_builds(self):
+        sr = {"11": True}
+        items = await self.ddragon({"data": {
+            "1001": {"name": "Boots", "tags": ["Boots"], "gold": {"total": 300}, "into": ["3006"], "maps": sr},
+            "3006": {"name": "Berserker's Greaves", "tags": ["Boots", "AttackSpeed"], "gold": {"total": 1100}, "maps": sr},
+            "3031": {"name": "Infinity Edge", "tags": ["Damage"], "gold": {"total": 3450}, "maps": sr},
+            "1038": {"name": "B. F. Sword", "tags": ["Damage"], "gold": {"total": 1300}, "into": ["3031"], "maps": sr},
+            "1055": {"name": "Doran's Blade", "tags": ["Damage"], "gold": {"total": 450}, "maps": sr},
+            "2003": {"name": "Health Potion", "tags": ["Consumable"], "gold": {"total": 50}, "maps": sr},
+            "2055": {"name": "Control Ward", "tags": ["Consumable", "Vision"], "gold": {"total": 1075}, "maps": sr},
+            "3340": {"name": "Stealth Ward", "tags": ["Trinket"], "gold": {"total": 0}, "maps": sr},
+            "3867": {"name": "Bounty of Worlds", "tags": ["GoldPer"], "gold": {"total": 400}, "into": ["3877"], "maps": sr},
+            "3877": {"name": "Bloodsong", "tags": ["GoldPer", "Health"], "gold": {"total": 400}, "maps": sr},
+            "447100": {"name": "Arena-only", "tags": [], "gold": {"total": 3000}, "maps": {"11": False, "30": True}},
+        }}, riot.load_items)
+        self.assertEqual({i for i, it in items.items() if it["completed"]}, {3031})
+        self.assertEqual({i for i, it in items.items() if it["boots"]}, {3006})
+        self.assertEqual({i for i, it in items.items() if it["support"]}, {3877})  # priced 400, but a finished item
+        self.assertNotIn(447100, items)
+        self.assertEqual(items[3031]["name"], "Infinity Edge")
+
+    async def test_runes_flatten_trees_and_keystones(self):
+        runes = await self.ddragon([{"id": 8000, "name": "Precision", "icon": "perk-images/Styles/7201_Precision.png", "slots": [
+            {"runes": [{"id": 8010, "name": "Conqueror", "icon": "perk-images/Styles/Precision/Conqueror/Conqueror.png"}]},
+            {"runes": [{"id": 9111, "name": "Triumph", "icon": "perk-images/Styles/Precision/Triumph.png"}]}]}], riot.load_runes)
+        self.assertEqual(set(runes), {8000, 8010, 9111})
+        self.assertEqual(runes[8010], {"name": "Conqueror",
+                                       "icon": f"{riot.DDRAGON}/cdn/img/perk-images/Styles/Precision/Conqueror/Conqueror.png"})
+
     async def test_spells_retry_transport_failure(self):
         requests = []
 

@@ -27,7 +27,7 @@ import auth
 import history
 import stats
 import store
-from riot import PLATFORMS, Riot, RiotError, load_champions, load_spells, profile_icon
+from riot import PLATFORMS, Riot, RiotError, load_champions, load_items, load_runes, load_spells, profile_icon
 
 SOLO_QUEUE = 420
 TIERS = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND",
@@ -44,11 +44,14 @@ SAMPLER = {
     "players": int(os.environ.get("SAMPLER_PLAYERS", "8")),     # players sampled in parallel per tier
     "share": 0.5,  # fraction of the rate limits the sampler may use
 }
-# IDs from https://static.developer.riotgames.com/docs/lol/queues.json — retired ones stay for old games' labels
+# IDs from https://static.developer.riotgames.com/docs/lol/queues.json.
+# Both Arena queues exist; actual 16-player match-v5 responses also use 1700.
 QUEUES = {420: "Ranked Solo", 440: "Ranked Flex", 400: "Normal Draft", 430: "Normal Blind", 450: "ARAM",
           480: "Swiftplay", 490: "Quickplay", 1700: "Arena", 1710: "Arena", 1900: "URF", 2300: "Brawl",
           2400: "ARAM: Mayhem"}
 LIVE_TTL = 60  # seconds before re-checking the spectator endpoint while polling (ranks/mastery: once per game)
+LIVE_CACHE_TTL = 6 * 3600  # expire unwatched players; polling keeps a game's ranks/mastery alive
+LIVE_CACHE_MAX = 64
 LIVE_FORM_GAMES = 10  # recent games synced per live participant (matches only, no timelines)
 PROFILE_TTL = 6 * 3600  # Riot ID -> PUUID, profile icon, level and mastery are reused this long
 FIRST_RESPONSE_WAIT = 3  # seconds a lookup waits for its sync before answering with what's cached
@@ -56,13 +59,46 @@ SAMPLER_QUIET = 120      # the sampler stays off this long after any user activi
 DDRAGON_REFRESH = 1800   # re-check Riot's live version (patch, new champions) this often
 MIN_PATCH_GAMES = 50     # games a new patch needs before the landing page switches its stats to it
 HISTORY_SHARE = 0.85  # player history syncs; leaves headroom so new lookups never queue
+RANK_EVERY = 20 * 60      # tracked players' solo rank is re-checked this often (Riot keeps no LP history)
+RANK_RECENT = 14 * 86400  # players looked up this recently are tracked; linked accounts always are
+RANK_SHARE = 0.2          # rank checks only use this much of the rate limits
 
 SEEN_EVERY = 60  # seconds between "last seen" writes per user
+SEEN_MAX = 1024
 
 log = logging.getLogger("sampler")
 state = {"sampler": {"status": "off"}, "live": {}, "last_activity": 0.0}
 _seen = {}  # username -> when "last seen" was last written
 ACTIVE_PATHS = ("/api/player", "/api/sync", "/api/live", "/api/pick")
+
+
+def _live_cached(puuid, entry=None):
+    """Get/store an entry, refreshing its idle TTL and least-recently-used position."""
+    now, cache = time.time(), state["live"]
+    for key in list(cache):
+        if now - cache[key].get("used_at", cache[key]["at"]) >= LIVE_CACHE_TTL:
+            del cache[key]
+    cached = cache.pop(puuid, None)
+    if entry is not None:
+        cached = entry
+    if cached is not None:
+        cached["used_at"] = now
+        cache[puuid] = cached
+    while len(cache) > LIVE_CACHE_MAX:
+        # Only drop the cache's reference: an in-flight request may still use the entry.
+        del cache[next(iter(cache))]
+    return cached
+
+
+def _seen_due(username, now):
+    for user in list(_seen):
+        if now - _seen[user] >= SEEN_EVERY:
+            del _seen[user]
+    # Keep active throttles when full, rather than evicting them into per-request writes.
+    if username in _seen or len(_seen) >= SEEN_MAX:
+        return False
+    _seen[username] = now
+    return True
 
 
 @asynccontextmanager
@@ -72,9 +108,13 @@ async def lifespan(app):
     try:
         state["ddragon"], state["champions"] = await load_champions()
         state["spells"] = await load_spells(state["ddragon"])
+        await load_build_data()
         await ensure_cache_matches_key(riot)
-        store.backfill_bans(store.connect())
+        with closing(store.connect()) as db:
+            store.backfill_bans(db)
         tasks.append(asyncio.create_task(refresh_ddragon()))
+        tasks.append(asyncio.create_task(backfill_builds()))
+        tasks.append(asyncio.create_task(track_ranks()))
         if SAMPLER["enabled"]:
             tasks.append(asyncio.create_task(sampler()))
         yield
@@ -94,8 +134,62 @@ async def refresh_ddragon():
         try:
             state["ddragon"], state["champions"] = await load_champions()
             state["spells"] = await load_spells(state["ddragon"])
+            await load_build_data()
         except Exception:
             log.warning("could not refresh Data Dragon; keeping %s", state["ddragon"])
+
+
+async def load_build_data():
+    """Item and rune names for builds. Builds are optional: a Data Dragon hiccup must not stop the site."""
+    try:
+        state["items"] = await load_items(state["ddragon"])
+        state["runes"] = await load_runes(state["ddragon"])
+    except Exception:
+        log.warning("could not load items/runes from Data Dragon", exc_info=True)
+        state.setdefault("items", {})
+        state.setdefault("runes", {})
+
+
+async def backfill_builds():
+    """Builds were added after release: flatten them out of the cached raw matches in the
+    background, a batch at a time, so startup isn't delayed by a large cache."""
+    after = ""
+    try:
+        while after is not None:
+            def batch():
+                with closing(store.connect()) as db:
+                    return store.backfill_builds(db, after)
+            after = await asyncio.to_thread(batch)
+            await asyncio.sleep(0)
+    except Exception:
+        log.exception("could not backfill builds; the rest are done at the next start")
+
+
+async def track_ranks():
+    """Build LP history: every RANK_EVERY, re-check the solo rank of linked accounts and recently
+    viewed players (one request each). Only changes are stored."""
+    while True:
+        await asyncio.sleep(RANK_EVERY)
+        try:
+            linked = {a["puuid"] for a in await asyncio.to_thread(auth.all_accounts)}
+            with closing(store.connect()) as db:
+                players = store.tracked_players(db, linked, time.time() - RANK_RECENT)
+            riot = state["riot"].background(RANK_SHARE)
+            for puuid, platform in players:
+                try:
+                    entries = await riot.league_entries(platform, puuid)
+                except RiotError as e:
+                    if e.status in (401, 403):
+                        raise
+                    continue  # one player's hiccup doesn't stop the round
+                solo = next((e for e in entries if e.get("queueType") == "RANKED_SOLO_5x5"), {})
+                with closing(store.connect()) as db:
+                    store.update_rank(db, puuid, solo)
+                    db.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("rank tracking round failed", exc_info=True)
 
 
 def current_patch(db):
@@ -105,13 +199,20 @@ def current_patch(db):
     return max(filter(None, (live, cached)), key=stats._patch_key)
 
 
+def shown_patch(db):
+    """(live patch, its sampled games, the patch stats use): right after a patch drops, the
+    previous one until the sampler has MIN_PATCH_GAMES on the new one."""
+    current = current_patch(db)
+    games = patch_matches(db, current)
+    return current, games, current if games >= MIN_PATCH_GAMES else (stats.latest_patch(db, before=current) or current)
+
+
 async def ensure_cache_matches_key(riot):
     """PUUIDs are encrypted per API key, so a cache built with another key can't be joined
     to anything this key returns. Riot answers 400 when asked to decrypt a foreign PUUID:
     if that happens, archive the cache and re-resolve users' linked accounts by Riot ID."""
-    db = store.connect()
-    sample = store.oldest_participant(db)
-    db.close()
+    with closing(store.connect()) as db:
+        sample = store.oldest_participant(db)
     if not sample:
         return
     try:
@@ -147,8 +248,8 @@ async def require_login(request: Request, call_next):
         if not user:
             return JSONResponse({"detail": "Not logged in"}, status_code=401)
         request.state.user = user
-        if time.time() - _seen.get(user, 0) > SEEN_EVERY:
-            _seen[user] = time.time()
+        now = time.time()
+        if _seen_due(user, now):
             await asyncio.to_thread(track, user, "seen")
         if request.url.path.startswith(ACTIVE_PATHS):
             state["last_activity"] = time.time()  # the sampler backs off while people use the site
@@ -199,7 +300,8 @@ def linked_account(username):
     if not link:
         return None
     # prefer the latest name from the cache in case the player renamed
-    p = store.get_player(store.connect(), link["puuid"])
+    with closing(store.connect()) as db:
+        p = store.get_player(db, link["puuid"])
     if p:
         link.update(game_name=p["game_name"], tag_line=p["tag_line"])
     return link
@@ -211,7 +313,8 @@ class AccountLink(BaseModel):
 
 @app.put("/api/me/account")
 def link_account(body: AccountLink, request: Request):
-    p = store.get_player(store.connect(), body.puuid)
+    with closing(store.connect()) as db:
+        p = store.get_player(db, body.puuid)
     if not p:
         raise HTTPException(404, "Look the player up first.")
     auth.set_account(request.state.user, p["platform"], p["game_name"], p["tag_line"], p["puuid"])
@@ -303,14 +406,15 @@ async def sampler():
                 await asyncio.sleep(5)
                 continue
             riot = state["riot"].background(sampler_share())
-            db = store.connect()
-            patch = current_patch(db)  # not the newest cached one: a finished old patch must not idle the sampler
-            s.update(platform=platform, target=SAMPLER["target"], patch=patch,
-                     matches=patch_matches(db, patch) if patch else 0)
-            no_timeline = [r[0] for r in db.execute(
-                """SELECT m.match_id FROM matches m LEFT JOIN timelines t ON t.match_id = m.match_id
-                   WHERE m.patch = ? AND m.queue_id = ? AND m.remake = 0 AND t.match_id IS NULL LIMIT 40""",
-                (patch, SOLO_QUEUE))] if patch else []
+            with closing(store.connect()) as db:
+                patch = current_patch(db)  # not the newest cached one: a finished old patch must not idle the sampler
+                s.update(platform=platform, target=SAMPLER["target"], patch=patch,
+                         matches=patch_matches(db, patch) if patch else 0)
+                no_timeline = [r[0] for r in db.execute(
+                    """SELECT m.match_id FROM matches m LEFT JOIN timelines t ON t.match_id = m.match_id
+                       WHERE m.patch = ? AND m.queue_id = ? AND m.remake = 0 AND t.match_id IS NULL LIMIT 40""",
+                    (patch, SOLO_QUEUE))] if patch else []
+                since = patch_start(db, patch)
             if no_timeline:
                 s.update(status="sampling", tier=None)
                 await fetch_matches(riot, platform, no_timeline, None, chunk=10, stop=users_active)
@@ -325,7 +429,6 @@ async def sampler():
             division = random.choice(["I", "II", "III", "IV"])
             pool = (await riot.tier_players(platform, tier, division, page=random.randint(1, 3))
                     or await riot.tier_players(platform, tier, division, page=1))
-            since = patch_start(db, patch)
             picked = random.sample(pool, min(SAMPLER["players"], len(pool)))
             id_lists = await asyncio.gather(*(riot.match_ids(platform, p, SOLO_QUEUE, 10, start_time=since)
                                               for p in picked), return_exceptions=True)
@@ -381,7 +484,8 @@ def meta():
             "ranges": [{"key": k, "label": r["label"], "kind": "count" if "count" in r else "time"}
                        for k, r in history.RANGES.items()],
             "default_range": history.DEFAULT_RANGE,
-            "queues": [{"key": str(q), "label": QUEUES[q]} for q in HISTORY_QUEUES],
+            "queues": [{"key": str(q), "label": "Arena (1710)" if q == 1710 else QUEUES[q]} for q in HISTORY_QUEUES],
+            "items": {i: it["name"] for i, it in state.get("items", {}).items()}, "runes": state.get("runes", {}),
             "ddragon": state["ddragon"], "champions": state["champions"], "spells": state["spells"]}
 
 
@@ -390,9 +494,7 @@ def patch(tier: str | None = None):
     """Stats for the live patch — or, right after a patch drops, the previous one until the
     sampler has enough games on the new one (`patch` vs `current_patch` tells the client)."""
     with closing(store.connect()) as db, store.read_snapshot(db):
-        current = current_patch(db)
-        current_games = patch_matches(db, current)
-        shown = current if current_games >= MIN_PATCH_GAMES else (stats.latest_patch(db, before=current) or current)
+        current, current_games, shown = shown_patch(db)
         overview = stats.patch_overview(db, shown, tier) if shown else {"patch": None, "matches": 0, "tiers": []}
         if shown and overview["matches"]:
             overview["leads"] = stats.patch_lead_curve(db, shown, tier)
@@ -411,6 +513,7 @@ def analysis(puuid, rng, tz):
             "profile": {"name": p["game_name"], "tag": p["tag_line"], "platform": p["platform"],
                         "tier": p["tier"], "division": p["division"], "lp": p["lp"],
                         "season_wins": p["wins"], "season_losses": p["losses"], "level": p["level"],
+                        "rank_checked": p["rank_checked"],
                         "icon": profile_icon(state["ddragon"], p["profile_icon"]) if p["profile_icon"] is not None else None},
             "range": {"key": rng["key"], "label": rng["label"]},
             "games_analyzed": len(games),
@@ -421,6 +524,7 @@ def analysis(puuid, rng, tz):
             "leads": stats.player_leads(db, games, puuid, p["tier"], SOLO_QUEUE),
             "mastery": stats.mastery(db, puuid, games),
             "series": stats.game_series(games),
+            "ranks": store.rank_history(db, puuid, since=history.SEASON_TS),
             "sync": history.status(puuid),
         }
 
@@ -439,8 +543,8 @@ async def player(request: Request, platform: str, riot_id: str,
         raise HTTPException(400, "Use the full Riot ID, e.g. Name#EUW")
     name, tag = (x.strip() for x in riot_id.rsplit("#", 1))
     riot = state["riot"]
-    db = store.connect()
-    cached = store.find_player(db, platform, name, tag)
+    with closing(store.connect()) as db:
+        cached = store.find_player(db, platform, name, tag)
     fresh = cached and cached["profile_updated"] and time.time() - cached["profile_updated"] < PROFILE_TTL
     try:
         # a fresh cached profile skips 3 of the 5 lookup calls (account, summoner, mastery)
@@ -456,12 +560,15 @@ async def player(request: Request, platform: str, riot_id: str,
     except RiotError as e:
         raise riot_errors(e)
     solo = next((e for e in entries if e["queueType"] == "RANKED_SOLO_5x5"), {})
-    store.save_player(db, puuid, game_name, tag_line, platform, solo, profile[0] if profile else None)
-    if profile:
-        store.save_mastery(db, puuid, profile[1])
-    db.commit()
+    with closing(store.connect()) as db:
+        store.save_player(db, puuid, game_name, tag_line, platform, solo, profile[0] if profile else None)
+        if profile:
+            store.save_mastery(db, puuid, profile[1])
+        db.commit()
     if game:
-        state["live"][puuid] = {"at": time.time(), "game": game, "extra": None}
+        cached = _live_cached(puuid)
+        same = cached and cached["game"] and cached["game"]["gameId"] == game["gameId"]
+        _live_cached(puuid, {"at": time.time(), "game": game, "extra": cached["extra"] if same else None})
 
     rng = history.resolve(range_)
     await asyncio.to_thread(track, request.state.user, "lookup", f"{game_name}#{tag_line} ({platform}) · {rng['label']}")
@@ -490,24 +597,25 @@ async def live(puuid: str, form: bool = False):
     the client polls until `pending` is 0. Players who hide their identity in live games
     come without a PUUID and are shown champion-only.
     """
-    db = store.connect()
-    me = store.get_player(db, puuid)
+    with closing(store.connect()) as db:
+        me = store.get_player(db, puuid)
     if not me:
         raise HTTPException(404, "Unknown player")
     platform = me["platform"]
     riot = state["riot"]
-    cached = state["live"].get(puuid)
+    cached = _live_cached(puuid)
     try:
         if not cached or time.time() - cached["at"] > LIVE_TTL:
             game = await riot.active_game(platform, puuid)
             same = cached and cached["game"] and game and cached["game"]["gameId"] == game["gameId"]
-            cached = state["live"][puuid] = {"at": time.time(), "game": game, "extra": cached["extra"] if same else None}
+            cached = _live_cached(puuid, {"at": time.time(), "game": game, "extra": cached["extra"] if same else None})
         game = cached["game"]
         if not game:
             return {"in_game": False}
         people = [p for p in game["participants"] if p.get("puuid")]
         hidden = [p for p in game["participants"] if not p.get("puuid")]
-        if cached["extra"] is None:  # ranks + mastery, once per TTL
+        fresh_ranks = cached["extra"] is None
+        if fresh_ranks:  # ranks + mastery, once per game while watched
             leagues, masteries = await asyncio.gather(
                 asyncio.gather(*(riot.league_entries(platform, p["puuid"]) for p in people), return_exceptions=True),
                 asyncio.gather(*(riot.mastery(platform, p["puuid"]) for p in people), return_exceptions=True))
@@ -518,6 +626,11 @@ async def live(puuid: str, form: bool = False):
 
     solo_of = {p["puuid"]: next((e for e in cached["extra"].get(p["puuid"], ([], []))[0]
                                  if e.get("queueType") == "RANKED_SOLO_5x5"), {}) for p in people}
+    if fresh_ranks:  # each live check is a free rank snapshot for all ten players
+        with closing(store.connect()) as db:
+            for p in people:
+                store.save_rank(db, p["puuid"], solo_of[p["puuid"]])
+            db.commit()
     if form:
         bg = riot.background(HISTORY_SHARE)
         for p in people:
@@ -525,24 +638,24 @@ async def live(puuid: str, form: bool = False):
                           history.last_n(LIVE_FORM_GAMES), replace=False, timelines=False)  # form only needs matches
 
     def build_rows():  # blocking SQLite reads: run in a worker thread
-        db = store.connect()
-        rows = []
-        for p in people:
-            solo = solo_of[p["puuid"]]
-            masteries = cached["extra"].get(p["puuid"], ([], []))[1]
-            games = stats.player_games(db, p["puuid"], SOLO_QUEUE)
-            on_champ = [g for g in games if g["champion_id"] == p["championId"]]
-            m = next((x for x in masteries if x.get("championId") == p["championId"]), {})
-            rows.append({
-                "puuid": p["puuid"], "riot_id": p.get("riotId") or "Unknown", "team": p["teamId"],
-                "champion_id": p["championId"], "is_me": p["puuid"] == puuid,
-                "tier": solo.get("tier", "UNRANKED"), "division": solo.get("rank", ""), "lp": solo.get("leaguePoints", 0),
-                "season_wins": solo.get("wins", 0), "season_losses": solo.get("losses", 0),
-                "mastery_level": m.get("championLevel"), "mastery_points": m.get("championPoints"),
-                "form": stats.wr_of(games[-LIVE_FORM_GAMES:]), "on_champ": stats.wr_of(on_champ),
-                "cached_games": len(games), "loading": (history.status(p["puuid"]) or {}).get("running", False),
-            })
-        return rows
+        with closing(store.connect()) as db:
+            rows = []
+            for p in people:
+                solo = solo_of[p["puuid"]]
+                masteries = cached["extra"].get(p["puuid"], ([], []))[1]
+                games = stats.player_games(db, p["puuid"], SOLO_QUEUE)
+                on_champ = [g for g in games if g["champion_id"] == p["championId"]]
+                m = next((x for x in masteries if x.get("championId") == p["championId"]), {})
+                rows.append({
+                    "puuid": p["puuid"], "riot_id": p.get("riotId") or "Unknown", "team": p["teamId"],
+                    "champion_id": p["championId"], "is_me": p["puuid"] == puuid,
+                    "tier": solo.get("tier", "UNRANKED"), "division": solo.get("rank", ""), "lp": solo.get("leaguePoints", 0),
+                    "season_wins": solo.get("wins", 0), "season_losses": solo.get("losses", 0),
+                    "mastery_level": m.get("championLevel"), "mastery_points": m.get("championPoints"),
+                    "form": stats.wr_of(games[-LIVE_FORM_GAMES:]), "on_champ": stats.wr_of(on_champ),
+                    "cached_games": len(games), "loading": (history.status(p["puuid"]) or {}).get("running", False),
+                })
+            return rows
 
     rows = await asyncio.to_thread(build_rows)
     rows += [{"puuid": None, "riot_id": "Hidden player", "team": p["teamId"], "champion_id": p["championId"],
@@ -564,7 +677,7 @@ def player_analysis(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias
 
 ITEM_SLOTS = [f"item{i}" for i in range(7)]  # item6 is the trinket
 POSITION_ORDER = {"TOP": 0, "JUNGLE": 1, "MIDDLE": 2, "BOTTOM": 3, "UTILITY": 4}
-HISTORY_QUEUES = (420, 440, 400, 480, 450, 2400, 1710)  # match-history filters, besides "all"; 1710 = 16-player Arena
+HISTORY_QUEUES = (420, 440, 400, 480, 450, 2400, 1700, 1710)  # keep both Arena formats selectable
 SUMMONERS_RIFT = 11  # mapId: dragons and barons only exist here
 
 
@@ -577,6 +690,11 @@ def team_of(p):
     return p.get("playerSubteamId") or p["teamId"]
 
 
+def placement_of(p):
+    """Arena's duo placement takes precedence over the individual placement field."""
+    return p.get("subteamPlacement") or p.get("placement") or None
+
+
 def history_row(raw, puuid):
     """One match-history row for `puuid`, read from the raw match JSON (any queue)."""
     info = raw["info"]
@@ -586,10 +704,10 @@ def history_row(raw, puuid):
     position = me.get("teamPosition") or ""
     team_kills = sum(p["kills"] for p in info["participants"] if team_of(p) == team_of(me))
     return {
-        "match_id": raw["metadata"]["matchId"], "queue": queue_name(info),
+        "match_id": raw["metadata"]["matchId"], "queue": queue_name(info), "queue_id": info["queueId"],
         "game_start": info["gameStartTimestamp"], "duration": info["gameDuration"],
         "champion_id": me["championId"], "position": position, "team_id": me["teamId"], "win": bool(me["win"]),
-        "placement": me.get("placement") or None,  # Arena: 1st-8th
+        "placement": placement_of(me),  # Arena: 1st-8th
         "kills": me["kills"], "deaths": me["deaths"], "assists": me["assists"],
         "cs": me["totalMinionsKilled"] + me["neutralMinionsKilled"], "gold": me["goldEarned"],
         "damage": me["totalDamageDealtToChampions"], "vision": me["visionScore"],
@@ -646,7 +764,13 @@ async def player_matches(puuid: str, range_: str = Query(history.DEFAULT_RANGE, 
     def page_rows():
         with closing(store.connect()) as db, store.read_snapshot(db):
             return history_rows(db, puuid, ids)
-    return {"queue": queue, "offset": offset, "total": None, "error": error, "rows": await asyncio.to_thread(page_rows),
+    rows = await asyncio.to_thread(page_rows)
+    if queue != "all":
+        filtered = [row for row in rows if row["queue_id"] == int(queue)]
+        if len(filtered) != len(rows):
+            error = error or "Some returned games didn't match the selected match type. Please retry."
+        rows = filtered
+    return {"queue": queue, "offset": offset, "total": None, "error": error, "rows": rows,
             "next": offset + len(ids) if len(ids) == limit else None}
 
 
@@ -672,7 +796,7 @@ def match_detail(match_id: str):
         o = t.get("objectives") or {}
         count = lambda key: (o.get(key) or {}).get("kills")
         teams.append({
-            "team_id": team_id, "win": bool(players[0]["win"]), "placement": players[0].get("placement") or None,
+            "team_id": team_id, "win": bool(players[0]["win"]), "placement": placement_of(players[0]),
             "kills": sum(p["kills"] for p in players), "towers": count("tower"),
             "dragons": count("dragon") if rift else None, "barons": count("baron") if rift else None,
             "gold15": sum(gold15.get(p["puuid"], 0) for p in players) if len(gold15) == len(info["participants"]) else None,
@@ -691,6 +815,30 @@ def match_detail(match_id: str):
             "duration": info["gameDuration"], "patch": ".".join(info["gameVersion"].split(".")[:2]), "teams": teams}
 
 
+@app.get("/api/builds/{champion_id}")
+def build(champion_id: int, role: str, tier: str | None = None):
+    """The most successful build for a champion in a role on the patch the landing page shows."""
+    if role not in stats.ROLES:
+        raise HTTPException(400, "Unknown role")
+    if tier and tier not in TIERS:
+        raise HTTPException(400, "Unknown tier")
+    with closing(store.connect()) as db:
+        patch = shown_patch(db)[2]
+        return stats.champion_build(db, champion_id, role, patch, state.get("items", {}), tier)
+
+
+@app.get("/api/player/{puuid}/picks")
+def player_picks(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias="range")):
+    """Suggested champions for the player's main roles (highest win rate on the patch), with builds."""
+    history.touch(puuid)
+    with closing(store.connect()) as db:
+        p = store.get_player(db, puuid)
+        if not p:
+            raise HTTPException(404, "Unknown player")
+        games = history.window(stats.player_games(db, puuid, SOLO_QUEUE), history.resolve(range_))
+        return stats.suggested_picks(db, games, p["tier"], shown_patch(db)[2], state.get("items", {}))
+
+
 @app.get("/api/sync/{puuid}")
 def sync_status(puuid: str):
     history.touch(puuid)  # the client polls this while it shows the profile: that keeps the sync alive
@@ -700,7 +848,8 @@ def sync_status(puuid: str):
 @app.get("/api/pick")
 def pick(puuid: str, role: str, opp: int | None = None, alpha: float = Query(5.0, ge=0, allow_inf_nan=False),
          range_: str = Query(history.DEFAULT_RANGE, alias="range")):
-    games = history.window(stats.player_games(store.connect(), puuid, SOLO_QUEUE), history.resolve(range_))
+    with closing(store.connect()) as db:
+        games = history.window(stats.player_games(db, puuid, SOLO_QUEUE), history.resolve(range_))
     return stats.pick_probabilities(games, role, opp, alpha)
 
 

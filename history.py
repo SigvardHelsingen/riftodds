@@ -16,7 +16,7 @@ import store
 
 SOLO_QUEUE = 420
 SEASON_START = os.environ.get("SEASON_START", "2026-01-08")  # first day of the ranked season (UTC)
-_SEASON_TS = datetime.fromisoformat(SEASON_START).replace(tzinfo=timezone.utc).timestamp()
+SEASON_TS = datetime.fromisoformat(SEASON_START).replace(tzinfo=timezone.utc).timestamp()
 
 RANGES = {
     "20": {"label": "Last 20 games", "count": 20},
@@ -25,14 +25,18 @@ RANGES = {
     "200": {"label": "Last 200 games", "count": 200},
     "30d": {"label": "Last 30 days", "days": 30},
     "90d": {"label": "Last 90 days", "days": 90},
-    "season": {"label": f"This season (since {SEASON_START})", "since": _SEASON_TS},
+    "season": {"label": f"This season (since {SEASON_START})", "since": SEASON_TS},
 }
 DEFAULT_RANGE = "100"
-CHUNK = 20  # matches fetched in parallel (and committed) per step: small, so the first stats show fast
+CHUNK = 20  # IDs per progress step; downloads and commits use smaller batches below
+FETCH_BATCH = 4  # IDs per batch (at most four decoded timelines plus their matches)
+FETCH_BATCHES = 2  # shared by player jobs, sampler and manual fetch_chunk callers
+_fetch_slots = None
 TIMELINE_LIMIT = int(os.environ.get("TIMELINE_LIMIT", "100"))  # newest games per sync that get a timeline
 TIMELINE_SHARE = 0.5   # timelines are nice-to-have: they yield to other users' match fetches
 ORPHAN_AFTER = 180     # stop a sync nobody has polled for this long (background tabs poll ~once a minute)
 RESYNC_AFTER = 600  # incidental syncs (replace=False) skip players synced this recently
+FINISHED_MAX = 128  # running jobs are never evicted to meet this metadata cap
 _incidental = None   # semaphore: incidental syncs run two at a time so results arrive one by one
 
 log = logging.getLogger("history")
@@ -59,13 +63,31 @@ def window(games, rng):
     return [g for g in games if g["game_start"] >= since_ms]
 
 
+def _prune_jobs():
+    now = time.time()
+    finished = []
+    for puuid, j in list(jobs.items()):
+        if j["running"]:
+            continue
+        idle_since = max(j["finished"], j["seen"])
+        if now - idle_since >= RESYNC_AFTER:
+            del jobs[puuid]
+        else:
+            finished.append((idle_since, puuid))
+    # The hard cap takes precedence over idle expiry when many jobs finish quickly.
+    for _, puuid in sorted(finished, key=lambda entry: entry[0])[:max(0, len(finished) - FINISHED_MAX)]:
+        del jobs[puuid]
+
+
 def status(puuid):
+    _prune_jobs()
     j = jobs.get(puuid)
     return None if j is None else {k: j[k] for k in ("range", "phase", "total", "done", "running", "error")}
 
 
 def touch(puuid):
     """Someone is looking at this player's sync — keep it going."""
+    _prune_jobs()
     if puuid in jobs:
         jobs[puuid]["seen"] = time.time()
 
@@ -81,6 +103,7 @@ async def wait_for_matches(puuid, timeout):
 
 
 def any_running():
+    _prune_jobs()
     return any(j["running"] for j in jobs.values())
 
 
@@ -92,6 +115,7 @@ def _finish(j, task=None):
     j["running"] = False
     j["finished"] = time.time()
     j["matches_ready"].set()
+    _prune_jobs()
 
 
 def start(riot, platform, puuid, tier, rng, replace=True, timelines=True):
@@ -100,6 +124,7 @@ def start(riot, platform, puuid, tier, rng, replace=True, timelines=True):
     replace=True (a user picked this range) cancels a running job for another range;
     replace=False (incidental syncs, e.g. live-game participants) leaves it alone.
     """
+    _prune_jobs()
     j = jobs.get(puuid)
     if j and j["running"]:
         if j["range"] == rng["key"] or not replace:
@@ -135,50 +160,65 @@ class FetchChunkError(RuntimeError):
 
 
 async def fetch_chunk(riot, db, platform, ids, tier, timelines=True):
-    """Commit valid results, then raise FetchChunkError for failed IDs.
+    """Commit valid results in bounded batches, then report failures across all IDs.
 
-    This function owns the chunk's commit/rollback, but not the connection. No
-    transaction is left open on return or failure, including cancellation.
+    This owns batch commit/rollback, not the connection. Callers must commit any
+    pending work first; an existing transaction is rejected without changing it.
+    No transaction spans a network/slot wait. Cancellation rolls back only the
+    current batch, leaving earlier commits cached.
     """
+    global _fetch_slots
+    if db.in_transaction:
+        raise ValueError("commit pending work before fetching matches")
     errors = []
     try:
-        need_match = [m for m in ids if not store.has_match(db, m)]
-        need_tl = [m for m in ids if timelines and not store.has_timeline(db, m)]
-        results = await asyncio.gather(*(riot.match(platform, m) for m in need_match),
-                                       *(riot.timeline(platform, m) for m in need_tl), return_exceptions=True)
-        matches, tls = results[:len(need_match)], results[len(need_match):]
-        if not db.in_transaction:
-            db.execute("BEGIN")
-        for kind, needed, fetched in (("match", need_match, matches), ("timeline", need_tl, tls)):
-            for mid, result in zip(needed, fetched):
-                if isinstance(result, asyncio.CancelledError):
-                    raise result
-                if isinstance(result, Exception):
-                    errors.append(f"{kind} {mid}: {type(result).__name__}: {result}")
-                    continue
-                if kind == "timeline" and not store.has_match(db, mid):
-                    continue  # the corresponding match failure is already reported
-                db.execute("SAVEPOINT fetch_item")
+        _fetch_slots = _fetch_slots or asyncio.Semaphore(FETCH_BATCHES)
+        for i in range(0, len(ids), FETCH_BATCH):
+            batch = ids[i:i + FETCH_BATCH]
+            async with _fetch_slots:
+                need_match = [m for m in batch if not store.has_match(db, m)]
+                need_tl = [m for m in batch if timelines and not store.has_timeline(db, m)]
+                results = await asyncio.gather(*(riot.match(platform, m) for m in need_match),
+                                               *(riot.timeline(platform, m) for m in need_tl), return_exceptions=True)
                 try:
-                    if kind == "match":
-                        if not isinstance(result, dict) or result.get("metadata", {}).get("matchId") != mid:
-                            raise ValueError("expected a match object with the requested matchId")
-                        store.save_match(db, platform, result)
-                    else:
-                        if result is not None and (not isinstance(result, dict) or not result):
-                            raise ValueError("expected a timeline object or an unavailable response")
-                        store.save_timeline(db, mid, result)
-                except Exception as e:
-                    db.execute("ROLLBACK TO fetch_item")
-                    errors.append(f"{kind} {mid}: {type(e).__name__}: {e}")
+                    db.execute("BEGIN")
+                    for kind, needed, offset in (("match", need_match, 0), ("timeline", need_tl, len(need_match))):
+                        for index, mid in enumerate(needed, offset):
+                            result = results[index]
+                            results[index] = None  # don't retain each payload after storing it
+                            try:
+                                if isinstance(result, asyncio.CancelledError):
+                                    raise result
+                                if isinstance(result, Exception):
+                                    errors.append(f"{kind} {mid}: {type(result).__name__}: {result}")
+                                    continue
+                                if kind == "timeline" and not store.has_match(db, mid):
+                                    continue  # the corresponding match failure is already reported
+                                db.execute("SAVEPOINT fetch_item")
+                                try:
+                                    if kind == "match":
+                                        if not isinstance(result, dict) or result.get("metadata", {}).get("matchId") != mid:
+                                            raise ValueError("expected a match object with the requested matchId")
+                                        store.save_match(db, platform, result)
+                                    else:
+                                        if result is not None and (not isinstance(result, dict) or not result):
+                                            raise ValueError("expected a timeline object or an unavailable response")
+                                        store.save_timeline(db, mid, result)
+                                except Exception as e:
+                                    db.execute("ROLLBACK TO fetch_item")
+                                    errors.append(f"{kind} {mid}: {type(e).__name__}: {e}")
+                                finally:
+                                    db.execute("RELEASE fetch_item")
+                            finally:
+                                del result
+                    for mid in batch:
+                        if tier and store.has_match(db, mid):
+                            store.tag_tier(db, mid, tier)
+                    db.commit()
                 finally:
-                    db.execute("RELEASE fetch_item")
-        for mid in ids:
-            if tier and store.has_match(db, mid):
-                store.tag_tier(db, mid, tier)
+                    results.clear()  # release decoded data before handing the slot to another caller
         completed = sum(store.has_match(db, mid) and (not timelines or store.has_timeline(db, mid))
                         for mid in ids)
-        db.commit()
     except BaseException:
         db.rollback()
         raise

@@ -5,10 +5,10 @@ l losses, the true win rate ~ Beta(1 + w, 1 + l). That gives honest credible
 intervals and lets us say "P(this player is better than their rank on X)".
 """
 import math
-import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from itertools import combinations
 from statistics import NormalDist
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -17,22 +17,6 @@ import store
 ROLES = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 SESSION_GAP_MS = 30 * 60 * 1000  # a new "session" starts after 30 min idle
 
-
-# --- small TTL memo for rank-wide aggregates ------------------------------------
-# The lead curve scans every cached timeline in a tier; it barely moves minute to minute,
-# and a loading profile re-requests its stats several times. Cache it briefly. Only cache
-# values that are later *filtered* per player, never ones that get subtracted from.
-_memo = {}
-MEMO_TTL = 300
-
-
-def _memoized(key, compute):
-    hit = _memo.get(key)
-    if hit and time.time() - hit[0] < MEMO_TTL:
-        return hit[1]
-    value = compute()
-    _memo[key] = (time.time(), value)
-    return value
 
 
 def _snapshot(func):
@@ -505,41 +489,42 @@ def _team_leads(db, where, args):
               GROUP BY f.match_id, p.team_id)
             SELECT a.match_id, a.gold - b.gold, a.win FROM tg a
             JOIN tg b ON a.match_id = b.match_id AND a.team_id != b.team_id
-            WHERE a.n = 5 AND b.n = 5""", args).fetchall()
+            WHERE a.n = 5 AND b.n = 5""", args)
 
 
 def lead_curve(rows):
-    """P(win | gold-lead bucket at 15) and how often each bucket happens."""
-    n = len(rows)
-    out = []
-    for label, test in LEAD_BUCKETS:
-        hits = [w for d, w in rows if test(d)]
-        out.append({"label": label, "share": len(hits) / n if n else None, **winrate(sum(hits), len(hits))})
-    return out
+    """Summarize a stream of teams in five counters, without retaining every timeline row."""
+    counts = [[0, 0] for _ in LEAD_BUCKETS]
+    n = 0
+    for diff, win in rows:
+        n += 1
+        for i, (_, test) in enumerate(LEAD_BUCKETS):
+            if test(diff):
+                counts[i][0] += 1
+                counts[i][1] += win
+                break
+    return [{"label": label, "share": games / n if n else None, **winrate(wins, games)}
+            for (label, _), (games, wins) in zip(LEAD_BUCKETS, counts)]
 
 
 def player_leads(db, games, puuid, tier, queue=420):
     """The player's lead-to-win curve vs their rank, plus comeback / close-out rates and laning."""
     mine = [(g["team_diff15"], g["win"]) for g in games if g.get("team_diff15") is not None]
-    use_memo = not db.in_transaction
     with store.read_snapshot(db):
-        load_rows = lambda: _team_leads(
-            db, "m.queue_id = ? AND m.match_id IN (SELECT match_id FROM match_tier WHERE tier = ?)", (queue, tier))
-        # A caller's transaction may contain uncommitted rows: don't publish them to the memo.
-        tier_rows = _memoized(("leads", tier, queue), load_rows) if use_memo else load_rows()
-        own_matches = {r[0] for r in db.execute("SELECT match_id FROM participants WHERE puuid = ?", (puuid,))}
-    rank = [(d, w) for mid, d, w in tier_rows if mid not in own_matches]
-    you, base = lead_curve(mine), lead_curve(rank)
-    rate = lambda rows, test: winrate(sum(w for d, w in rows if test(d)), sum(1 for d, _ in rows if test(d)))
-    behind, ahead = (lambda d: d <= -1000), (lambda d: d >= 1000)
+        rank_rows = _team_leads(
+            db, """m.queue_id = ? AND m.match_id IN (SELECT match_id FROM match_tier WHERE tier = ?)
+                   AND m.match_id NOT IN (SELECT match_id FROM participants WHERE puuid = ?)""", (queue, tier, puuid))
+        base = lead_curve((d, w) for _, d, w in rank_rows)
+    you = lead_curve(mine)
+    rate = lambda buckets: winrate(sum(b["wins"] for b in buckets), sum(b["games"] for b in buckets))
     lane = [g["lane_diff15"] for g in games if g.get("lane_diff15") is not None]
     return {
         "games_with_timeline": len(mine),
-        "rank_games": len(rank) // 2,
+        "rank_games": sum(b["games"] for b in base) // 2,
         "curve": [{"label": y["label"], "share": y["share"], "you": {k: y[k] for k in ("games", "wins", "wr", "lo", "hi")},
                    "rank": {k: b[k] for k in ("games", "wins", "wr", "lo", "hi")}} for y, b in zip(you, base)],
-        "comeback": {"you": rate(mine, behind), "rank": rate(rank, behind)},   # win when behind 1k+
-        "close_out": {"you": rate(mine, ahead), "rank": rate(rank, ahead)},    # win when ahead 1k+
+        "comeback": {"you": rate(you[:2]), "rank": rate(base[:2])},    # win when behind 1k+
+        "close_out": {"you": rate(you[3:]), "rank": rate(base[3:])},  # win when ahead 1k+
         "lane": {
             "games": len(lane),
             "ahead_share": sum(1 for d in lane if d > 0) / len(lane) if lane else None,
@@ -553,8 +538,9 @@ def patch_lead_curve(db, patch, tier=None, queue=420):
     if tier:
         where += " AND m.match_id IN (SELECT match_id FROM match_tier WHERE tier = ?)"
         args.append(tier)
-    rows = [(d, w) for _, d, w in _team_leads(db, where, args)]
-    return {"games": len(rows) // 2, "curve": lead_curve(rows)}
+    with store.read_snapshot(db):
+        curve = lead_curve((d, w) for _, d, w in _team_leads(db, where, args))
+    return {"games": sum(b["games"] for b in curve) // 2, "curve": curve}
 
 
 # --- mastery --------------------------------------------------------------------
@@ -572,3 +558,140 @@ def mastery(db, puuid, games, pockets=6):
         "pockets": [{"champion_id": c, "level": lv, "points": pts, "last_play": lp}
                     for c, lv, pts, lp in rows if c not in played][:pockets],
     }
+
+
+# --- builds and suggested picks ------------------------------------------------------
+
+PICK_PRIOR = 50         # pseudo-games pulling a champion's win rate towards its role's average
+BUILD_PRIOR = 20        # pseudo-games pulling a build option's win rate towards the champion's
+MIN_PICK_GAMES = 15     # games a champion needs in a role before it can be suggested
+MIN_BUILD_GAMES = 5     # games a build option needs (and MIN_BUILD_SHARE of the champion's) to be ranked
+MIN_BUILD_SHARE = 0.05
+MIN_TIER_MATCHES = 300  # below this many sampled games in the player's tier, suggestions use every tier
+
+
+def shrunk(wins, games, mean, k):
+    """Win rate pulled towards `mean` by k pseudo-games, so 3-0 doesn't outrank 300-200."""
+    return (wins + k * mean) / (games + k)
+
+
+def _population(patch, tier, queue):
+    where, args = "m.patch = ? AND m.queue_id = ? AND m.remake = 0", [patch, queue]
+    if tier:
+        where += " AND m.match_id IN (SELECT match_id FROM match_tier WHERE tier = ?)"
+        args.append(tier)
+    return where, args
+
+
+@_snapshot
+def role_champions(db, patch, role, tier=None, queue=420):
+    """[(champion_id, games, wins)] for everyone who played `role` on `patch` (optionally in `tier`)."""
+    where, args = _population(patch, tier, queue)
+    return [tuple(r) for r in db.execute(
+        f"""SELECT p.champion_id, COUNT(*), SUM(p.win) FROM participants p JOIN matches m ON m.match_id = p.match_id
+            WHERE {where} AND p.position = ? GROUP BY p.champion_id""", (*args, role))]
+
+
+def _ranked(table, mean, n):
+    """Options for one build choice ({key: [games, wins]}) as (key, games, wins), best first: those
+    played often enough by shrunk win rate; if none is, just the most played one."""
+    floor = max(MIN_BUILD_GAMES, MIN_BUILD_SHARE * n)
+    options = [(key, g, w) for key, (g, w) in table.items() if g >= floor]
+    if options:
+        return sorted(options, key=lambda o: -shrunk(o[2], o[1], mean, BUILD_PRIOR))
+    return sorted(((key, g, w) for key, (g, w) in table.items()), key=lambda o: -o[1])[:1]
+
+
+@_snapshot
+def champion_build(db, champion_id, role, patch, items, tier=None, queue=420):
+    """The most successful core items, boots, runes and summoner spells for a champion in a role.
+
+    `items` is Data Dragon's {itemId: {completed, boots, support}}. Matches only record the final
+    inventory, not the purchase order: a core is three finished items from the same game,
+    listed most-built first."""
+    where, args = _population(patch, tier, queue)
+    rows = db.execute(
+        f"""SELECT b.items, b.keystone, b.primary_style, b.sub_style, b.spells, p.win
+            FROM participants p JOIN matches m ON m.match_id = p.match_id
+            JOIN builds b ON b.match_id = p.match_id AND b.puuid = p.puuid
+            WHERE {where} AND p.champion_id = ? AND p.position = ?""", (*args, champion_id, role))
+    n = wins = 0
+    tables = defaultdict(lambda: defaultdict(lambda: [0, 0]))
+
+    def add(kind, key, win):
+        tables[kind][key][0] += 1
+        tables[kind][key][1] += win
+
+    for item_list, keystone, primary, sub, spells, win in rows:
+        n += 1
+        wins += win
+        ids = [int(i) for i in (item_list or "").split(",") if i]
+        finished = sorted({i for i in ids if items.get(i, {}).get("completed")})
+        for i in finished:
+            add("item", i, win)
+        for trio in combinations(finished, 3):
+            add("core", trio, win)
+        for kind in ("boots", "support"):
+            for i in {i for i in ids if items.get(i, {}).get(kind)}:
+                add(kind, i, win)
+        if keystone:
+            add("runes", (keystone, primary, sub), win)
+        if spells:
+            add("spells", spells, win)
+    out = {"champion_id": champion_id, "role": role, "patch": patch, "tier": tier, **winrate(wins, n),
+           "core": [], "boots": [], "support": [], "runes": [], "spells": [], "situational": []}
+    if not n:
+        return out
+    mean = wins / n
+    entry = lambda g, w: {**winrate(w, g), "share": g / n}
+    built = {i: g for i, (g, _) in tables["item"].items()}
+    out["core"] = [{"items": sorted(trio, key=lambda i: -built[i]), **entry(g, w)}
+                   for trio, g, w in _ranked(tables["core"], mean, n)[:3]]
+    out["boots"] = [{"item": i, **entry(g, w)} for i, g, w in _ranked(tables["boots"], mean, n)[:2]]
+    out["support"] = [{"item": i, **entry(g, w)} for i, g, w in _ranked(tables["support"], mean, n)[:1]]
+    out["runes"] = [{"keystone": k, "primary": p, "secondary": s, **entry(g, w)}
+                    for (k, p, s), g, w in _ranked(tables["runes"], mean, n)[:2]]
+    out["spells"] = [{"spells": [int(x) for x in key.split(",")], **entry(g, w)}
+                     for key, g, w in _ranked(tables["spells"], mean, n)[:1]]
+    in_core = set(out["core"][0]["items"]) if out["core"] else set()
+    floor = max(MIN_BUILD_GAMES, MIN_BUILD_SHARE * n)
+    out["situational"] = [{"item": i, **entry(g, w)} for i, (g, w) in sorted(
+        tables["item"].items(), key=lambda kv: -kv[1][0]) if i not in in_core and g >= floor][:5]
+    return out
+
+
+def player_roles(games, min_share=0.2, most=2):
+    """[(role, share)] for the player's main roles: up to `most`, each at least `min_share` of their games."""
+    counts = Counter(g["position"] for g in games if g["position"])
+    n = sum(counts.values())
+    return [(r, c / n) for r, c in counts.most_common(most) if c / n >= min_share] if n else []
+
+
+@_snapshot
+def suggested_picks(db, games, tier, patch, items, per_role=4, queue=420):
+    """The highest win-rate champions in the player's main roles on `patch`, each with its build.
+
+    Uses games from the player's tier when the sample has enough of them, else every tier.
+    Champions are ranked by win rate shrunk towards the role's average."""
+    with store.read_snapshot(db):
+        tier_matches = db.execute(
+            """SELECT COUNT(*) FROM match_tier mt JOIN matches m ON m.match_id = mt.match_id
+               WHERE mt.tier = ? AND m.patch = ? AND m.queue_id = ? AND m.remake = 0""",
+            (tier, patch, queue)).fetchone()[0] if tier else 0
+    population = tier if tier_matches >= MIN_TIER_MATCHES else None
+    mine = defaultdict(list)
+    for g in games:
+        mine[g["champion_id"]].append(g)
+    roles = []
+    for role, share in player_roles(games):
+        champs = role_champions(db, patch, role, population, queue)
+        role_games, role_wins = sum(c[1] for c in champs), sum(c[2] for c in champs)
+        mean = role_wins / role_games if role_games else 0.5
+        ranked = sorted((c for c in champs if c[1] >= MIN_PICK_GAMES),
+                        key=lambda c: -shrunk(c[2], c[1], mean, PICK_PRIOR))[:per_role]
+        roles.append({"role": role, "share": share, "games": role_games, "average": mean, "picks": [{
+            "champion_id": champ, **winrate(w, g), "pick_share": g / role_games, "score": shrunk(w, g, mean, PICK_PRIOR),
+            "you": wr_of(mine.get(champ, [])),
+            "build": champion_build(db, champ, role, patch, items, population, queue),
+        } for champ, g, w in ranked]})
+    return {"patch": patch, "tier": population, "roles": roles}

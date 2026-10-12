@@ -9,7 +9,7 @@ import unittest
 from contextlib import ExitStack, closing
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import ANY, AsyncMock, Mock, patch
 
 import httpx
 
@@ -241,9 +241,58 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 response = await self.client.post("/api/login", json=body)
         self.assertEqual(response.status_code, 200)
 
+    async def test_build_endpoint_validates_and_uses_the_shown_patch(self):
+        items = {3031: {"name": "Infinity Edge", "completed": True, "boots": False}}
+        with patch.object(main.store, "connect", return_value=Mock()), \
+                patch.object(main, "shown_patch", return_value=("16.21", 10, "16.20")), \
+                patch.object(main.stats, "champion_build", return_value={"games": 0}) as build, \
+                patch.dict(main.state, {"items": items}):
+            self.assertEqual((await self.client.get("/api/builds/1", params={"role": "MIDDLE", "tier": "GOLD"})).status_code, 200)
+            build.assert_called_once_with(ANY, 1, "MIDDLE", "16.20", items, "GOLD")
+            self.assertEqual((await self.client.get("/api/builds/1", params={"role": "FEEDER"})).status_code, 400)
+            self.assertEqual((await self.client.get("/api/builds/1", params={"role": "MIDDLE", "tier": "WOOD"})).status_code, 400)
+        self.assertEqual(build.call_count, 1)
+
+    async def test_picks_endpoint_suggests_for_the_players_range(self):
+        games = [{"game_start": i, "position": "MIDDLE"} for i in range(30)]
+        with patch.object(main.store, "connect", return_value=Mock()), \
+                patch.object(main.store, "get_player", side_effect=[None, {"tier": "GOLD"}]), \
+                patch.object(main.stats, "player_games", return_value=games), \
+                patch.object(main, "shown_patch", return_value=("16.20", 99, "16.20")), \
+                patch.object(main.stats, "suggested_picks", return_value={"roles": []}) as picks, \
+                patch.dict(main.state, {"items": {}}):
+            self.assertEqual((await self.client.get("/api/player/nobody/picks")).status_code, 404)
+            response = await self.client.get("/api/player/someone/picks", params={"range": "20"})
+        self.assertEqual((response.status_code, response.json()), (200, {"roles": []}))
+        db, window, tier, patch_shown, items = picks.call_args.args
+        self.assertEqual((len(window), window[0]["game_start"], tier, patch_shown), (20, 10, "GOLD", "16.20"))
+
+    async def test_meta_names_items_and_runes(self):
+        runes = {8010: {"name": "Conqueror", "icon": "https://cdn.test/conqueror.png"}}
+        with patch.dict(main.state, {"ddragon": "16.20.1", "champions": {}, "spells": {}, "runes": runes,
+                                     "items": {3031: {"name": "Infinity Edge", "completed": True, "boots": False}}}):
+            meta = (await self.client.get("/api/meta")).json()
+        self.assertEqual((meta["items"], meta["runes"]), ({"3031": "Infinity Edge"}, {"8010": runes[8010]}))
+
+    async def test_builds_backfill_runs_in_batches_until_done(self):
+        with patch.object(main.store, "connect", return_value=Mock()), \
+                patch.object(main.store, "backfill_builds", side_effect=["B1", "B2", None]) as backfill:
+            await main.backfill_builds()
+        self.assertEqual([c.args[1] for c in backfill.call_args_list], ["", "B1", "B2"])
+        with patch.object(main.store, "connect", side_effect=sqlite3.OperationalError("database is locked")), \
+                self.assertLogs("sampler", "ERROR"):
+            await main.backfill_builds()  # logged, not raised into the event loop
+
+    async def test_item_data_failure_does_not_stop_startup(self):
+        with patch.object(main, "load_items", new_callable=AsyncMock, side_effect=httpx.ConnectError("down")), \
+                patch.dict(main.state, {"ddragon": "16.20.1"}), self.assertLogs("sampler", "WARNING"):
+            main.state.pop("items", None)
+            await main.load_build_data()
+            self.assertEqual(main.state["items"], {})
+
     async def test_riot_key_errors_are_not_session_401_or_403(self):
         self.store_connect.side_effect = None
-        self.store_connect.return_value = object()
+        self.store_connect.return_value = Mock()
         with patch.object(main.store, "find_player", return_value=None):
             for status in (401, 403):
                 main.state["riot"] = SimpleNamespace(account=AsyncMock(side_effect=main.RiotError(status, "rejected")))
@@ -260,7 +309,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             pick.assert_not_called()
             self.store_connect.assert_not_called()
             self.store_connect.side_effect = None
-            self.store_connect.return_value = object()
+            self.store_connect.return_value = Mock()
             response = await self.client.get("/api/pick", params={"puuid": "dummy", "role": "TOP", "alpha": "0"})
             self.assertEqual(response.status_code, 200)
             pick.assert_called_once_with([], "TOP", None, 0.0)
@@ -305,6 +354,8 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 patches.enter_context(patch.object(main, "Riot", return_value=riot))
                 champions = patches.enter_context(patch.object(main, "load_champions", new_callable=AsyncMock, return_value=("26.20.1", {})))
                 spells = patches.enter_context(patch.object(main, "load_spells", new_callable=AsyncMock, return_value={}))
+                for loader in ("load_items", "load_runes"):  # no real Data Dragon requests from tests
+                    patches.enter_context(patch.object(main, loader, new_callable=AsyncMock, return_value={}))
                 cache = patches.enter_context(patch.object(main, "ensure_cache_matches_key", new_callable=AsyncMock))
                 backfill = patches.enter_context(patch.object(main.store, "backfill_bans"))
                 self.store_connect.side_effect = None
@@ -327,10 +378,11 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         riot = SimpleNamespace(http=SimpleNamespace(aclose=AsyncMock()))
         self.store_connect.side_effect = None
         self.store_connect.return_value = Mock()
-        with patch.object(main, "Riot", return_value=riot), patch.object(main, "load_champions", new_callable=AsyncMock, return_value=("26.20.1", {})), patch.object(main, "load_spells", new_callable=AsyncMock, return_value={}), patch.object(main, "ensure_cache_matches_key", new_callable=AsyncMock), patch.object(main.store, "backfill_bans"), patch.object(main, "refresh_ddragon", side_effect=refresh), patch.dict(main.SAMPLER, {"enabled": False}):
+        with patch.object(main, "Riot", return_value=riot), patch.object(main, "load_champions", new_callable=AsyncMock, return_value=("26.20.1", {})), patch.object(main, "load_spells", new_callable=AsyncMock, return_value={}), patch.object(main, "load_items", new_callable=AsyncMock, return_value={}), patch.object(main, "load_runes", new_callable=AsyncMock, return_value={}), patch.object(main, "ensure_cache_matches_key", new_callable=AsyncMock), patch.object(main.store, "backfill_bans"), patch.object(main, "refresh_ddragon", side_effect=refresh), patch.object(main, "backfill_builds", new_callable=AsyncMock) as backfill_builds, patch.dict(main.SAMPLER, {"enabled": False}):
             async with main.lifespan(main.app):
                 await asyncio.sleep(0)
             self.assertTrue(stopped.is_set())
+            backfill_builds.assert_awaited_once_with()
         riot.http.aclose.assert_awaited_once_with()
 
 
@@ -400,7 +452,8 @@ class SnapshotBoundaryTests(unittest.TestCase):
             if concurrent_write:
                 self.add_match("second")
             return {"game_name": "Test", "tag_line": "EUW", "platform": "euw1", "tier": "GOLD",
-                    "division": "I", "lp": 10, "wins": 1, "losses": 0, "level": count, "profile_icon": None}
+                    "division": "I", "lp": 10, "wins": 1, "losses": 0, "level": count, "profile_icon": None,
+                    "rank_checked": None}
 
         def games(db, puuid, queue):
             return [{"game_start": 1000 + i} for i in range(self.count(db))]
@@ -415,7 +468,8 @@ class SnapshotBoundaryTests(unittest.TestCase):
 
         for target, name, effect in ((main.store, "get_player", player), (main.stats, "player_games", games),
                                      (main.stats, "attach_gold", attach), (main.stats, "champions_vs_rank", composite),
-                                     (main.stats, "player_leads", composite), (main.stats, "mastery", composite)):
+                                     (main.stats, "player_leads", composite), (main.stats, "mastery", composite),
+                                     (main.store, "rank_history", lambda db, puuid, since=0: [])):
             self.stack.enter_context(patch.object(target, name, side_effect=effect))
         self.stack.enter_context(patch.object(main.stats, "overview", side_effect=lambda games, tz: {"count": len(games)}))
         self.stack.enter_context(patch.object(main.history, "status", return_value=None))
@@ -516,11 +570,16 @@ class MatchHistoryTests(unittest.IsolatedAsyncioTestCase):
         return response.json()
 
     @staticmethod
-    def arena_fixture(mid, puuid):
+    def arena_fixture(mid, puuid, queue=1700):
         match = test_data.match_fixture(mid, puuid)
-        match["info"].update(queueId=1710, gameMode="CHERRY", mapId=30, teams=[])
-        for i, p in enumerate(match["info"]["participants"]):
-            p.update(playerSubteamId=i // 2 + 1, placement=i // 2 + 1, teamPosition="", kills=i)
+        info = match["info"]
+        info.update(queueId=queue, gameMode="CHERRY", mapId=30, teams=[])
+        info["participants"].extend(dict(info["participants"][i]) for i in range(6))
+        for i, p in enumerate(info["participants"]):
+            duo = i // 2 + 1
+            p.update(puuid=puuid if i == 0 else f"{mid}-arena-{i}", playerSubteamId=duo,
+                     subteamPlacement=duo, placement=0, teamPosition="", teamId=100 if duo <= 4 else 200,
+                     win=duo <= 4, kills=3 + i % 5, assists=2)
         return match
 
     async def test_ranked_solo_pages_follow_the_synced_range(self):
@@ -547,7 +606,7 @@ class MatchHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page["next"], 2)
         arena, solo = page["rows"]
         self.assertEqual((arena["queue"], arena["placement"], solo["queue"]), ("Arena", 1, "Ranked Solo"))
-        self.assertEqual(arena["kill_participation"], (0 + 3) / (0 + 1))  # KP within the duo, not all 16 players
+        self.assertEqual(arena["kill_participation"], (3 + 2) / (3 + 4))  # KP within the duo, not all 16 players
         self.assertIsNone(arena["opp_champ"])
 
         self.riot.match_ids.reset_mock()
@@ -555,25 +614,124 @@ class MatchHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.matches(queue="1710", offset=2))["next"], None)
         self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, 1710, 20, start=2)
 
-    async def test_current_modes_are_filters_and_retired_arena_is_not(self):
+    async def test_both_arena_queues_and_mayhem_are_selectable(self):
         self.riot.match_ids.return_value = []
-        await self.matches(queue="2400")
+        for queue in (1700, 1710, 2400):
+            with self.subTest(queue=queue):
+                self.riot.match_ids.reset_mock()
+                await self.matches(queue=str(queue))
+                self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, queue, 20, start=0)
+        with patch.dict(main.state, {"ddragon": "16.20.1", "champions": {}, "spells": {}}):
+            filters = {q["key"]: q["label"] for q in (await self.client.get("/api/meta")).json()["queues"]}
+        self.assertEqual((filters["1700"], filters["1710"], filters["2400"]),
+                         ("Arena", "Arena (1710)", "ARAM: Mayhem"))
+
+    async def test_arena_filter_returns_sixteen_players_from_queue_1700(self):
+        self.riot.match_ids.return_value = ["ARENA_CURRENT"]
+        self.riot.match.return_value = self.arena_fixture("ARENA_CURRENT", self.PUUID)
+        page = await self.matches(queue="1700")
+        self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, 1700, 20, start=0)
+        [row] = page["rows"]
+        self.assertEqual((row["queue_id"], row["placement"], row["win"]), (1700, 1, True))
+
+    async def test_mayhem_filter_returns_mayhem_not_regular_aram(self):
+        self.riot.match_ids.return_value = ["MAYHEM_1"]
+        match = test_data.match_fixture("MAYHEM_1", self.PUUID)
+        match["info"].update(queueId=2400, mapId=12, gameMode="ARAM")
+        for p in match["info"]["participants"]:
+            p.update(teamPosition="", playerSubteamId=0, subteamPlacement=0, placement=0)
+        self.riot.match.return_value = match
+        page = await self.matches(queue="2400")
         self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, 2400, 20, start=0)
-        for retired in ("1700", "490"):
-            response = await self.client.get(f"/api/player/{self.PUUID}/matches", params={"queue": retired})
-            self.assertEqual(response.status_code, 400, retired)
+        [row] = page["rows"]
+        self.assertEqual((row["queue_id"], row["queue"], row["placement"]), (2400, "ARAM: Mayhem", None))
+        detail = (await self.client.get("/api/match/MAYHEM_1")).json()
+        self.assertEqual([(t["team_id"], len(t["players"])) for t in detail["teams"]], [(100, 5), (200, 5)])
+        self.assertTrue(all(t["placement"] is None and t["dragons"] is None and t["barons"] is None for t in detail["teams"]))
+
+    async def test_short_nonrift_games_are_not_dropped_as_remakes(self):
+        for queue in (1700, 1710, 2400):
+            with self.subTest(queue=queue):
+                mid = f"SHORT_{queue}"
+                match = self.arena_fixture(mid, self.PUUID, queue=queue) if queue != 2400 else test_data.match_fixture(mid, self.PUUID)
+                match["info"].update(queueId=queue, gameDuration=240)
+                match["info"]["participants"][0]["gameEndedInEarlySurrender"] = True
+                self.riot.match_ids.return_value = [mid]
+                self.riot.match.return_value = match
+                page = await self.matches(queue=str(queue))
+                self.assertEqual([r["match_id"] for r in page["rows"]], [mid])
+                with closing(test_data.fixture_db(self.path)) as db:
+                    self.assertEqual(db.execute("SELECT remake FROM matches WHERE match_id = ?", (mid,)).fetchone()[0], 0)
+
+    async def test_arena_placement_prefers_subteam_and_supports_individual_fallback(self):
+        self.assertEqual(main.placement_of({"placement": 0, "subteamPlacement": 7}), 7)
+        self.assertEqual(main.placement_of({"placement": 3, "subteamPlacement": 0}), 3)
+        self.assertIsNone(main.placement_of({"placement": 0, "subteamPlacement": 0}))
+
+    async def test_filtered_history_never_displays_a_different_queue(self):
+        self.riot.match_ids.return_value = ["WRONG_QUEUE"]
+        self.riot.match.return_value = test_data.match_fixture("WRONG_QUEUE", self.PUUID)
+        result = await self.matches(queue="2400")
+        self.assertEqual(result["rows"], [])
+        self.assertIn("didn't match the selected match type", result["error"])
 
     async def test_unknown_queue_is_rejected(self):
         response = await self.client.get(f"/api/player/{self.PUUID}/matches", params={"queue": "999"})
         self.assertEqual(response.status_code, 400)
+
+    def ranks(self, puuid):
+        with closing(test_data.fixture_db(self.path)) as db:
+            return [(r["tier"], r["division"], r["lp"]) for r in main.store.rank_history(db, puuid)]
+
+    async def test_rank_tracker_checks_tracked_players_and_records_changes(self):
+        with closing(test_data.fixture_db(self.path)) as db:
+            main.store.save_player(db, "linked-player", "Linked", "EUW", "euw1", {})
+            db.execute("UPDATE players SET updated = 0 WHERE puuid = 'linked-player'")  # not looked up lately
+            db.commit()
+        entries = {self.PUUID: [test_data.league(tier="EMERALD", division="I", lp=75)],
+                   "linked-player": [{"queueType": "RANKED_FLEX_SR", "tier": "GOLD"}]}
+
+        async def league_entries(platform, puuid):
+            if puuid == "linked-player" and not entries.get("failed"):
+                entries["failed"] = True
+                raise main.RiotError(500, "flaky")
+            return entries[puuid]
+
+        self.riot.background = lambda share: SimpleNamespace(league_entries=league_entries)
+        with patch.object(main.auth, "all_accounts", return_value=[{"puuid": "linked-player"}]), \
+                patch.object(main.asyncio, "sleep", new_callable=AsyncMock, side_effect=[None, None, asyncio.CancelledError()]):
+            with self.assertRaises(asyncio.CancelledError):
+                await main.track_ranks()
+        self.assertEqual(self.ranks(self.PUUID), [("EMERALD", "I", 75)])  # a 500 for one player didn't stop the round
+        self.assertEqual(self.ranks("linked-player"), [])  # flex only: no solo rank to record
+        with closing(test_data.fixture_db(self.path)) as db:
+            self.assertIsNotNone(main.store.get_player(db, "linked-player")["rank_checked"])
+
+        self.riot.background = lambda share: SimpleNamespace(league_entries=AsyncMock(side_effect=main.RiotError(403, "key")))
+        with patch.object(main.auth, "all_accounts", return_value=[]), self.assertLogs("sampler", "WARNING"), \
+                patch.object(main.asyncio, "sleep", new_callable=AsyncMock, side_effect=[None, asyncio.CancelledError()]):
+            with self.assertRaises(asyncio.CancelledError):
+                await main.track_ranks()  # a rejected key ends the round, logged; the loop keeps going
+
+    async def test_live_game_records_every_participants_rank(self):
+        game = {"gameId": 1, "gameQueueConfigId": 420, "participants": [
+            {"puuid": self.PUUID, "teamId": 100, "championId": 1, "riotId": "Fixture#EUW"},
+            {"puuid": "opponent", "teamId": 200, "championId": 2, "riotId": "Opp#EUW"}], "bannedChampions": []}
+        self.riot.active_game = AsyncMock(return_value=game)
+        self.riot.league_entries = AsyncMock(side_effect=lambda platform, puuid: [test_data.league(lp=20 if puuid == "opponent" else 60)])
+        self.riot.mastery = AsyncMock(return_value=[])
+        response = await self.client.get(f"/api/live/{self.PUUID}")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual((self.ranks(self.PUUID), self.ranks("opponent")), ([("GOLD", "II", 60)], [("GOLD", "II", 20)]))
 
     async def test_arena_scoreboard_lists_each_duo_by_placement(self):
         with closing(test_data.fixture_db(self.path)) as db:
             main.store.save_match(db, "euw1", self.arena_fixture("ARENA_2", self.PUUID))
             db.commit()
         detail = (await self.client.get("/api/match/ARENA_2")).json()
-        self.assertEqual([t["placement"] for t in detail["teams"]], [1, 2, 3, 4, 5])
-        self.assertEqual([len(t["players"]) for t in detail["teams"]], [2] * 5)
+        self.assertEqual([t["placement"] for t in detail["teams"]], list(range(1, 9)))
+        self.assertEqual([len(t["players"]) for t in detail["teams"]], [2] * 8)
+        self.assertEqual([t["win"] for t in detail["teams"]], [True] * 4 + [False] * 4)
         self.assertEqual((detail["queue"], detail["teams"][0]["dragons"]), ("Arena", None))
         rift = (await self.client.get("/api/match/SOLO_00")).json()
         self.assertEqual([(t["team_id"], t["win"], t["kills"]) for t in rift["teams"]], [(100, True, 10), (200, False, 10)])

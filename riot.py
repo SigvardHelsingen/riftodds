@@ -257,5 +257,44 @@ async def load_spells(version):
     return {int(sp["key"]): f"{DDRAGON}/cdn/{version}/img/spell/{sp['image']['full']}" for sp in data.values()}
 
 
+LEGENDARY_GOLD = 1000  # finished items cost more than this; starters, potions and components less (or build into more)
+
+
+async def load_items(version):
+    """{itemId: {name, boots, support, completed}} for Summoner's Rift items.
+
+    `completed`: a finished, non-boots item (nothing builds out of it). `boots`: upgraded boots.
+    `support`: a finished support quest item, e.g. Bloodsong (Data Dragon prices those at 400)."""
+    async with httpx.AsyncClient(timeout=20) as c:
+        data = (await _ddragon_json(c, f"/cdn/{version}/data/en_US/item.json"))["data"]
+    gold_income = lambda it: "GoldPer" in it.get("tags", [])
+    support = {int(k) for parent in data.values() if gold_income(parent) for k in parent.get("into") or []
+               if k in data and gold_income(data[k]) and not data[k].get("into")}
+    items = {}
+    for key, it in data.items():
+        if not it.get("maps", {}).get("11"):
+            continue
+        tags = set(it.get("tags", []))
+        gold = it.get("gold", {}).get("total", 0)
+        boots = "Boots" in tags and gold > 300  # not the plain 300-gold Boots
+        completed = (not boots and not it.get("into") and gold >= LEGENDARY_GOLD
+                     and not tags & {"Consumable", "Trinket", "Jungle"})
+        items[int(key)] = {"name": it["name"], "boots": boots, "support": int(key) in support, "completed": completed}
+    return items
+
+
+async def load_runes(version):
+    """{id: {name, icon}} for every rune tree and rune (keystones included)."""
+    async with httpx.AsyncClient(timeout=20) as c:
+        trees = await _ddragon_json(c, f"/cdn/{version}/data/en_US/runesReforged.json")
+    runes = {}
+    for tree in trees:
+        runes[tree["id"]] = {"name": tree["name"], "icon": f"{DDRAGON}/cdn/img/{tree['icon']}"}
+        for slot in tree["slots"]:
+            for rune in slot["runes"]:
+                runes[rune["id"]] = {"name": rune["name"], "icon": f"{DDRAGON}/cdn/img/{rune['icon']}"}
+    return runes
+
+
 def profile_icon(version, icon_id):
     return f"{DDRAGON}/cdn/{version}/img/profileicon/{icon_id}.png"

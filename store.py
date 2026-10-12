@@ -64,6 +64,19 @@ CREATE TABLE IF NOT EXISTS frames (
 CREATE INDEX IF NOT EXISTS ix_frames_minute ON frames(minute, match_id);
 -- which matches have had their timeline fetched (short games have no frames)
 CREATE TABLE IF NOT EXISTS timelines (match_id TEXT PRIMARY KEY);
+-- each player's final items, runes and summoner spells, flattened from the raw match for builds
+CREATE TABLE IF NOT EXISTS builds (
+    match_id TEXT, puuid TEXT,
+    items TEXT,  -- final inventory item0-item5 (no trinket), comma-separated, empty slots left out
+    keystone INTEGER, primary_style INTEGER, sub_style INTEGER,
+    spells TEXT,  -- both summoner spell ids, sorted, comma-separated
+    PRIMARY KEY (match_id, puuid)
+);
+-- solo-queue rank over time (Riot has no LP history): a row whenever a check finds it changed
+CREATE TABLE IF NOT EXISTS rank_history (
+    puuid TEXT, at INTEGER, tier TEXT, division TEXT, lp INTEGER, wins INTEGER, losses INTEGER,
+    PRIMARY KEY (puuid, at)
+);
 CREATE TABLE IF NOT EXISTS mastery (
     puuid TEXT, champion_id INTEGER, level INTEGER, points INTEGER, last_play INTEGER,
     PRIMARY KEY (puuid, champion_id)
@@ -72,7 +85,16 @@ CREATE TABLE IF NOT EXISTS mastery (
 FRAME_MINUTES = (10, 15)
 # columns added after the first release; connect() adds them to older databases
 MIGRATIONS = [("players", "profile_icon", "INTEGER"), ("players", "level", "INTEGER"),
-              ("players", "profile_updated", "INTEGER")]  # when summoner + mastery were last fetched
+              ("players", "profile_updated", "INTEGER"),  # when summoner + mastery were last fetched
+              ("players", "rank_checked", "INTEGER")]     # when the solo rank was last checked
+
+
+def init(db):
+    """Create the tables and add columns from later releases (older databases are upgraded in place)."""
+    db.executescript(SCHEMA)
+    for table, col, kind in MIGRATIONS:
+        if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
 
 
 def connect():
@@ -80,10 +102,10 @@ def connect():
     try:
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA journal_mode=WAL")  # stats reads don't block (or wait on) history writes
-        db.executescript(SCHEMA)
-        for table, col, kind in MIGRATIONS:
-            if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
-                db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+        db.execute("PRAGMA cache_size=-2048")  # target 2 MiB of pages per connection, not the whole DB
+        db.execute("PRAGMA temp_store=FILE")   # large sorts/groupings can spill to disk on a 1 GiB server
+        db.execute("PRAGMA mmap_size=0")
+        init(db)
     except BaseException:
         db.close()
         raise
@@ -131,6 +153,9 @@ def has_match(db, match_id):
 
 
 def is_remake(info):
+    # The Rift heuristic must not hide short Arena eliminations or ARAM/Mayhem games.
+    if info.get("queueId") in (1700, 1710, 450, 2400):
+        return False
     return info["gameDuration"] < 300 or any(p.get("gameEndedInEarlySurrender") for p in info["participants"])
 
 
@@ -162,6 +187,34 @@ def save_match(db, platform, m):
              first("champion"), first("tower"), first("dragon"), first("riftHerald")),
         )
     _save_bans(db, mid, info)
+    _save_builds(db, mid, info)
+
+
+def _save_builds(db, mid, info):
+    for p in info["participants"]:
+        styles = (p.get("perks") or {}).get("styles") or []
+        primary = styles[0] if styles else {}
+        keystone = ((primary.get("selections") or [{}])[0]).get("perk")
+        spells = sorted(s for s in (p.get("summoner1Id"), p.get("summoner2Id")) if s)
+        db.execute("INSERT OR REPLACE INTO builds VALUES (?,?,?,?,?,?,?)",
+                   (mid, p["puuid"], ",".join(str(p[f"item{i}"]) for i in range(6) if p.get(f"item{i}")),
+                    keystone, primary.get("style"), styles[1].get("style") if len(styles) > 1 else None,
+                    ",".join(map(str, spells))))
+
+
+def backfill_builds(db, after="", limit=50):
+    """Flatten builds out of matches cached before the builds table existed, a batch at a time.
+
+    Returns the last match_id handled (pass it back as `after`), or None when nothing is left."""
+    ids = [r[0] for r in db.execute(
+        """SELECT match_id FROM matches WHERE match_id > ?
+           AND match_id NOT IN (SELECT DISTINCT match_id FROM builds) ORDER BY match_id LIMIT ?""",
+        (after, limit))]
+    for mid in ids:
+        raw = match_raw(db, mid)  # decode one match at a time, never a batch of compressed JSON
+        _save_builds(db, mid, raw["info"])
+    db.commit()
+    return ids[-1] if ids else None
 
 
 def _save_bans(db, mid, info):
@@ -176,7 +229,7 @@ def backfill_bans(db):
     """Derive bans for matches cached before the bans table existed."""
     rows = db.execute(
         "SELECT match_id, raw FROM matches WHERE match_id NOT IN (SELECT DISTINCT match_id FROM bans)")
-    for mid, raw in rows.fetchall():
+    for mid, raw in rows:
         _save_bans(db, mid, json.loads(zlib.decompress(raw))["info"])
     db.commit()
 
@@ -196,9 +249,48 @@ def save_player(db, puuid, name, tag, platform, solo, summoner=None):
              wins=excluded.wins, losses=excluded.losses, updated=excluded.updated""",
         (puuid, name, tag, platform, solo.get("tier", "UNRANKED"), solo.get("rank", ""),
          solo.get("leaguePoints", 0), solo.get("wins", 0), solo.get("losses", 0), now))
+    db.execute("UPDATE players SET rank_checked=? WHERE puuid=?", (now, puuid))
+    save_rank(db, puuid, solo, now)
     if summoner:
         db.execute("UPDATE players SET profile_icon=?, level=?, profile_updated=? WHERE puuid=?",
                    (summoner.get("profileIconId"), summoner.get("summonerLevel"), now, puuid))
+
+
+def save_rank(db, puuid, solo, at=None):
+    """Record a solo-queue league entry if it differs from the last one recorded (unranked isn't).
+    Two records in the same second keep the later one."""
+    if not solo.get("tier"):
+        return False
+    rank = (solo["tier"], solo.get("rank", ""), solo.get("leaguePoints", 0), solo.get("wins", 0), solo.get("losses", 0))
+    last = db.execute("SELECT tier, division, lp, wins, losses FROM rank_history WHERE puuid = ? ORDER BY at DESC LIMIT 1",
+                      (puuid,)).fetchone()
+    if last and tuple(last) == rank:
+        return False
+    db.execute("INSERT OR REPLACE INTO rank_history VALUES (?,?,?,?,?,?,?)", (puuid, int(at or time.time()), *rank))
+    return True
+
+
+def update_rank(db, puuid, solo):
+    """A background rank check: refresh the cached player's rank and record it if it changed."""
+    now = int(time.time())
+    db.execute("UPDATE players SET tier=?, division=?, lp=?, wins=?, losses=?, rank_checked=? WHERE puuid=?",
+               (solo.get("tier", "UNRANKED"), solo.get("rank", ""), solo.get("leaguePoints", 0),
+                solo.get("wins", 0), solo.get("losses", 0), now, puuid))
+    save_rank(db, puuid, solo, now)
+
+
+def rank_history(db, puuid, since=0):
+    """The player's recorded ranks since `since` (epoch seconds), oldest first."""
+    return [dict(zip(("at", "tier", "division", "lp", "wins", "losses"), r)) for r in db.execute(
+        "SELECT at, tier, division, lp, wins, losses FROM rank_history WHERE puuid = ? AND at >= ? ORDER BY at",
+        (puuid, since))]
+
+
+def tracked_players(db, linked, since):
+    """[(puuid, platform)] whose rank is followed: linked accounts, and players looked up since `since`."""
+    marks = ",".join("?" * len(linked))
+    return db.execute(f"SELECT puuid, platform FROM players WHERE updated >= ?{f' OR puuid IN ({marks})' if linked else ''}",
+                      (int(since), *linked)).fetchall()
 
 
 def find_player(db, platform, name, tag):

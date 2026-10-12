@@ -14,8 +14,12 @@ interval, so "60% over 10 games" is shown with how sure it really is.
   comeback and close-out rates.
 - **Match history:** every game type (ranked, normals, ARAM, ARAM: Mayhem, Arena) with expandable scoreboards.
 - **Live game:** rank, mastery and recent form for all ten players in a player's current game.
-- **Form over time:** a chart on every profile of win rate, KDA, CS, gold, damage, vision or lane gold per game,
-  with a 10-game average.
+- **Form over time:** rank history is the default graph for ranked players; switch to win rate, KDA, CS,
+  gold, damage, vision or lane gold with a 10-game average. Rank history starts when tracking begins—Riot
+  doesn't provide past LP. Linked and recently viewed accounts are checked every 20 minutes.
+- **Builds and suggested picks:** the most successful core items, boots, runes and spells per champion and role
+  on the current patch (open one from the patch board's champion table), and a Suggested picks tab with the
+  highest win-rate champions in a player's main roles, each with its build.
 - **Admin page:** admins see each member's last visit, logins and player lookups.
 
 ## Running it yourself
@@ -44,6 +48,11 @@ Optional settings in `.env`:
 In production, run a **single worker** behind an HTTPS reverse proxy. The sampler, rate limiter,
 login throttle and sync jobs live in process memory. When the API key changes, the old `cache.db`
 is set aside as `cache.db.<date>.old` and a fresh cache is built.
+
+Match history, builds and rank observations stay in SQLite on disk. For small-memory servers, downloads
+use four-game batches (two active batches maximum), live entries are capped at 64 and finished sync
+records at 128. Statistics stream database rows rather than keeping population-wide results in RAM;
+SQLite targets 2 MiB of page cache per connection and uses disk for temporary query work.
 
 ## Tests
 

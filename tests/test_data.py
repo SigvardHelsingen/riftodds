@@ -3,10 +3,12 @@ import copy
 import math
 import sqlite3
 import tempfile
+import tracemalloc
 import unittest
 from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import history
@@ -43,7 +45,7 @@ def fixture_db(path=":memory:"):
     db = sqlite3.connect(path, timeout=0.1, factory=FixtureConnection)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
-    db.executescript(store.SCHEMA)
+    store.init(db)  # the same tables and migrations as production
     return db
 
 
@@ -134,9 +136,7 @@ class MemoryTests(unittest.TestCase):
     def setUp(self):
         self.db = fixture_db()
         self.addCleanup(self.db.close)
-        self.memo_patch = mock.patch.object(stats, "_memo", {})
-        self.memo_patch.start()
-        self.addCleanup(self.memo_patch.stop)
+
 
 
 class PickTests(unittest.TestCase):
@@ -271,6 +271,247 @@ class SeriesTests(unittest.TestCase):
                          (2, 3, 10, 1000, 5000))
 
 
+FINISHED = {"completed": True, "boots": False}
+ITEMS = {3031: FINISHED, 3072: FINISHED, 3036: FINISHED, 3046: FINISHED, 6672: FINISHED,
+         3006: {"completed": False, "boots": True}, 3111: {"completed": False, "boots": True},
+         1055: {"completed": False, "boots": False}, 3340: {"completed": False, "boots": False},
+         3877: {"completed": False, "boots": False, "support": True}}
+
+
+def build_match(mid, champion, items, win, subject="subject", patch="16.1", position="MIDDLE",
+                keystone=8010, primary=8000, sub=8400, spells=(4, 12)):
+    """A ranked solo match where only `subject` has a role: `champion` in `position`, with these final items."""
+    match = match_fixture(mid, subject)
+    info = match["info"]
+    info["gameVersion"] = f"{patch}.1"
+    for p in info["participants"]:
+        p.update(teamPosition="", win=(p["teamId"] == 100) == win, championId=p["championId"] + 500)
+    for t in info["teams"]:
+        t["win"] = (t["teamId"] == 100) == win
+    slots = (list(items) + [0] * 6)[:6]
+    info["participants"][0].update(
+        championId=champion, teamPosition=position, summoner1Id=spells[0], summoner2Id=spells[1], item6=3340,
+        perks={"styles": [{"style": primary, "selections": [{"perk": keystone}]}, {"style": sub, "selections": []}]},
+        **{f"item{i}": item for i, item in enumerate(slots)})
+    return match
+
+
+class BuildTests(unittest.TestCase):
+    def setUp(self):
+        self.db = fixture_db()
+        self.addCleanup(self.db.close)
+
+
+    def add(self, mid, champion, items, win, **kwargs):
+        store.save_match(self.db, "FIXTURE", build_match(mid, champion, items, win, subject=f"p-{mid}", **kwargs))
+
+    def build(self, champion=901):
+        return stats.champion_build(self.db, champion, "MIDDLE", "16.1", ITEMS)
+
+    def test_save_match_flattens_final_items_runes_and_spells(self):
+        self.add("B1", 901, [3031, 0, 1055, 3006], True, spells=(12, 4))
+        row = self.db.execute("SELECT items, keystone, primary_style, sub_style, spells FROM builds WHERE puuid = 'p-B1'").fetchone()
+        self.assertEqual(tuple(row), ("3031,1055,3006", 8010, 8000, 8400, "4,12"))  # empty slots and the trinket left out
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM builds WHERE match_id = 'B1'").fetchone()[0], 10)
+
+    def test_backfill_restores_builds_in_batches(self):
+        for mid in ("B1", "B2"):
+            self.add(mid, 901, [3031], True)
+        self.db.execute("DELETE FROM builds")
+        self.db.commit()
+        self.assertEqual(store.backfill_builds(self.db, limit=1), "B1")
+        self.assertEqual(store.backfill_builds(self.db, "B1", limit=1), "B2")
+        self.assertIsNone(store.backfill_builds(self.db, "B2"))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM builds").fetchone()[0], 20)
+
+    def test_core_ranks_by_shrunk_win_rate_and_lists_the_most_built_item_first(self):
+        for i in range(12):
+            self.add(f"A{i}", 901, [3072, 3031, 3036, 3006, 1055], i < 9)
+        for i in range(8):
+            self.add(f"C{i}", 901, [3046, 3031, 6672, 3111], i < 2, keystone=8005, spells=(4, 14))
+        b = self.build()
+        self.assertEqual((b["games"], b["wins"]), (20, 11))
+        core = b["core"][0]
+        self.assertEqual((core["items"][0], set(core["items"]), core["games"], core["wins"]), (3031, {3031, 3072, 3036}, 12, 9))
+        self.assertEqual(set(b["core"][1]["items"]), {3031, 3046, 6672})
+        self.assertEqual((b["boots"][0]["item"], b["runes"][0]["keystone"], b["spells"][0]["spells"]), (3006, 8010, [4, 12]))
+        self.assertEqual((b["runes"][0]["primary"], b["runes"][0]["secondary"]), (8000, 8400))
+        # also built: finished items outside the top core (no starters, boots or core items)
+        self.assertEqual({o["item"] for o in b["situational"]}, {3046, 6672})
+        self.assertAlmostEqual(b["core"][0]["share"], 12 / 20)
+
+    def test_thin_options_only_show_when_nothing_else_qualifies(self):
+        for i in range(10):
+            self.add(f"P{i}", 901, [3031, 3072, 3036], i < 5)
+        for i in range(4):
+            self.add(f"Q{i}", 901, [3046, 6672, 3031], True)  # 4-0, under MIN_BUILD_GAMES
+        self.assertEqual([set(c["items"]) for c in self.build()["core"]], [{3031, 3072, 3036}])
+        for i in range(4):
+            self.add(f"R{i}", 902, [3046, 6672, 3031], True)
+        self.assertEqual([(set(c["items"]), c["games"]) for c in self.build(902)["core"]], [({3031, 3046, 6672}, 4)])
+
+    def test_support_items_get_their_own_slot(self):
+        for i in range(6):
+            self.add(f"S{i}", 901, [3877, 3031, 3072, 3036, 3111], i < 4)
+        b = self.build()
+        self.assertEqual((b["support"][0]["item"], b["support"][0]["games"], b["support"][0]["wins"]), (3877, 6, 4))
+        self.assertNotIn(3877, b["core"][0]["items"] + [o["item"] for o in b["situational"]])
+
+    def test_unknown_champion_has_an_empty_build(self):
+        b = self.build(999)
+        self.assertEqual((b["games"], b["core"], b["boots"], b["runes"]), (0, [], [], []))
+
+
+class SuggestedPickTests(BuildTests):
+    def test_player_roles_need_a_real_share(self):
+        games = [{"position": p} for p in ["MIDDLE"] * 7 + ["TOP"] * 2 + ["UTILITY", ""]]
+        self.assertEqual(stats.player_roles(games), [("MIDDLE", 0.7), ("TOP", 0.2)])
+        self.assertEqual(stats.player_roles(games, min_share=0.25), [("MIDDLE", 0.7)])
+        self.assertEqual(stats.player_roles([]), [])
+
+    def test_picks_rank_by_shrunk_win_rate_with_enough_games(self):
+        for champion, games, wins in ((901, 50, 30), (902, 20, 12), (903, 14, 14), (904, 50, 20)):
+            for i in range(games):
+                self.add(f"{champion}-{i}", champion, [3031, 3072, 3036], i < wins)
+        mine = [{"position": "MIDDLE", "champion_id": 902, "win": w} for w in (1, 1, 0)]
+        res = stats.suggested_picks(self.db, mine, "GOLD", "16.1", ITEMS, per_role=2)
+        self.assertIsNone(res["tier"])  # too few sampled Gold games: every tier
+        [role] = res["roles"]
+        self.assertEqual((role["role"], role["games"]), ("MIDDLE", 134))
+        # 903 is 14-0 but under MIN_PICK_GAMES; 901 (30-20) edges 902 (12-8) once both are shrunk
+        self.assertEqual([p["champion_id"] for p in role["picks"]], [901, 902])
+        first, second = role["picks"]
+        self.assertAlmostEqual(first["pick_share"], 50 / 134)
+        self.assertEqual((first["you"]["games"], second["you"]["games"], second["you"]["wins"]), (0, 3, 2))
+        self.assertEqual((first["build"]["games"], set(first["build"]["core"][0]["items"])), (50, {3031, 3072, 3036}))
+
+    def test_picks_use_the_players_tier_once_it_has_enough_games(self):
+        for i in range(20):
+            self.add(f"G{i}", 901, [3031], i < 15)
+            store.tag_tier(self.db, f"G{i}", "GOLD")
+        for i in range(20):
+            self.add(f"S{i}", 902, [3031], i < 18)
+        mine = [{"position": "MIDDLE", "champion_id": 901, "win": 1}]
+        with mock.patch.object(stats, "MIN_TIER_MATCHES", 10):
+            res = stats.suggested_picks(self.db, mine, "GOLD", "16.1", ITEMS)
+        self.assertEqual((res["tier"], [p["champion_id"] for p in res["roles"][0]["picks"]]), ("GOLD", [901]))
+
+
+def league(tier="GOLD", division="II", lp=40, wins=10, losses=8):
+    return {"queueType": "RANKED_SOLO_5x5", "tier": tier, "rank": division, "leaguePoints": lp, "wins": wins, "losses": losses}
+
+
+class RankHistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.db = fixture_db()
+        self.addCleanup(self.db.close)
+
+    def history(self, puuid="p1", since=0):
+        return [(r["at"], r["tier"], r["division"], r["lp"]) for r in store.rank_history(self.db, puuid, since)]
+
+    def test_only_changes_are_recorded_and_unranked_is_not(self):
+        self.assertTrue(store.save_rank(self.db, "p1", league(lp=40), at=100))
+        self.assertFalse(store.save_rank(self.db, "p1", league(lp=40), at=200))  # unchanged
+        self.assertTrue(store.save_rank(self.db, "p1", league(lp=58, wins=11), at=300))
+        self.assertFalse(store.save_rank(self.db, "p1", {}, at=400))
+        self.assertEqual(self.history(), [(100, "GOLD", "II", 40), (300, "GOLD", "II", 58)])
+        self.assertEqual(self.history(since=200), [(300, "GOLD", "II", 58)])
+
+    def test_lookups_and_background_checks_both_record_and_stamp_the_check(self):
+        store.save_player(self.db, "p1", "Name", "TAG", "euw1", league(lp=40))
+        self.db.execute("UPDATE rank_history SET at = 100")  # the lookup was a while before the check
+        looked_up = store.get_player(self.db, "p1")
+        self.assertIsNotNone(looked_up["rank_checked"])
+        store.update_rank(self.db, "p1", league(tier="PLATINUM", division="IV", lp=0, wins=11))
+        player = store.get_player(self.db, "p1")
+        self.assertEqual((player["tier"], player["division"], player["lp"], player["wins"]), ("PLATINUM", "IV", 0, 11))
+        self.assertEqual(player["updated"], looked_up["updated"])  # a background check isn't a lookup
+        self.assertEqual([r[1:] for r in self.history()][-2:], [("GOLD", "II", 40), ("PLATINUM", "IV", 0)])
+
+    def test_tracked_players_are_linked_or_recently_looked_up(self):
+        for puuid, updated in (("recent", 1000), ("stale", 10), ("linked", 10)):
+            store.save_player(self.db, puuid, puuid, "TAG", "euw1", {})
+            self.db.execute("UPDATE players SET updated = ? WHERE puuid = ?", (updated, puuid))
+        self.assertEqual(sorted(r[0] for r in store.tracked_players(self.db, {"linked"}, since=500)), ["linked", "recent"])
+        self.assertEqual([r[0] for r in store.tracked_players(self.db, set(), since=500)], ["recent"])
+
+
+class StreamingStatsTests(unittest.TestCase):
+    def test_lead_curve_consumes_one_pass_without_retaining_population_rows(self):
+        rows = ((1000 if i % 2 else -1000, i % 2) for i in range(100_000))
+        tracemalloc.start()
+        try:
+            curve = stats.lead_curve(rows)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(sum(b["games"] for b in curve), 100_000)
+        self.assertEqual([(b["games"], b["wins"]) for b in curve],
+                         [(0, 0), (50_000, 0), (0, 0), (50_000, 50_000), (0, 0)])
+        self.assertLess(peak, 512 * 1024, "Population rows must not be materialized in Python")
+
+    def test_builds_aggregate_a_cursor_instead_of_a_full_row_list(self):
+        rows = (("3031,3072,3036,3006", 8010, 8000, 8400, "4,12", i % 2) for i in range(10_000))
+        db = SimpleNamespace(in_transaction=True, execute=lambda sql, args: rows)
+        tracemalloc.start()
+        try:
+            build = stats.champion_build(db, 901, "MIDDLE", "16.1", ITEMS)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((build["games"], build["wins"]), (10_000, 5_000))
+        self.assertEqual(build["core"][0]["games"], 10_000)
+        self.assertLess(peak, 512 * 1024, "Build rows must not be materialized in Python")
+
+    def test_database_cache_targets_small_ram_and_temporary_work_uses_disk(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(store, "DB_PATH", Path(directory) / "cache.db"):
+            db = store.connect()
+            try:
+                self.assertEqual(db.execute("PRAGMA cache_size").fetchone()[0], -2048)
+                self.assertEqual(db.execute("PRAGMA temp_store").fetchone()[0], 1)
+                self.assertEqual(db.execute("PRAGMA mmap_size").fetchone()[0], 0)
+            finally:
+                db.close()
+
+    def test_build_and_ban_backfills_never_fetchall_raw_blobs(self):
+        db = fixture_db()
+        self.addCleanup(db.close)
+        for mid in ("B1", "B2", "B3"):
+            store.save_match(db, "FIXTURE", build_match(mid, 901, [3031], True))
+        db.execute("DELETE FROM builds")
+        db.execute("DELETE FROM bans")
+        db.commit()
+
+        class Cursor:
+            def __init__(self, inner):
+                self.inner = inner
+
+            def __iter__(self):
+                return iter(self.inner)
+
+            def fetchone(self):
+                return self.inner.fetchone()
+
+            def fetchall(self):
+                raise AssertionError("Backfill must stream, not fetchall")
+
+        class Connection:
+            def execute(self, *args):
+                return Cursor(db.execute(*args))
+
+            def commit(self):
+                db.commit()
+
+        streamed = Connection()
+        self.assertEqual(store.backfill_builds(streamed, limit=2), "B2")
+        self.assertEqual(store.backfill_builds(streamed, after="B2", limit=2), "B3")
+        store.backfill_bans(streamed)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM builds").fetchone()[0], 30)
+        self.assertEqual(db.execute("SELECT COUNT(*) FROM bans").fetchone()[0], 6)
+        scan = next(sql for sql, _ in db.queries if "match_id > ?" in sql)
+        self.assertNotIn("raw", scan, "The batch keeps IDs only; JSON is decoded one match at a time")
+
+
 class SnapshotTests(MemoryTests):
     def test_owned_snapshot_is_explicit_and_released(self):
         with store.read_snapshot(self.db):
@@ -335,11 +576,11 @@ class SnapshotTests(MemoryTests):
             stats.patch_overview(self.db, "16.1")
         self.assertFalse(self.db.in_transaction)
 
-    def test_player_leads_does_not_memoize_uncommitted_rows(self):
+    def test_player_leads_reflects_rollback_without_cached_rows(self):
         save_fixture(self.db, "FIXTURE_PENDING")
         result = stats.player_leads(self.db, [], "fixture-observer", "GOLD")
         self.assertEqual(result["rank_games"], 1)
-        self.assertEqual(stats._memo, {})
+
         self.assertTrue(self.db.in_transaction)
         self.db.rollback()
         self.assertEqual(stats.player_leads(self.db, [], "fixture-observer", "GOLD")["rank_games"], 0)
@@ -366,9 +607,7 @@ class ConcurrentSnapshotTests(unittest.TestCase):
         self.writer.commit()
         self.reader = fixture_db(self.path)
         self.addCleanup(self.reader.close)
-        patch = mock.patch.object(stats, "_memo", {})
-        patch.start()
-        self.addCleanup(patch.stop)
+
         self.injected = False
 
     def inject_match_before(self, marker):
@@ -411,7 +650,8 @@ class ConcurrentSnapshotTests(unittest.TestCase):
         self.reader.before_execute = change_player
         result = stats.player_leads(self.reader, [], "fixture-observer", "GOLD")
         self.assertTrue(self.injected)
-        self.assertEqual(result["rank_games"], 1)
+        # Exclusion and gold now share one query: a commit before that query is visible to both.
+        self.assertEqual(result["rank_games"], 0)
         self.assertFalse(self.reader.in_transaction)
 
 
@@ -566,7 +806,6 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.Event().wait()
         client = FakeClient(ids=["FIXTURE_1"])
         client.match = wait_for_cancel
-        self.db.execute("INSERT INTO match_tier VALUES (?,?)", ("FIXTURE_PENDING", "GOLD"))
         task = asyncio.create_task(history.fetch_chunk(client, self.db, "FIXTURE", client.ids, "GOLD", timelines=False))
         await asyncio.wait_for(started.wait(), 1)
         task.cancel()

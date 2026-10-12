@@ -17,7 +17,7 @@ const ordinal = (n) => `${n}${{ 1: "st", 2: "nd", 3: "rd" }[n] || "th"}`;
 const ROLE_NAMES = { TOP: "Top", JUNGLE: "Jungle", MIDDLE: "Mid", BOTTOM: "Bot", UTILITY: "Support", UNKNOWN: "Unknown" };
 
 let META = null;
-const view = { landing: { tier: "", sort: "wr", role: "", all: false }, player: { tab: "champions", role: null, queue: "420" },
+const view = { landing: { tier: "", sort: "wr", role: "", all: false, builds: new Set() }, player: { tab: "champions", role: null, queue: "420" },
   admin: { days: 30, user: "" } };
 let PATCH = null;
 let DATA = null;
@@ -283,19 +283,27 @@ function renderPatch() {
 
     <div class="card section">
       <div class="card-head"><div><h2>Champions</h2>
-        <p>${L.sort === "wr" ? `Champions with fewer than ${minGames} games are hidden when sorting by win rate.` : `${rows.length} champions`}</p></div>
+        <p>${L.sort === "wr" ? `Champions with fewer than ${minGames} games are hidden when sorting by win rate.` : `${rows.length} champions`}
+        Select a champion to see its most successful build.</p></div>
         <div class="chips" id="sort-chips">${[["wr", "Win rate"], ["pick", "Pick rate"], ["ban", "Ban rate"]].map(([v, l]) => `<button class="chip ${L.sort === v ? "active" : ""}" data-v="${v}">${l}</button>`).join("")}</div>
       </div>
       <div class="chips" id="role-chips" style="margin-bottom:16px">${[["", "All roles"], ...META.roles.map((r) => [r, ROLE_NAMES[r]])].map(([v, l]) => `<button class="chip ${L.role === v ? "active" : ""}" data-v="${v}">${l}</button>`).join("")}</div>
       ${WR_LEGEND()}
       <table>
         <thead><tr><th></th><th>Champion</th><th>Win rate</th><th class="num"></th><th>Pick rate</th><th>Ban rate</th><th class="num">Games</th></tr></thead>
-        <tbody>${shown.map((c, i) => `<tr><td class="rank">${i + 1}</td>
-          <td>${champCell(c.champion_id, c.role ? `${ROLE_NAMES[c.role]}${c.role_share < 0.9 ? ` · ${pct(c.role_share)}` : ""}` : "")}</td>
+        <tbody>${shown.map((c, i) => {
+          const sub = c.role ? `${ROLE_NAMES[c.role]}${c.role_share < 0.9 ? ` · ${pct(c.role_share)}` : ""}` : "";
+          const open = !!c.role && L.builds.has(c.champion_id);
+          return `<tr class="${open ? "open" : ""}"><td class="rank">${i + 1}</td>
+          <td>${c.role ? `<button class="champ-btn" data-build="${c.champion_id}" aria-expanded="${open}">${champCell(c.champion_id, sub)}
+            <span class="build-cue" aria-hidden="true">${open ? "▴" : "▾"} Build</span></button>` : champCell(c.champion_id, sub)}</td>
           <td style="width:24%">${wrBar(c)}</td><td class="num" title="${esc(wrTip(c))}">${pct(c.wr, 1)}</td>
           <td style="width:15%">${barCell(c.pick_rate / maxPick, pct(c.pick_rate, 1))}</td>
           <td style="width:15%">${barCell(c.ban_rate / maxBan, pct(c.ban_rate, 1))}</td>
-          <td class="num muted">${c.games}</td></tr>`).join("") || `<tr><td colspan="7" class="empty">${L.sort === "wr" ? `No champion has ${minGames}+ games yet — sort by pick rate, or check back as the sampler collects more.` : "No games yet."}</td></tr>`}</tbody>
+          <td class="num muted">${c.games}</td></tr>
+          ${open ? `<tr class="build-row"><td colspan="7"><div class="build-slot" data-build-slot="${c.champion_id}" data-role="${c.role}">
+            <div class="loading"><div class="spinner"></div></div></div></td></tr>` : ""}`;
+        }).join("") || `<tr><td colspan="7" class="empty">${L.sort === "wr" ? `No champion has ${minGames}+ games yet — sort by pick rate, or check back as the sampler collects more.` : "No games yet."}</td></tr>`}</tbody>
       </table>
       ${rows.length > 15 ? `<div class="table-foot"><button class="btn ghost" id="show-all">${L.all ? "Show top 15" : `Show all ${rows.length}`}</button></div>` : ""}
     </div>
@@ -311,6 +319,12 @@ function renderPatch() {
   chipGroup("#sort-chips", "sort");
   chipGroup("#role-chips", "role");
   $("#show-all")?.addEventListener("click", () => { L.all = !L.all; renderPatch(); });
+  $$(".champ-btn").forEach((b) => b.addEventListener("click", () => {
+    const id = +b.dataset.build;
+    L.builds.has(id) ? L.builds.delete(id) : L.builds.add(id);
+    renderPatch();
+  }));
+  $$("[data-build-slot]").forEach(loadBuildSlot);
   prepareTables($("#patch-body"));
 }
 
@@ -337,6 +351,7 @@ async function showPlayer(platform, riotId, range) {
   view.player.liveForm = false;
   view.player.mh = null;  // loaded match-history rows: { key, rows, next, total, error }
   view.player.trendGame = null;  // match_id of the game open beside the form chart
+  view.player.picks = null;      // suggested picks for this player/range: { key, data }
   view.player.open = new Set();
   const [name] = riotId.split("#");
   const label = META.ranges.find((r) => r.key === range)?.label.toLowerCase() || "recent games";
@@ -498,21 +513,19 @@ function renderPlayer() {
   });
   renderSync();
 
-  if (!DATA.overview) {
-    $("#player-body").innerHTML = DATA.sync?.running
-      ? `<div class="loading"><div class="spinner"></div>Waiting for the first games to arrive…</div>`
-      : `<div class="card empty"><h2>No ranked solo games in this range</h2><p>Try a longer range.</p></div>`;
-    return;
-  }
   const o = DATA.overview;
-  const m = o.momentum;
-  const cb = DATA.leads.comeback;
-  const tilt = m.after_win.games && m.after_loss.games ? m.after_win.wr - m.after_loss.wr : null;
-  const best = DATA.vs_rank.rows.filter((r) => r.p_better != null && r.player.games >= 3).sort((a, b) => b.p_better - a.p_better)[0];
-  const tabs = [...(DATA.live ? [["live", "Live game"]] : []), ["champions", "Champions"], ["matches", "Matches"], ["draft", "Draft"], ["habits", "Habits"], ["wincons", "Win conditions"]];
-  if (view.player.tab === "live" && !DATA.live) view.player.tab = "champions";
-
-  $("#player-body").innerHTML = `
+  let summary;
+  if (!o) {
+    summary = `<section class="card section trend" id="trend" aria-label="Form over time"></section>`
+      + (DATA.sync?.running
+        ? `<div class="loading"><div class="spinner"></div>Waiting for the first ranked solo games to arrive…</div>`
+        : `<div class="card empty section"><h2>No ranked solo games in this range</h2><p>Try a longer range, or browse other match types below.</p></div>`);
+  } else {
+    const m = o.momentum;
+    const cb = DATA.leads.comeback;
+    const tilt = m.after_win.games && m.after_loss.games ? m.after_win.wr - m.after_loss.wr : null;
+    const best = DATA.vs_rank.rows.filter((r) => r.p_better != null && r.player.games >= 3).sort((a, b) => b.p_better - a.p_better)[0];
+    summary = `
     <div class="tiles">
       ${tile(`Win rate · ${o.record.games} games`, pct(o.record.wr), `90% likely true win rate ${pct(o.record.lo)}–${pct(o.record.hi)}`, "indigo")}
       ${cb.you.games ? tile("Comeback rate", pct(cb.you.wr), `wins when 1k+ gold behind at 15 (${cb.you.games} games)${rankRate(cb.rank, title(p.tier))}`, "peach")
@@ -521,7 +534,13 @@ function renderPlayer() {
       ${best ? tile(`Best vs ${p.tier === "UNRANKED" ? "rank" : title(p.tier)}`, `${icon(best.champion_id)}<span class="sm">${esc(champ(best.champion_id).name)}</span>`,
         `${pts(best.delta)} vs rank · ${pct(best.p_better)} sure you're better`) : tile("Best vs rank", "–", "Not enough data yet")}
     </div>
-    ${DATA.series?.length ? `<section class="card section trend" id="trend" aria-label="Form over time"></section>` : ""}
+    ${DATA.series?.length ? `<section class="card section trend" id="trend" aria-label="Form over time"></section>` : ""}`;
+  }
+  const tabs = [...(DATA.live ? [["live", "Live game"]] : []),
+    ...(o ? [["champions", "Champions"], ["picks", "Suggested picks"]] : []), ["matches", "Matches"],
+    ...(o ? [["draft", "Draft"], ["habits", "Habits"], ["wincons", "Win conditions"]] : [])];
+  if (!tabs.some(([tab]) => tab === view.player.tab)) view.player.tab = o ? "champions" : "matches";
+  $("#player-body").innerHTML = `${summary}
     <nav class="tabs" aria-label="Player statistics">${tabs.map(([v, l]) => `<button data-tab="${v}" aria-pressed="${view.player.tab === v}" class="${view.player.tab === v ? "active" : ""}">${l}</button>`).join("")}</nav>
     <div id="tab-body"></div>`;
   $$(".tabs button").forEach((b) => b.addEventListener("click", () => {
@@ -538,7 +557,11 @@ function renderPlayer() {
 
 function renderTab() {
   clearInterval(livePoll);
-  ({ live: tabLive, champions: tabChampions, matches: tabMatches, draft: tabDraft, habits: tabHabits, wincons: tabWincons })[view.player.tab]();
+  if (view.player.tab !== "matches") {
+    matchesRequest++;
+    if (view.player.mh) view.player.mh.busy = null;
+  }
+  ({ live: tabLive, champions: tabChampions, picks: tabPicks, matches: tabMatches, draft: tabDraft, habits: tabHabits, wincons: tabWincons })[view.player.tab]();
   prepareTables($("#tab-body"));
 }
 
@@ -750,7 +773,14 @@ const TREND_STATS = [  // fmt formats a magnitude; `signed` stats get their sign
   { key: "deaths", label: "Deaths", value: (g) => g.deaths, fmt: (v) => String(Math.round(v * 10) / 10), lowerIsBetter: true },
   { key: "lane", label: "Lane gold @15", value: (g) => g.lane_diff15, fmt: whole, signed: true },
 ];
-const trendStat = () => TREND_STATS.find((s) => s.key === view.player.trendStat) || TREND_STATS[0];
+const RANK_STAT = { key: "rank", label: "Rank" };
+const CHART_STATS = [RANK_STAT, ...TREND_STATS];
+// rank is the default view; players who are unranked with nothing recorded start on win rate
+const trendStat = () => CHART_STATS.find((s) => s.key === view.player.trendStat)
+  || (DATA.profile.tier !== "UNRANKED" || DATA.ranks?.length ? RANK_STAT : TREND_STATS[0]);
+const GAMES_DESC = `Every ranked solo game in the range, oldest to newest. The line is the average of the last ${ROLL} games. Click a game to open it.`;
+const RANK_DESC = "Solo queue rank over time. Riot keeps no LP history, so Rift Odds records every change it sees: on each lookup and "
+  + "live game, and every 20 minutes for linked and recently viewed players. Dots along the bottom are this range's games.";
 const showValue = (stat, v) => (stat.signed ? `${v > 0 ? "+" : v < 0 ? "−" : ""}${stat.fmt(Math.abs(v))}` : stat.fmt(v));
 const reducedMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 let trendResize = null;
@@ -758,7 +788,7 @@ let trendDrawn = "";  // the last animated puuid/range/stat: data refreshes redr
 
 // games with a value for `stat` (oldest first), each with the average of the last ROLL of them
 function trendPoints(stat) {
-  const out = DATA.series.map((g) => ({ g, v: stat.value(g) })).filter((p) => p.v != null && Number.isFinite(p.v));
+  const out = (DATA.series || []).map((g) => ({ g, v: stat.value(g) })).filter((p) => p.v != null && Number.isFinite(p.v));
   let sum = 0;
   out.forEach((p, i) => {
     sum += p.v - (i >= ROLL ? out[i - ROLL].v : 0);
@@ -785,17 +815,15 @@ function renderTrend() {
   const table = !!view.player.trendTable;
   const open = !!view.player.trendGame;
   el.innerHTML = `
-    <div class="card-head"><div><h2>Form over time</h2>
-      <p>Every ranked solo game in the range, oldest to newest. The line is the average of the last ${ROLL} games.
-        Click a game to open it.</p></div>
+    <div class="card-head"><div><h2>Form over time</h2><p id="trend-desc"></p></div>
       <button class="btn ghost" id="trend-view" aria-pressed="${table}">${table ? "Show chart" : "Show table"}</button></div>
-    <div class="chips trend-stats" role="group" aria-label="Statistic">${TREND_STATS.map((st) => `<button class="chip ${st === stat ? "active" : ""}"
+    <div class="chips trend-stats" role="group" aria-label="Statistic">${CHART_STATS.map((st) => `<button class="chip ${st === stat ? "active" : ""}"
       data-stat="${st.key}" aria-pressed="${st === stat}">${st.label}</button>`).join("")}</div>
     <div class="trend-body ${open ? "open" : ""}" id="trend-body">
       <div class="trend-main">
         <div class="trend-figures" id="trend-figures"></div>
         <div class="trend-plot" id="trend-plot"></div>
-        ${table ? "" : legend([["", "background:var(--pos)", "Win"], ["ring", "", "Loss"], ["stroke", "background:var(--mag)", `${ROLL}-game average`]])}
+        <div id="trend-legend"></div>
       </div>
       <aside class="trend-game" id="trend-game" aria-label="Selected game" ${open ? "" : "inert"}><div class="trend-game-inner" id="trend-game-inner"></div></aside>
     </div>`;
@@ -814,25 +842,199 @@ function drawTrend() {
   const plot = $("#trend-plot");
   if (!plot) return;
   const stat = trendStat();
-  const pts = trendPoints(stat);
-  const key = `${DATA.puuid}|${view.player.range}|${stat.key}|${!!view.player.trendTable}`;
+  const table = !!view.player.trendTable;
+  const key = `${DATA.puuid}|${view.player.range}|${stat.key}|${table}`;
   const animate = key !== trendDrawn && !reducedMotion();
   trendDrawn = key;
   trendResize?.disconnect();
-  trendFigures(stat, pts, animate);
   plot.redraw = null;
+  $("#trend-desc").textContent = stat === RANK_STAT ? RANK_DESC : GAMES_DESC;
+  $("#trend-legend").innerHTML = table ? "" : legend(stat === RANK_STAT
+    ? [["stroke", "background:var(--mag)", "Rank"], ["", "background:var(--pos)", "Won game"], ["ring", "", "Lost game"]]
+    : [["", "background:var(--pos)", "Win"], ["ring", "", "Loss"], ["stroke", "background:var(--mag)", `${ROLL}-game average`]]);
+  if (stat === RANK_STAT) return drawRank(plot, animate);
+  const pts = trendPoints(stat);
+  trendFigures(stat, pts, animate);
   if (pts.length < 2) {
     plot.innerHTML = `<p class="muted trend-empty">${stat.key === "lane" ? "Lane gold needs game timelines — they're still being fetched or aren't available yet."
       : "Not enough games with this stat yet."}</p>`;
     return;
   }
-  if (view.player.trendTable) return trendTable(plot, stat, pts);
+  if (table) return trendTable(plot, stat, pts);
   plot.classList.toggle("animate", animate);
   drawTrendSvg(plot, stat, pts, animate);
-  plot.redraw = () => { plot.classList.remove("animate"); drawTrendSvg(plot, stat, pts, false); };
-  // follows the card's width, and the panel sliding open beside the chart (which pushes it left)
+  followWidth(plot, () => drawTrendSvg(plot, stat, pts, false));
+}
+
+// redraw at the plot's width: the card resizing, or the game panel sliding open beside the chart (pushing it left)
+function followWidth(plot, draw) {
+  plot.redraw = () => { plot.classList.remove("animate"); draw(); };
   trendResize = new ResizeObserver(() => { if ($("#trend-plot") === plot && plot.clientWidth !== +plot.dataset.w) plot.redraw(); });
   trendResize.observe(plot);
+}
+
+// ---- rank view: Riot keeps no LP history, so the server records each change it sees
+const LADDER_TIERS = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND"];
+const APEX = ["MASTER", "GRANDMASTER", "CHALLENGER"];
+const DIVISIONS = ["IV", "III", "II", "I"];
+const isRanked = (r) => LADDER_TIERS.includes(r.tier) || APEX.includes(r.tier);
+// one scale for every rank: 100 per division from Iron IV up; Master and above continue on LP alone
+const ladder = (r) => (APEX.includes(r.tier) ? 2800 + r.lp : LADDER_TIERS.indexOf(r.tier) * 400 + DIVISIONS.indexOf(r.division) * 100 + r.lp);
+const ladderTick = (v) => (v >= 2800 ? (v === 2800 ? "Master" : `Master +${v - 2800}`)
+  : `${title(LADDER_TIERS[Math.floor(v / 400)])} ${DIVISIONS[Math.floor((v % 400) / 100)]}`);
+const rankName = (r) => (APEX.includes(r.tier) ? title(r.tier) : `${title(r.tier)} ${r.division}`);
+const lpDiff = (d) => `${d > 0 ? "+" : d < 0 ? "−" : "±"}${Math.abs(d)} LP`;
+const stamp = (ms) => new Date(ms).toLocaleString(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+
+// recorded ranks in the range, plus the last one before it (the rank going into the range)
+function rankPoints() {
+  const all = (DATA.ranks || []).filter(isRanked).map((r) => ({ ...r, t: r.at * 1000, v: ladder(r) }));
+  const from = DATA.first_game || 0;
+  const before = all.filter((r) => r.t < from);
+  const pts = all.filter((r) => r.t >= from);
+  if (before.length) pts.unshift({ ...before.at(-1), t: from, carried: true });
+  return pts;
+}
+
+function drawRank(plot, animate) {
+  const pts = rankPoints();
+  rankFigures(pts, animate);
+  if (!pts.length) {
+    plot.innerHTML = `<p class="muted trend-empty">${DATA.profile.tier === "UNRANKED" ? "Not ranked in solo queue this season, so there's no rank to chart."
+      : "No rank recorded yet. Rift Odds records every change it sees from now on."}</p>`;
+    return;
+  }
+  if (view.player.trendTable) return rankTable(plot, pts);
+  plot.classList.toggle("animate", animate);
+  drawRankSvg(plot, pts, animate);
+  followWidth(plot, () => drawRankSvg(plot, pts, false));
+}
+
+function drawRankSvg(plot, pts, animate) {
+  const W = plot.clientWidth || 640;
+  const H = matchMedia("(max-width: 640px)").matches ? 210 : 250;
+  const m = { l: 96, r: 14, t: 10, b: 46 };  // the bottom band holds the game dots and the dates
+  const iw = W - m.l - m.r;
+  const ih = H - m.t - m.b;
+  const games = DATA.series || [];
+  const checked = (DATA.profile.rank_checked || 0) * 1000;
+  const last = pts.at(-1);
+  const t0 = Math.min(pts[0].t, games[0]?.game_start ?? Infinity);
+  let t1 = Math.max(last.t, checked, games.at(-1)?.game_start ?? 0);
+  if (t1 <= t0) t1 = t0 + 86400000;
+  const values = pts.map((p) => p.v);
+  let lo = Math.floor(Math.min(...values) / 100) * 100;
+  let hi = Math.floor(Math.max(...values) / 100) * 100 + 100;
+  if (hi - lo < 300) { lo = Math.max(0, lo - 100); hi = Math.max(hi, lo + 300); }
+  const step = hi - lo <= 600 ? 100 : hi - lo <= 2400 ? 400 : 800;
+  const ticks = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi; v += step) ticks.push(v);
+  const x = (t) => m.l + ((t - t0) / (t1 - t0)) * iw;
+  const y = (v) => m.t + ih - ((v - lo) / (hi - lo)) * ih;
+  // the rank holds from the last change to the last check
+  const line = checked > last.t ? [...pts, { t: Math.min(checked, t1), v: last.v }] : pts;
+  const real = pts.filter((p) => !p.carried);
+  const marks = real.length ? real : pts;
+  const sel = games.find((g) => g.match_id === view.player.trendGame);
+  const nDates = W < 520 ? 3 : 5;
+  // a few days: label weekday and time; longer: dates. Never the same label twice.
+  const short = t1 - t0 < 3 * 86400000
+    ? (ms) => new Date(ms).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" })
+    : (ms) => new Date(ms).toLocaleDateString(undefined, { day: "numeric", month: "short" });
+  const dates = Array.from({ length: nDates }, (_, k) => t0 + ((t1 - t0) * k) / (nDates - 1))
+    .filter((t, k, all) => k === 0 || short(t) !== short(all[k - 1]));
+  const refocus = plot.contains(document.activeElement) ? (plot.at ?? marks.length - 1) : null;
+  plot.dataset.w = W;
+  plot.classList.remove("dense");
+  plot.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">
+      ${ticks.map((v) => `<line class="grid" x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}"/>
+        <text x="${m.l - 8}" y="${y(v)}" text-anchor="end" dominant-baseline="middle">${ladderTick(v)}</text>`).join("")}
+      ${sel ? `<rect class="sel-band" x="${x(sel.game_start) - 8}" y="${m.t}" width="16" height="${ih + 22}" rx="8"/>` : ""}
+      ${games.filter((g) => g.game_start >= t0 && g.game_start <= t1).map((g, i, all) => `<circle class="dot ${g.win ? "win" : "loss"}"
+        cx="${x(g.game_start)}" cy="${m.t + ih + 14}" r="3" style="--d:${animate ? Math.round((i / all.length) * 700) : 0}ms"/>`).join("")}
+      ${dates.map((t, k) => `<text x="${x(t)}" y="${H - 6}" text-anchor="${k === 0 ? "start" : k === dates.length - 1 ? "end" : "middle"}">${short(t)}</text>`).join("")}
+      <path class="avg rank-line" pathLength="1" d="${line.map((p, i) => `${i ? "L" : "M"}${x(p.t).toFixed(1)},${y(p.v).toFixed(1)}`).join("")}"/>
+      ${real.map((p, i) => `<circle class="rank-dot" cx="${x(p.t)}" cy="${y(p.v)}" r="4" style="--d:${animate ? 300 + Math.round((i / real.length) * 700) : 0}ms"/>`).join("")}
+      <line class="cross" x1="0" x2="0" y1="${m.t}" y2="${m.t + ih}" visibility="hidden"/>
+      <circle class="focus-dot" r="8" visibility="hidden"/>
+    </svg>
+    <div class="trend-hit" tabindex="0" role="slider" aria-label="Rank over time — arrow keys move between recorded ranks"
+      aria-valuemin="1" aria-valuemax="${marks.length}" style="left:${m.l}px;top:${m.t}px;width:${iw}px;height:${ih}px"></div>
+    <div class="trend-tip" hidden aria-live="polite"></div>`;
+
+  const hit = $(".trend-hit", plot);
+  const tip = $(".trend-tip", plot);
+  const cross = $(".cross", plot);
+  const ring = $(".focus-dot", plot);
+  let at = null;
+  const show = (i) => {
+    at = plot.at = Math.max(0, Math.min(marks.length - 1, i));
+    const p = marks[at];
+    const prev = pts[pts.indexOf(p) - 1];
+    cross.setAttribute("x1", x(p.t)); cross.setAttribute("x2", x(p.t)); cross.setAttribute("visibility", "visible");
+    ring.setAttribute("cx", x(p.t)); ring.setAttribute("cy", y(p.v)); ring.setAttribute("visibility", "visible");
+    const value = document.createElement("b");
+    value.textContent = `${rankName(p)} · ${p.lp} LP`;
+    const change = document.createElement("div");
+    change.textContent = p.carried ? "Rank going into this range" : prev ? `${lpDiff(p.v - prev.v)} since the last change` : "First recorded rank";
+    const record = document.createElement("div");
+    record.textContent = `Season record ${p.wins}W ${p.losses}L`;
+    const when = document.createElement("div");
+    when.className = "muted";
+    when.textContent = p.carried ? `Recorded before ${day(p.t)}` : stamp(p.t);
+    tip.replaceChildren(value, change, record, when);
+    tip.hidden = false;
+    const left = x(p.t) + 14;
+    tip.style.left = `${left + tip.offsetWidth > W ? x(p.t) - 14 - tip.offsetWidth : left}px`;
+    tip.style.top = `${m.t}px`;
+    hit.setAttribute("aria-valuenow", at + 1);
+    hit.setAttribute("aria-valuetext", `${value.textContent}, ${change.textContent}, ${when.textContent}`);
+  };
+  const hide = () => { at = plot.at = null; tip.hidden = true; cross.setAttribute("visibility", "hidden"); ring.setAttribute("visibility", "hidden"); };
+  const nearest = (px) => marks.reduce((best, p, i) => (Math.abs(x(p.t) - px) < Math.abs(x(marks[best].t) - px) ? i : best), 0);
+  const pick = (e) => show(nearest(e.clientX - hit.getBoundingClientRect().left + m.l));
+  hit.addEventListener("pointermove", pick);
+  hit.addEventListener("pointerdown", pick);
+  hit.addEventListener("pointerleave", hide);
+  hit.addEventListener("focus", () => show(at ?? marks.length - 1));
+  hit.addEventListener("blur", hide);
+  hit.addEventListener("keydown", (e) => {
+    const step = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1 }[e.key];
+    if (step) show((at ?? marks.length - 1) + step);
+    else if (e.key === "Home") show(0);
+    else if (e.key === "End") show(marks.length - 1);
+    else if (e.key === "Escape") hide();
+    else return;
+    e.preventDefault();
+  });
+  if (refocus != null) { hit.focus({ preventScroll: true }); show(Math.min(refocus, marks.length - 1)); }
+}
+
+function rankFigures(pts, animate) {
+  const el = $("#trend-figures");
+  if (!el) return;
+  const p = DATA.profile;
+  const now = isRanked(p) ? { tier: p.tier, division: p.division, lp: p.lp } : pts.at(-1);
+  if (!now) { el.innerHTML = ""; return; }
+  const first = pts[0];
+  const peak = pts.reduce((a, b) => (b.v > a.v ? b : a), first || { ...now, v: ladder(now), t: Date.now() });
+  const change = first && pts.length > 1 ? ladder(now) - first.v : null;
+  el.innerHTML = figure("Current rank", esc(rankName(now)), `${now.lp} LP${p.rank_checked ? ` · checked ${ago(p.rank_checked * 1000)}` : ""}`)
+    + figure("Change in range", change == null ? "–" : `<span data-count="${change}">${lpDiff(change)}</span>`,
+      change == null ? `recording since ${day(first?.t ?? Date.now())}` : `since ${day(first.t)}`)
+    + figure("Peak in range", esc(rankName(peak)), `${peak.lp} LP · ${day(peak.t)}`);
+  if (animate) $$("[data-count]", el).forEach((span) => countUp(span, +span.dataset.count, (v) => lpDiff(Math.round(v))));
+}
+
+function rankTable(plot, pts) {
+  plot.classList.remove("animate");
+  const rows = pts.map((p, i) => ({ ...p, change: i ? p.v - pts[i - 1].v : null })).reverse();
+  plot.innerHTML = `<table class="trend-table"><thead><tr><th>When</th><th>Rank</th><th class="num">LP</th>
+      <th class="num">Change</th><th class="num">Season record</th></tr></thead>
+    <tbody>${rows.map((p) => `<tr><td>${p.carried ? "Start of range" : esc(stamp(p.t))}</td><td>${esc(rankName(p))}</td>
+      <td class="num">${p.lp}</td><td class="num">${p.change == null ? "–" : lpDiff(p.change)}</td>
+      <td class="num">${p.wins}W ${p.losses}L</td></tr>`).join("")}</tbody></table>`;
+  prepareTables(plot);
 }
 
 function drawTrendSvg(plot, stat, pts, animate) {
@@ -1053,6 +1255,96 @@ async function renderTrendGame(swap = false) {
     <p class="muted small tg-foot">${[m.queue && esc(m.queue), m.patch && `Patch ${patchName(m.patch)}`].filter(Boolean).join(" · ")}</p>`;
 }
 
+// ---------------------------------------------------------------- builds & suggested picks
+const itemImg = (id) => {
+  const name = META.items?.[id] || `Item ${id}`;
+  return `<img src="${ITEM_CDN()}${id}.png" alt="${esc(name)}" title="${esc(name)}" loading="lazy">`;
+};
+const runeImg = (id) => (META.runes?.[id]
+  ? `<img src="${META.runes[id].icon}" alt="${esc(META.runes[id].name)}" title="${esc(META.runes[id].name)}" loading="lazy">` : "");
+const buildWr = (o) => `<span class="build-wr" title="${esc(wrTip(o))}"><b>${pct(o.wr)}</b> win rate · ${o.games} game${o.games === 1 ? "" : "s"}</span>`;
+const BUILD_NOTE = "Core items are three finished items from the same game, most built first (Riot's match data has no purchase order).";
+
+function buildHtml(b) {
+  if (!b?.games) return `<p class="muted small">No build data for this champion on this patch yet.</p>`;
+  const line = (label, icons, o, name = "") =>
+    `<div class="build-line"><span class="build-label">${label}</span><span class="build-icons">${icons}</span>${name}${buildWr(o)}</div>`;
+  const [core, ...alternatives] = b.core;
+  const rune = b.runes[0];
+  return `<div class="build">
+    ${core ? line("Core items", core.items.map(itemImg).join(""), core) : ""}
+    ${b.boots[0] ? line("Boots", itemImg(b.boots[0].item), b.boots[0]) : ""}
+    ${b.support?.[0] ? line("Support item", itemImg(b.support[0].item), b.support[0]) : ""}
+    ${rune ? line("Runes", runeImg(rune.keystone) + runeImg(rune.primary) + runeImg(rune.secondary), rune,
+      `<span class="build-name">${esc(META.runes?.[rune.keystone]?.name || "")}</span>`) : ""}
+    ${b.spells[0] ? line("Spells", b.spells[0].spells.map(spellIcon).join(""), b.spells[0]) : ""}
+    ${alternatives.map((c) => line("Alternative", c.items.map(itemImg).join(""), c)).join("")}
+    ${b.situational.length ? `<div class="build-line"><span class="build-label">Also built</span><span class="build-icons">${b.situational.map((o) =>
+      `<span class="build-sit" title="${esc(`${META.items?.[o.item] || ""} · ${pct(o.share)} of games · ${wrTip(o)}`)}">${itemImg(o.item)}<small>${pct(o.wr)}</small></span>`).join("")}</span></div>` : ""}
+  </div>`;
+}
+
+const buildCache = new Map();  // champion|role|tier|patch -> pending or finished build
+async function loadBuildSlot(el) {
+  const { buildSlot: champion, role } = el.dataset;
+  const tier = view.landing.tier;
+  const key = `${champion}|${role}|${tier}|${PATCH.patch}`;
+  if (!buildCache.has(key)) {
+    buildCache.set(key, api(`/api/builds/${champion}?role=${role}${tier ? `&tier=${tier}` : ""}`)
+      .catch((e) => { buildCache.delete(key); return { error: e.message }; }));
+  }
+  const b = await buildCache.get(key);
+  if (!el.isConnected) return;
+  el.innerHTML = b.error ? `<p class="error small">${esc(b.error)}</p>`
+    : `<p class="muted small build-note">The most successful ${ROLE_NAMES[role]} build on patch ${patchName(b.patch)}${b.tier ? ` in ${title(b.tier)}` : ""},
+        from ${b.games} game${b.games === 1 ? "" : "s"}. ${BUILD_NOTE}</p>${buildHtml(b)}`;
+}
+
+async function tabPicks() {
+  const token = nav;
+  const { puuid } = DATA;
+  const key = `${puuid}|${view.player.range}`;
+  if (view.player.picks?.key === key) return renderPicks(view.player.picks.data);
+  $("#tab-body").innerHTML = `<div class="loading"><div class="spinner"></div>Finding the best picks for your roles…</div>`;
+  const data = await api(`/api/player/${puuid}/picks?range=${view.player.range}`).catch((e) => ({ error: e.message }));
+  if (token !== nav || view.player.tab !== "picks" || DATA.puuid !== puuid) return;
+  if (!data.error) view.player.picks = { key, data };
+  renderPicks(data);
+}
+
+function renderPicks(res) {
+  const el = $("#tab-body");
+  if (res.error) { el.innerHTML = `<div class="card empty"><p class="error">${esc(res.error)}</p></div>`; return; }
+  if (!res.roles.length) { el.innerHTML = `<div class="card empty"><h2>No games with a known role in this range yet</h2></div>`; return; }
+  const population = res.tier ? `${title(res.tier)} games` : "games from every tier";
+  el.innerHTML = res.roles.map((r) => {
+    const role = ROLE_NAMES[r.role];
+    const average = { games: r.games, wins: Math.round(r.average * r.games), wr: r.average, lo: r.average, hi: r.average };
+    return `<div class="card section">
+      <div class="card-head"><div><h2>Suggested ${role} picks</h2>
+        <p>${role} is ${pct(r.share)} of your games. The highest win rates for ${role} on patch ${patchName(res.patch)}, from
+          ${r.games.toLocaleString()} sampled ${role} players in ${population}. Small samples are pulled towards the ${role}
+          average (${pct(r.average, 1)}) before ranking. ${BUILD_NOTE}</p></div></div>
+      ${r.picks.length ? `${WR_LEGEND(`${role} average`)}<div class="picks">${r.picks.map((p, i) => pickCard(p, i, role, average)).join("")}</div>`
+        : `<p class="muted">Not enough sampled ${role} games on this patch yet. The background sampler adds more over time.</p>`}
+    </div>`;
+  }).join("");
+}
+
+function pickCard(p, i, role, average) {
+  const m = DATA.mastery.by_champion[p.champion_id];
+  const tags = [p.you.games ? `You: ${p.you.wins}W ${p.you.games - p.you.wins}L (${pct(p.you.wr)})` : "New to you",
+    m ? `Mastery ${m.level} · ${kpts(m.points)} pts` : ""].filter(Boolean);
+  return `<article class="pick-card">
+    <div class="pick-head"><span class="pick-rank">${i + 1}</span>${icon(p.champion_id)}<div>
+      <b>${esc(champ(p.champion_id).name)}</b>
+      <div class="muted small">${pct(p.wr, 1)} win rate · ${p.games} games · ${pct(p.pick_share)} of ${role} players</div></div></div>
+    ${wrBar(p, average)}
+    <div class="pick-tags">${tags.map((t) => `<span>${t}</span>`).join("")}</div>
+    ${buildHtml(p.build)}
+  </article>`;
+}
+
 // ---------------------------------------------------------------- match history
 const ITEM_CDN = () => `https://ddragon.leagueoflegends.com/cdn/${META.ddragon}/img/item/`;
 const itemIcon = (id) => (id ? `<img src="${ITEM_CDN()}${id}.png" alt="" loading="lazy">` : `<span class="slot"></span>`);
@@ -1071,43 +1363,83 @@ const SOLO = "420";
 const MH_PAGE = 20;
 const SESSION_GAP_MS = 30 * 60 * 1000;
 
-// Ranked solo pages come from the synced range; other match types are listed from Riot page by page.
-async function fetchMatches(queue, offset, count) {
+let matchesRequest = 0;
+const matchesContext = () => {
+  const { puuid } = DATA;
+  const { range, queue } = view.player;
+  return { puuid, range, queue, key: `${puuid}|${range}|${queue}` };
+};
+const mergeMatches = (rows, added) => {
+  const seen = new Set();
+  return [...rows, ...added].filter((g) => !seen.has(g.match_id) && seen.add(g.match_id))
+    .sort((a, b) => b.game_start - a.game_start);
+};
+const matchesCurrent = (context, token, request, mh) => token === nav && request === matchesRequest
+  && view.player.tab === "matches" && DATA?.puuid === context.puuid && matchesContext().key === context.key
+  && view.player.mh === mh && mh.key === context.key;
+
+// Keep the request context fixed, and keep good pages if a later page fails.
+async function fetchMatches(context, offset, count, current) {
   const out = { rows: [], next: offset, total: null, error: null };
-  while (out.next != null && out.next - offset < count) {
-    const limit = Math.min(100, count - (out.next - offset));
-    const res = await api(`/api/player/${DATA.puuid}/matches?range=${view.player.range}&queue=${queue}&offset=${out.next}&limit=${limit}`);
-    out.rows.push(...res.rows);
-    Object.assign(out, { next: res.next, total: res.total, error: res.error });
+  while (out.next != null && out.next - offset < count && current()) {
+    const start = out.next;
+    const limit = Math.min(100, count - (start - offset));
+    try {
+      const res = await api(`/api/player/${context.puuid}/matches?range=${context.range}&queue=${context.queue}&offset=${start}&limit=${limit}`);
+      if (!current()) break;
+      out.rows.push(...res.rows);
+      out.total = res.total ?? out.total;
+      if (res.next != null && (!Number.isInteger(res.next) || res.next <= start)) {
+        out.error = res.error || "Match history cursor did not advance. Please retry.";
+        break;
+      }
+      out.next = res.next;
+      if (res.error) {
+        out.error = res.error;
+        out.next = start;
+        break;
+      }
+    } catch (e) {
+      out.error = e.message;
+      break;
+    }
   }
   return out;
 }
 
-async function tabMatches() {
+async function tabMatches({ force = false } = {}) {
+  const context = matchesContext();
+  let mh = view.player.mh;
+  if (!mh || mh.key !== context.key) {
+    mh = view.player.mh = { key: context.key, rows: [], next: null, total: null, error: null, loaded: false, busy: null, retry: null };
+  }
+  // Ranked sync can add games; other queues are refreshed explicitly.
+  if (mh.busy || (mh.loaded && context.queue !== SOLO && !force)) return renderMatches();
   const token = nav;
-  const { puuid } = DATA;
-  const { queue, range } = view.player;
-  const key = `${puuid}|${range}|${queue}`;
-  const loaded = view.player.mh?.key === key ? view.player.mh : null;
-  renderMatches({ loading: !loaded });
-  // only the ranked solo sync adds games while the profile is open: other types keep what's loaded
-  if (loaded && queue !== SOLO) return;
-  const res = await fetchMatches(queue, 0, Math.max(MH_PAGE, loaded?.rows.length || 0)).catch((e) => ({ rows: [], next: null, error: e.message }));
-  if (token !== nav || view.player.tab !== "matches" || DATA.puuid !== puuid || `${puuid}|${view.player.range}|${view.player.queue}` !== key) return;
-  view.player.mh = { key, ...res };
+  const request = ++matchesRequest;
+  const current = () => matchesCurrent(context, token, request, mh);
+  mh.busy = "load";
+  renderMatches();
+  const res = await fetchMatches(context, 0, Math.max(MH_PAGE, mh.rows.length), current);
+  if (!current()) return;
+  Object.assign(mh, { ...res, rows: mergeMatches(res.rows, res.error ? mh.rows : []), total: res.total ?? mh.total,
+    loaded: true, busy: null, retry: res.error ? "load" : null });
   renderMatches();
 }
 
-async function moreMatches(button) {
-  const token = nav;
+async function moreMatches() {
+  const context = matchesContext();
   const mh = view.player.mh;
-  button.disabled = true;
-  button.textContent = "Loading…";
-  const res = await fetchMatches(view.player.queue, mh.next, MH_PAGE).catch((e) => ({ rows: [], next: mh.next, error: e.message }));
-  if (token !== nav || view.player.mh !== mh || view.player.tab !== "matches") return;
-  const seen = new Set(mh.rows.map((g) => g.match_id));
-  Object.assign(mh, { rows: [...mh.rows, ...res.rows.filter((g) => !seen.has(g.match_id))], next: res.next,
-    total: res.total ?? mh.total, error: res.error });
+  if (!mh || mh.key !== context.key || mh.busy || mh.next == null) return;
+  const token = nav;
+  const request = ++matchesRequest;
+  const current = () => matchesCurrent(context, token, request, mh);
+  mh.busy = "more";
+  renderMatches();
+  const res = await fetchMatches(context, mh.next, MH_PAGE, current);
+  if (!current()) return;
+  Object.assign(mh, { ...res, rows: mergeMatches(mh.rows, res.rows), total: res.total ?? mh.total,
+    busy: null, retry: res.error ? "more" : null });
   renderMatches();
 }
 
@@ -1126,10 +1458,10 @@ function sessionsOf(rows) {
 function matchRow(g, queue) {
   const kda = g.deaths ? ((g.kills + g.assists) / g.deaths).toFixed(1) : "Perfect";
   const open = view.player.open.has(g.match_id);
-  const sub = [queue === "all" && esc(g.queue), g.placement ? `${ordinal(g.placement)} place` : ROLE_NAMES[g.position],
+  const sub = [g.queue && esc(g.queue), g.placement ? `${ordinal(g.placement)} place` : ROLE_NAMES[g.position],
     queue !== "all" && g.level && `lvl ${g.level}`].filter(Boolean).join(" · ") || "–";
   return `<button class="mh-row ${g.win ? "win" : "loss"} ${open ? "open" : ""}" data-mid="${g.match_id}" aria-expanded="${open}">
-      <span class="mh-res">${g.win ? "W" : "L"}</span>
+      <span class="mh-res"${g.placement ? ` style="font-size:12px" title="${ordinal(g.placement)} place"` : ""}>${g.placement ? ordinal(g.placement) : g.win ? "W" : "L"}</span>
       <span class="mh-champ">${icon(g.champion_id)}<span class="spells">${g.spells.map(spellIcon).join("")}</span>
         <span><b>${esc(champ(g.champion_id).name)}</b><small>${sub}</small></span></span>
       <span class="mh-vs">${g.opp_champ ? `<small>vs</small>${icon(g.opp_champ)}` : ""}</span>
@@ -1142,7 +1474,7 @@ function matchRow(g, queue) {
     <div class="mh-detail" id="d-${g.match_id}" ${open ? "" : "hidden"}></div>`;
 }
 
-function renderMatches({ loading = false } = {}) {
+function renderMatches() {
   const el = $("#tab-body");
   const { queue } = view.player;
   const types = [{ key: "all", label: "All" }, ...META.queues];
@@ -1151,22 +1483,23 @@ function renderMatches({ loading = false } = {}) {
       data-q="${t.key}" aria-pressed="${t.key === queue}">${esc(t.label)}</button>`).join("")}</div>
     <p class="muted small mh-note">${queue === SOLO ? `Ranked solo games in the selected range — the games behind the stats.`
       : "Newest games first, fetched from Riot a page at a time. The range only applies to ranked solo."}</p>`;
-  const mh = view.player.mh;
-  let body;
-  if (loading || !mh) body = `<div class="loading"><div class="spinner"></div>Loading ${queue === "all" ? "" : `${esc(label)} `}matches…</div>`;
+  const mh = view.player.mh?.key === matchesContext().key ? view.player.mh : null;
+  let body = mh?.error ? `<p class="error small">${esc(mh.error)}</p>` : "";
+  if (!mh || (!mh.loaded && mh.busy)) body += `<div class="loading"><div class="spinner"></div>Loading ${queue === "all" ? "" : `${esc(label)} `}matches…</div>`;
   else if (!mh.rows.length) {
-    body = mh.error && mh.next == null ? `<div class="card empty"><p class="error">${esc(mh.error)}</p></div>`
-      : `<div class="card empty"><h2>No ${queue === "all" ? "" : `${esc(label)} `}games ${queue === SOLO ? "in this range " : ""}yet</h2></div>`;
+    body += `<div class="card empty"><h2>${mh.error ? "Couldn't load matches" : mh.next != null ? "No matches on this page"
+      : `No ${queue === "all" ? "" : `${esc(label)} `}games ${queue === SOLO ? "in this range " : ""}yet`}</h2></div>`;
   } else {
-    body = `${mh.error ? `<p class="error small">${esc(mh.error)}</p>` : ""}<div class="mh">${sessionsOf(mh.rows).map((s) => {
+    body += `<div class="mh">${sessionsOf(mh.rows).map((s) => {
       const wins = s.games.filter((g) => g.win).length;
       return `<div class="mh-session">Session · ${sessionLabel(s.start)}<span>${s.games.length} game${s.games.length > 1 ? "s" : ""} · ${wins}W ${s.games.length - wins}L</span></div>
         ${s.games.map((g) => matchRow(g, queue)).join("")}`;
     }).join("")}</div>`;
-    if (mh.next != null) {
-      body += `<div class="table-foot"><button class="btn ghost" id="mh-more">Show more${mh.total != null ? ` (${mh.rows.length} of ${mh.total})` : ""}</button></div>`;
-    }
   }
+  if (mh) body += `<div class="table-foot">
+    <button class="btn ghost" id="mh-refresh" ${mh.busy ? "disabled" : ""}>${mh.busy === "load" ? "Loading…" : "Refresh matches"}</button>
+    ${mh.error ? `<button class="btn ghost" id="mh-retry" ${mh.busy ? "disabled" : ""}>Retry</button>` : ""}
+    ${mh.next != null ? `<button class="btn ghost" id="mh-more" ${mh.busy ? "disabled" : ""}>${mh.busy === "more" ? "Loading…" : `Show more${mh.total != null ? ` (${mh.rows.length} of ${mh.total})` : ""}`}</button>` : ""}</div>`;
   el.innerHTML = chips + body;
   $$(".mh-queues .chip", el).forEach((b) => b.addEventListener("click", () => {
     if (b.dataset.q === view.player.queue) return;
@@ -1174,7 +1507,9 @@ function renderMatches({ loading = false } = {}) {
     tabMatches();
   }));
   $$(".mh-row", el).forEach((b) => b.addEventListener("click", () => toggleMatch(b)));
-  $("#mh-more")?.addEventListener("click", (e) => moreMatches(e.currentTarget));
+  $("#mh-refresh")?.addEventListener("click", () => tabMatches({ force: true }));
+  $("#mh-retry")?.addEventListener("click", () => mh.retry === "more" ? moreMatches() : tabMatches({ force: true }));
+  $("#mh-more")?.addEventListener("click", moreMatches);
   view.player.open.forEach((mid) => loadMatchDetail(mid));
 }
 
@@ -1196,7 +1531,7 @@ async function loadMatchDetail(mid) {
   if (m.error) { el.innerHTML = `<p class="error">${esc(m.error)}</p>`; return; }
   el.dataset.loaded = "1";
   const maxDmg = Math.max(...m.teams.flatMap((t) => t.players.map((p) => p.damage)), 1);
-  const sides = { 100: ["blue", "Blue side"], 200: ["red", "Red side"] };  // Arena teams have no side
+  const sides = m.teams.some((t) => t.placement != null) ? {} : { 100: ["blue", "Blue side"], 200: ["red", "Red side"] };
   el.innerHTML = m.teams.map((t) => `<div class="mh-team ${sides[t.team_id]?.[0] || ""}">
     <div class="mh-team-head"><b>${t.placement ? `${ordinal(t.placement)} place` : t.win ? "Victory" : "Defeat"}</b><span>${[sides[t.team_id]?.[1], `${t.kills} kills`,
       t.towers != null && `${t.towers} towers`, t.dragons != null && `${t.dragons} dragons`, t.barons != null && `${t.barons} barons`,
