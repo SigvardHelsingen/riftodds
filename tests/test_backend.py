@@ -253,6 +253,36 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.client.get("/api/builds/1", params={"role": "MIDDLE", "tier": "WOOD"})).status_code, 400)
         self.assertEqual(build.call_count, 1)
 
+    async def test_random_build_returns_six_named_items_without_riot_or_database_work(self):
+        champions = {1: {"name": "Annie", "icon": "https://images.test/annie.png"}}
+        items = {3006: {"name": "Greaves", "boots": True}}
+        items.update({i: {"name": f"Item {i}", "boots": False} for i in range(9000, 9005)})
+        with patch.dict(main.state, {"champions": champions, "items": items, "ddragon": "16.20.1", "items_version": "16.19.1"}), \
+                patch.object(main.randomizer, "roll", return_value=(1, list(items))) as roll:
+            response = await self.client.post("/api/random-build", json={})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.headers["cache-control"], "no-store")
+        result = response.json()
+        self.assertEqual((result["champion_id"], result["champion"], result["version"]), (1, champions[1], "16.19.1"))
+        self.assertEqual(len(result["items"]), 6)
+        self.assertEqual(result["items"][0], {"id": 3006, "name": "Greaves", "boots": True,
+                                            "icon": "https://ddragon.leagueoflegends.com/cdn/16.19.1/img/item/3006.png"})
+        roll.assert_called_once_with(champions, items)
+        self.store_connect.assert_not_called()
+        self.record.assert_not_called()
+        self.assertNotIn("riot", main.state)
+
+    async def test_random_build_requires_login_and_handles_unavailable_data(self):
+        self.user_for.return_value = None
+        with patch.object(main.randomizer, "roll") as roll:
+            self.assertEqual((await self.client.post("/api/random-build", json={})).status_code, 401)
+            roll.assert_not_called()
+        self.user_for.return_value = "alice"
+        response = await self.client.post("/api/random-build", json={})
+        self.assertEqual(response.status_code, 503)
+        self.assertIn("warming up", response.json()["detail"])
+        self.store_connect.assert_not_called()
+
     async def test_picks_endpoint_suggests_for_the_players_range(self):
         games = [{"game_start": i, "position": "MIDDLE"} for i in range(30)]
         with patch.object(main.store, "connect", return_value=Mock()), \
@@ -614,7 +644,7 @@ class MatchHistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.matches(queue="1710", offset=2))["next"], None)
         self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, 1710, 20, start=2)
 
-    async def test_both_arena_queues_and_mayhem_are_selectable(self):
+    async def test_legacy_mode_history_remains_readable_but_tabs_are_rift_only(self):
         self.riot.match_ids.return_value = []
         for queue in (1700, 1710, 2400):
             with self.subTest(queue=queue):
@@ -623,8 +653,7 @@ class MatchHistoryTests(unittest.IsolatedAsyncioTestCase):
                 self.riot.match_ids.assert_awaited_once_with("euw1", self.PUUID, queue, 20, start=0)
         with patch.dict(main.state, {"ddragon": "16.20.1", "champions": {}, "spells": {}}):
             filters = {q["key"]: q["label"] for q in (await self.client.get("/api/meta")).json()["queues"]}
-        self.assertEqual((filters["1700"], filters["1710"], filters["2400"]),
-                         ("Arena", "Arena (1710)", "ARAM: Mayhem"))
+        self.assertEqual(filters, {"420": "Ranked Solo", "440": "Ranked Flex", "400": "Normal Draft", "480": "Swiftplay"})
 
     async def test_arena_filter_returns_sixteen_players_from_queue_1700(self):
         self.riot.match_ids.return_value = ["ARENA_CURRENT"]

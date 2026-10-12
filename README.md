@@ -12,7 +12,9 @@ interval, so "60% over 10 games" is shown with how sure it really is.
 - **Player profiles:** champion win rates compared with players of the same rank, a draft pick
   predictor (optionally by lane opponent), session and tilt habits, win conditions, and
   comeback and close-out rates.
-- **Match history:** every game type (ranked, normals, ARAM, ARAM: Mayhem, Arena) with expandable scoreboards.
+- **Match history:** Ranked Solo, Ranked Flex, Normal Draft and Swiftplay, with expandable scoreboards.
+- **Roll the dice:** a random champion and six-item challenge build on the landing page. Just for fun,
+  not a meta recommendation.
 - **Live game:** rank, mastery and recent form for all ten players in a player's current game.
 - **Form over time:** rank history is the default graph for ranked players; switch to win rate, KDA, CS,
   gold, damage, vision or lane gold with a 10-game average. Rank history starts when tracking begins—Riot

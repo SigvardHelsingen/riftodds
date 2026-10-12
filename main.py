@@ -25,6 +25,7 @@ load_env()
 
 import auth
 import history
+import randomizer
 import stats
 import store
 from riot import PLATFORMS, Riot, RiotError, load_champions, load_items, load_runes, load_spells, profile_icon
@@ -142,8 +143,10 @@ async def refresh_ddragon():
 async def load_build_data():
     """Item and rune names for builds. Builds are optional: a Data Dragon hiccup must not stop the site."""
     try:
-        state["items"] = await load_items(state["ddragon"])
-        state["runes"] = await load_runes(state["ddragon"])
+        version = state["ddragon"]
+        state["items"] = await load_items(version)
+        state["items_version"] = version
+        state["runes"] = await load_runes(version)
     except Exception:
         log.warning("could not load items/runes from Data Dragon", exc_info=True)
         state.setdefault("items", {})
@@ -484,9 +487,29 @@ def meta():
             "ranges": [{"key": k, "label": r["label"], "kind": "count" if "count" in r else "time"}
                        for k, r in history.RANGES.items()],
             "default_range": history.DEFAULT_RANGE,
-            "queues": [{"key": str(q), "label": "Arena (1710)" if q == 1710 else QUEUES[q]} for q in HISTORY_QUEUES],
+            "queues": [{"key": str(q), "label": QUEUES[q]} for q in HISTORY_QUEUES],
             "items": {i: it["name"] for i, it in state.get("items", {}).items()}, "runes": state.get("runes", {}),
             "ddragon": state["ddragon"], "champions": state["champions"], "spells": state["spells"]}
+
+
+@app.post("/api/random-build")
+def random_build():
+    """A just-for-fun champion and six-item loadout; no Riot calls or per-roll storage."""
+    champions = state.get("champions", {})
+    items = state.get("items", {})
+    version = state.get("items_version", state.get("ddragon"))
+    try:
+        champion_id, loadout = randomizer.roll(champions, items)
+    except ValueError:
+        raise HTTPException(503, "The dice are warming up—champion or item data isn't ready. Try again shortly.")
+    if not version:
+        raise HTTPException(503, "Item data isn't ready. Try again shortly.")
+    return JSONResponse({
+        "champion_id": champion_id, "champion": champions[champion_id], "version": version,
+        "items": [{"id": i, "name": items[i]["name"], "boots": bool(items[i].get("boots")),
+                   "icon": f"https://ddragon.leagueoflegends.com/cdn/{version}/img/item/{i}.png"}
+                  for i in loadout],
+    }, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/patch")
@@ -677,7 +700,8 @@ def player_analysis(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias
 
 ITEM_SLOTS = [f"item{i}" for i in range(7)]  # item6 is the trinket
 POSITION_ORDER = {"TOP": 0, "JUNGLE": 1, "MIDDLE": 2, "BOTTOM": 3, "UTILITY": 4}
-HISTORY_QUEUES = (420, 440, 400, 480, 450, 2400, 1700, 1710)  # keep both Arena formats selectable
+HISTORY_QUEUES = (420, 440, 400, 480)  # visible tabs: ranked, normal draft and Swiftplay
+HISTORY_API_QUEUES = (*HISTORY_QUEUES, 450, 2400, 1700, 1710)  # old clients can still read cached mode history
 SUMMONERS_RIFT = 11  # mapId: dragons and barons only exist here
 
 
@@ -736,7 +760,7 @@ async def player_matches(puuid: str, range_: str = Query(history.DEFAULT_RANGE, 
     Ranked solo is the synced range, straight from the cache. Other queues ("all" = every
     queue) aren't synced: each page lists its IDs from Riot and fetches only the uncached
     matches (no timelines). `next` is the offset of the following page, or null."""
-    if queue != "all" and queue not in {str(q) for q in HISTORY_QUEUES}:
+    if queue != "all" and queue not in {str(q) for q in HISTORY_API_QUEUES}:
         raise HTTPException(400, "Unknown queue")
     history.touch(puuid)
     if queue == str(SOLO_QUEUE):

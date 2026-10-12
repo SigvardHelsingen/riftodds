@@ -261,7 +261,7 @@ LEGENDARY_GOLD = 1000  # finished items cost more than this; starters, potions a
 
 
 async def load_items(version):
-    """{itemId: {name, boots, support, completed}} for Summoner's Rift items.
+    """Names and classification for Rift builds, plus purchase availability for the dice box.
 
     `completed`: a finished, non-boots item (nothing builds out of it). `boots`: upgraded boots.
     `support`: a finished support quest item, e.g. Bloodsong (Data Dragon prices those at 400)."""
@@ -279,7 +279,10 @@ async def load_items(version):
         boots = "Boots" in tags and gold > 300  # not the plain 300-gold Boots
         completed = (not boots and not it.get("into") and gold >= LEGENDARY_GOLD
                      and not tags & {"Consumable", "Trinket", "Jungle"})
-        items[int(key)] = {"name": it["name"], "boots": boots, "support": int(key) in support, "completed": completed}
+        buyable = (it.get("gold", {}).get("purchasable", False) and it.get("inStore", True)
+                   and not it.get("hideFromAll") and not it.get("requiredChampion") and not it.get("requiredAlly"))
+        items[int(key)] = {"name": it["name"], "boots": boots, "support": int(key) in support, "completed": completed,
+                           "random_eligible": bool(buyable and (boots or completed) and int(key) not in support)}
     return items
 
 

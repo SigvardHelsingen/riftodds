@@ -28,11 +28,11 @@ let nav = 0;    // bumped on every route; async renders bail out if it changed
 const playerHash = (platform, riotId, range) => `#/p/${platform}/${encodeURIComponent(riotId)}/${range}`;
 const myHash = () => ME?.account && playerHash(ME.account.platform, `${ME.account.game_name}#${ME.account.tag_line}`, view.player.range || META.default_range);
 
-async function api(path, opts) {
+async function api(path, opts, current) {
   const r = await fetch(path, opts);
   const body = await r.json().catch(() => ({}));
   if (r.status === 401 && path !== "/api/login") {
-    showLogin(); // session expired or user removed
+    if (!current || current()) showLogin(); // session expired or user removed; obsolete requests must not change routes
     throw new Error("Not logged in");
   }
   if (!r.ok) {
@@ -42,12 +42,13 @@ async function api(path, opts) {
   return body;
 }
 
-const postJSON = (path, data) =>
-  api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) });
+const postJSON = (path, data, current) =>
+  api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(data) }, current);
 
 // ---------------------------------------------------------------- login
 function showLogin() {
   nav++;
+  randomBuildResult = null;
   ME = null;
   DATA = null;
   clearInterval(pollTimer);
@@ -194,11 +195,83 @@ async function showLanding() {
       </div>
       ${searchForm("big")}
     </section>
+    ${randomBuildCard()}
     <div id="patch-body"><div class="loading"><div class="spinner"></div>Loading patch stats…</div></div>`;
   bindSearch($(".search.big"));
+  $("#random-roll").addEventListener("click", rollRandomBuild);
   const token = nav;
   await loadPatch();
   if (token === nav) pollTimer = setInterval(loadPatch, 30000);
+}
+
+let randomBuildResult = null;
+let randomBuildRequest = 0;
+const DICE = `<svg class="random-dice" viewBox="0 0 40 40" aria-hidden="true" focusable="false">
+  <rect x="6" y="6" width="28" height="28" rx="6" transform="rotate(-8 20 20)"/>
+  <circle cx="13" cy="13" r="2"/><circle cx="26" cy="12" r="2"/><circle cx="20" cy="20" r="2"/>
+  <circle cx="14" cy="28" r="2"/><circle cx="27" cy="27" r="2"/></svg>`;
+
+function randomBuildHtml(result) {
+  return `<div class="random-champion"><img src="${esc(result.champion.icon)}" alt="${esc(result.champion.name)} portrait" width="80" height="80">
+      <div><span class="random-label">Your champion</span><h3>${esc(result.champion.name)}</h3><span class="muted small">Now that's a plan. Sort of.</span></div></div>
+    <ul class="random-items" aria-label="Six random items, not build order">${result.items.map((item) => `<li>
+      <img src="${esc(item.icon)}" alt="" width="40" height="40"><span>${esc(item.name)}${item.boots ? `<small>Boots</small>` : ""}</span>
+    </li>`).join("")}</ul>`;
+}
+
+function randomBuildCard() {
+  return `<section class="random-build" id="random-build" aria-labelledby="random-title" aria-describedby="random-note" aria-busy="false">
+    <div class="random-head"><div><span class="random-label">Just for fun</span><h2 id="random-title">Let the dice pick.</h2>
+      <p>Random champion. Six random items. Zero promises.</p></div>
+      <button type="button" class="btn random-roll" id="random-roll" aria-describedby="random-note">${DICE}<span>${randomBuildResult ? "Reroll" : "Roll champion + build"}</span></button></div>
+    <div class="random-result" id="random-result" role="region" aria-label="Your random champion and item shopping list" ${randomBuildResult ? "" : "hidden"}>${randomBuildResult ? randomBuildHtml(randomBuildResult) : ""}</div>
+    <p class="random-note" id="random-note">Just for fun — not a meta recommendation. A shopping list, not build order.</p>
+    <p class="random-status small" id="random-status" role="status" aria-live="polite" aria-atomic="true">${randomBuildResult ? "Your last roll. Feeling lucky again?" : "Roll for a little chaos."}</p>
+  </section>`;
+}
+
+async function rollRandomBuild() {
+  const card = $("#random-build");
+  if (!card || !ME) return;
+  const button = $("#random-roll", card);
+  if (button.disabled) return;
+  const token = nav;
+  const request = ++randomBuildRequest;
+  const current = () => token === nav && request === randomBuildRequest && ME && card === $("#random-build");
+  const status = $("#random-status", card);
+  const label = $("span", button);
+  button.disabled = true;
+  label.textContent = "Rolling…";
+  card.setAttribute("aria-busy", "true");
+  card.classList.add("is-rolling");
+  status.classList.remove("error");
+  status.textContent = "Rolling a champion and six items…";
+  const pause = reducedMotion() ? Promise.resolve() : new Promise((resolve) => setTimeout(resolve, 400));
+  try {
+    const result = await postJSON("/api/random-build", {}, current);
+    await pause;
+    if (!current()) return;
+    randomBuildResult = result;
+    const output = $("#random-result", card);
+    output.innerHTML = randomBuildHtml(result);
+    output.hidden = false;
+    output.classList.remove("is-revealing");
+    void output.offsetWidth;
+    output.classList.add("is-revealing");
+    status.textContent = `Rolled ${result.champion.name} and six random items. Want another?`;
+  } catch (error) {
+    await pause;
+    if (!current()) return;
+    status.classList.add("error");
+    status.textContent = `Couldn't roll just now. ${error.message}${randomBuildResult ? " Your last roll is still here." : " Try again in a moment."}`;
+  } finally {
+    if (current()) {
+      button.disabled = false;
+      label.textContent = randomBuildResult ? "Reroll" : "Roll champion + build";
+      card.setAttribute("aria-busy", "false");
+      card.classList.remove("is-rolling");
+    }
+  }
 }
 
 let patchRequest = 0;
@@ -1365,6 +1438,7 @@ const SESSION_GAP_MS = 30 * 60 * 1000;
 
 let matchesRequest = 0;
 const matchesContext = () => {
+  if (!META.queues.some((type) => type.key === view.player.queue)) view.player.queue = SOLO;
   const { puuid } = DATA;
   const { range, queue } = view.player;
   return { puuid, range, queue, key: `${puuid}|${range}|${queue}` };
@@ -1476,19 +1550,20 @@ function matchRow(g, queue) {
 
 function renderMatches() {
   const el = $("#tab-body");
-  const { queue } = view.player;
-  const types = [{ key: "all", label: "All" }, ...META.queues];
+  const context = matchesContext();
+  const { queue } = context;
+  const types = META.queues;
   const label = types.find((t) => t.key === queue)?.label || "";
   const chips = `<div class="chips mh-queues" role="group" aria-label="Match type">${types.map((t) => `<button class="chip ${t.key === queue ? "active" : ""}"
       data-q="${t.key}" aria-pressed="${t.key === queue}">${esc(t.label)}</button>`).join("")}</div>
     <p class="muted small mh-note">${queue === SOLO ? `Ranked solo games in the selected range — the games behind the stats.`
       : "Newest games first, fetched from Riot a page at a time. The range only applies to ranked solo."}</p>`;
-  const mh = view.player.mh?.key === matchesContext().key ? view.player.mh : null;
+  const mh = view.player.mh?.key === context.key ? view.player.mh : null;
   let body = mh?.error ? `<p class="error small">${esc(mh.error)}</p>` : "";
-  if (!mh || (!mh.loaded && mh.busy)) body += `<div class="loading"><div class="spinner"></div>Loading ${queue === "all" ? "" : `${esc(label)} `}matches…</div>`;
+  if (!mh || (!mh.loaded && mh.busy)) body += `<div class="loading"><div class="spinner"></div>Loading ${esc(label)} matches…</div>`;
   else if (!mh.rows.length) {
     body += `<div class="card empty"><h2>${mh.error ? "Couldn't load matches" : mh.next != null ? "No matches on this page"
-      : `No ${queue === "all" ? "" : `${esc(label)} `}games ${queue === SOLO ? "in this range " : ""}yet`}</h2></div>`;
+      : `No ${esc(label)} games ${queue === SOLO ? "in this range " : ""}yet`}</h2></div>`;
   } else {
     body += `<div class="mh">${sessionsOf(mh.rows).map((s) => {
       const wins = s.games.filter((g) => g.win).length;

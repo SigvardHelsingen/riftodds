@@ -244,6 +244,55 @@ h2 { font: 800 26px/1 var(--display); text-transform: uppercase; letter-spacing:
   .hero .search .btn { flex: 1; }
 }
 
+/* A small detour from the numbers: a dice roll, not a recommendation. */
+.random-build { margin-top: 24px; padding: 22px; background: var(--peach-wash); border: 2px solid var(--ink); border-radius: var(--radius); }
+.random-head { display: flex; justify-content: space-between; align-items: center; gap: 18px; flex-wrap: wrap; }
+.random-head > div { min-width: 0; }
+.random-label { display: block; font: 800 12px/1.2 var(--display); text-transform: uppercase; letter-spacing: .09em; }
+.random-head h2 { margin-top: 6px; font-size: 32px; }
+.random-head p { margin: 8px 0 0; font-size: 14px; }
+.random-roll { display: inline-flex; align-items: center; justify-content: center; gap: 10px; min-height: 48px; white-space: normal; text-align: center; }
+.random-dice { flex: none; width: 34px; height: 34px; overflow: visible; }
+.random-dice rect { fill: var(--peach); stroke: currentColor; stroke-width: 2; }
+.random-dice circle { fill: var(--ink); }
+.random-result { display: grid; grid-template-columns: minmax(0, 180px) minmax(0, 1fr); align-items: center; gap: 22px;
+                 border-top: 1px solid var(--ink); margin-top: 20px; padding-top: 20px; }
+.random-champion { min-width: 0; display: grid; gap: 10px; }
+.random-champion > img { border: 2px solid var(--ink); border-radius: var(--radius); object-fit: cover; }
+.random-champion h3 { font: 800 28px/1.1 var(--display); margin: 5px 0; overflow-wrap: anywhere; }
+.random-items { list-style: none; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0; padding: 0; }
+.random-items li { min-width: 0; display: flex; align-items: center; gap: 10px; padding: 10px; background: var(--card);
+                   border: 1px solid var(--rule); border-radius: var(--radius); }
+.random-items img { flex: none; width: 40px; height: 40px; border: 1px solid var(--ink); border-radius: 5px; }
+.random-items li > span { min-width: 0; font-size: 12px; font-weight: 500; line-height: 1.35; overflow-wrap: anywhere; }
+.random-items small { display: block; color: var(--muted); font-weight: 400; margin-top: 3px; }
+.random-note { font-size: 12px; margin: 18px 0 0; }
+.random-status { min-height: 1.5em; margin: 6px 0 0; overflow-wrap: anywhere; }
+.random-build.is-rolling .random-dice { animation: dice-wiggle .4s ease-in-out; }
+.random-result.is-revealing { animation: dice-reveal .24s ease-out; }
+@keyframes dice-wiggle { 25% { transform: rotate(-18deg) translateY(-3px); } 65% { transform: rotate(16deg) translateY(-2px); } }
+@keyframes dice-reveal { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+@media (min-width: 1100px) {
+  .random-items { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+  .random-items li { flex-direction: column; align-items: flex-start; }
+}
+@media (max-width: 820px) {
+  .random-result { grid-template-columns: minmax(0, 140px) minmax(0, 1fr); gap: 16px; }
+  .random-items li { flex-direction: column; align-items: flex-start; }
+}
+@media (max-width: 640px) {
+  .random-build { margin-top: 18px; padding: 16px 12px; }
+  .random-head { gap: 14px; }
+  .random-roll { width: 100%; }
+  .random-result { grid-template-columns: minmax(0, 1fr); }
+  .random-champion { grid-template-columns: 64px minmax(0, 1fr); gap: 12px; align-items: center; }
+  .random-champion > img { width: 64px; height: 64px; }
+  .random-champion h3 { font-size: 26px; }
+  .random-items { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+  .random-items li { flex-direction: row; gap: 8px; padding: 8px; }
+  .random-items img { width: 32px; height: 32px; }
+}
+
 .patch-note { margin: 24px 0 0; padding: 10px 14px; border-radius: var(--radius); background: var(--peach); font-size: 14px; }
 
 /* the board: headline numbers in ruled cells */
@@ -592,7 +641,7 @@ td.rank { font: 900 22px/1 var(--display); color: var(--plum); width: 36px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .spinner, .live-dot, .sampler .dotlive { animation: none; }
+  .spinner, .live-dot, .sampler .dotlive, .random-build.is-rolling .random-dice, .random-result.is-revealing { animation: none; }
   .trend-plot.animate *, .trend-game-inner.swap { animation: none !important; }
   .trend-body, .trend-game-inner, .tg-stat, .tg-head { transition: none !important; }
 }

@@ -147,6 +147,32 @@ class DataDragonTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(447100, items)
         self.assertEqual(items[3031]["name"], "Infinity Edge")
 
+    async def test_random_items_are_purchasable_and_not_hidden_or_restricted(self):
+        def entry(name, *, tags=None, total=3000, purchasable=True, **extra):
+            return {"name": name, "tags": tags or ["Damage"], "gold": {"total": total, "purchasable": purchasable},
+                    "maps": {"11": True}, **extra}
+        items = await self.ddragon({"data": {
+            "3006": entry("Greaves", tags=["Boots"], total=1100, into=["3172"]),
+            "3031": entry("Infinity Edge"),
+            "3172": entry("Quest boots", tags=["Boots"], purchasable=False),
+            "7001": entry("Ornn upgrade", purchasable=False),
+            "7002": entry("Hidden item", hideFromAll=True),
+            "7003": entry("Unavailable item", inStore=False),
+            "7004": entry("Champion exclusive", requiredChampion="Viktor"),
+            "7005": entry("Ally exclusive", requiredAlly="Ornn"),
+            "1038": entry("Component", into=["3031"]),
+            "2003": entry("Potion", tags=["Consumable"], total=50),
+            "3340": entry("Trinket", tags=["Trinket"], total=0),
+            "3867": entry("Bounty of Worlds", tags=["GoldPer"], total=400, into=["3877"]),
+            "3877": entry("Bloodsong", tags=["GoldPer"], total=400),
+            "447100": entry("Arena item", maps={"11": False, "30": True}),
+        }}, riot.load_items)
+        self.assertEqual({i for i, it in items.items() if it["random_eligible"]}, {3006, 3031})
+        # Keep historical-build classification unchanged even when an item cannot be rolled.
+        self.assertTrue(items[7001]["completed"])
+        self.assertTrue(items[3172]["boots"])
+        self.assertTrue(items[3877]["support"])
+
     async def test_runes_flatten_trees_and_keystones(self):
         runes = await self.ddragon([{"id": 8000, "name": "Precision", "icon": "perk-images/Styles/7201_Precision.png", "slots": [
             {"runes": [{"id": 8010, "name": "Conqueror", "icon": "perk-images/Styles/Precision/Conqueror/Conqueror.png"}]},

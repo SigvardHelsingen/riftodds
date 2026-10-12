@@ -18,12 +18,16 @@ const meta = {
     6672: "Kraken Slayer", 3033: "Mortal Reminder", 3006: "Berserker's Greaves", 3877: "Bloodsong" },
   runes: { 8000: { name: "Precision", icon: "https://images.test/precision.png" }, 8010: { name: "Conqueror", icon: "https://images.test/conqueror.png" },
     8400: { name: "Resolve", icon: "https://images.test/resolve.png" } },
-  queues: [["420", "Ranked Solo"], ["440", "Ranked Flex"], ["400", "Normal Draft"], ["480", "Swiftplay"], ["450", "ARAM"],
-    ["2400", "ARAM: Mayhem"], ["1700", "Arena"], ["1710", "Arena (1710)"]].map(([key, label]) => ({ key, label })),
+  queues: [["420", "Ranked Solo"], ["440", "Ranked Flex"], ["400", "Normal Draft"], ["480", "Swiftplay"]].map(([key, label]) => ({ key, label })),
   default_range: "20", ranges: [
     { key: "20", label: "Last 20 games", kind: "count" },
     { key: "season", label: "Whole season", kind: "time" },
   ],
+};
+const randomBuild = (index) => {
+  const champion_id = index % 2 + 1;
+  return { champion_id, champion: champions[champion_id], version: meta.ddragon,
+    items: [3006, 3031, 3072, 3036, 3046, 6672].map((id) => ({ id, name: meta.items[id], icon: `https://images.test/items/${id}.png`, boots: id === 3006 })) };
 };
 const me = { username: "a-very-long-member-username", account: {
   puuid: "player", platform: "euw1", game_name: "LongPlayerName", tag_line: "EUW12",
@@ -123,6 +127,7 @@ const historyRows = {
   ...Object.fromEntries([["440", "Ranked Flex"], ["400", "Normal Draft"], ["480", "Swiftplay"]].map(([key, queue], i) =>
     [key, [{ ...matchRow, match_id: `EUW1_14${i}`, queue }]])),
 };
+const [normalRow] = historyRows["400"], [swiftplayRow] = historyRows["480"], [flexRow] = historyRows["440"];
 const historyPage = (queue, rows, next = null, error = null) => ({ queue, rows, total: null, next, error });
 const matchPage = (q) => {
   const queue = q.get("queue"), rows = historyRows[queue] || [];
@@ -173,11 +178,11 @@ const live = {
 };
 
 async function fixturePage(browser, width, options = {}) {
-  const context = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: "reduce" });
+  const context = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: options.reducedMotion || "reduce" });
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (err) => { errors.push(err.message); if (process.env.DEBUG) console.error(err); });
-  const state = { authenticated: options.authenticated !== false, liveRequests: 0, pickAlphas: [], matchQueues: [], matchRequests: [] };
+  const state = { authenticated: options.authenticated !== false, liveRequests: 0, pickAlphas: [], matchQueues: [], matchRequests: [], randomRequests: [] };
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     if (url.host !== "rift.test" || url.pathname === "/favicon.ico" || /^\/static\/(favicon|apple-touch-icon)/.test(url.pathname)) {
@@ -199,10 +204,18 @@ async function fixturePage(browser, width, options = {}) {
       body = adminData;
     }
     else if (url.pathname === "/api/meta") body = meta;
+    else if (url.pathname === "/api/random-build") {
+      const request = { index: state.randomRequests.length, method: route.request().method(), body: route.request().postDataJSON() };
+      state.randomRequests.push(request);
+      if (options.randomDelay) await new Promise((resolve) => setTimeout(resolve, options.randomDelay));
+      const response = await options.randomResponder?.(request, state);
+      status = response?.status ?? (options.randomError ? 503 : 200);
+      body = response?.body ?? (options.randomError ? { detail: "Champion and item metadata is temporarily unavailable." } : randomBuild(request.index));
+    }
     else if (url.pathname === "/api/patch") {
       if (options.patchDelay) await new Promise((resolve) => setTimeout(resolve, options.patchDelay));
       status = options.patchError ? 502 : 200;
-      body = options.patchError ? { detail: "Upstream unavailable" } : patch;
+      body = options.patchError ? { detail: "Upstream unavailable" } : options.patch || patch;
     }
     else if (url.pathname === "/api/player" || url.pathname.endsWith("/analysis")) body = options.data || data;
     else if (url.pathname.startsWith("/api/builds/")) body = { ...build, champion_id: +url.pathname.split("/").pop() };
@@ -249,12 +262,52 @@ async function noPageOverflow(page, label) {
   assert(size.content <= size.viewport + 1, `${label}: content ${size.content}px exceeds viewport ${size.viewport}px`);
 }
 
+async function assertRandomResult(page, index) {
+  const result = randomBuild(index);
+  assert.equal(await page.locator(".random-champion h3").textContent(), result.champion.name);
+  assert.equal(await page.locator(".random-champion > img").getAttribute("src"), result.champion.icon);
+  assert.equal(await page.locator(".random-champion > img").getAttribute("alt"), `${result.champion.name} portrait`);
+  assert.equal(await page.locator(".random-items > li").count(), 6, "Exactly six items, not an accumulating roll history");
+  assert.deepEqual(await page.locator(".random-items > li > span").evaluateAll((names) => names.map((name) => name.firstChild.textContent)), result.items.map((item) => item.name));
+  assert.deepEqual(await page.locator(".random-items img").evaluateAll((images) => images.map((image) => image.getAttribute("src"))), result.items.map((item) => item.icon));
+  assert.equal(await page.locator(".random-items small").textContent(), "Boots");
+  assert.equal(await page.locator("#random-roll > span").textContent(), "Reroll");
+  assert.equal(await page.locator("#random-build").getAttribute("aria-busy"), "false");
+  assert.equal(await page.locator("#random-status").getAttribute("role"), "status");
+  assert.equal(await page.locator("#random-status").getAttribute("aria-live"), "polite");
+  assert.match(await page.locator("#random-note").textContent(), /Just for fun.*not a meta recommendation.*shopping list, not build order/);
+}
+
+async function assertHistoryQueues(page) {
+  assert.deepEqual(await page.locator(".mh-queues .chip").evaluateAll((chips) => chips.map((chip) => ({ key: chip.dataset.q, label: chip.textContent }))), meta.queues);
+  assert.equal(await page.locator('.mh-queues .chip[data-q="all"], .mh-queues .chip[data-q="450"], .mh-queues .chip[data-q="2400"], .mh-queues .chip[data-q="1700"], .mh-queues .chip[data-q="1710"]').count(), 0, "Unsupported modes and All are removed");
+}
+
 async function checkWidth(browser, width) {
   const { context, page, errors, state } = await fixturePage(browser, width);
   try {
     await page.goto("http://rift.test/#/");
     await page.waitForSelector(".board");
     await noPageOverflow(page, `landing ${width}`);
+    assert(await page.locator("#random-build").evaluate((card) => card.previousElementSibling.matches(".hero") && card.nextElementSibling.id === "patch-body"), "The dice card is after the hero and outside patch updates");
+    assert.equal(await page.locator("#random-roll > span").textContent(), "Roll champion + build");
+    await page.locator("#random-roll").click();
+    await page.waitForSelector("#random-result:not([hidden])");
+    await assertRandomResult(page, 0);
+    await noPageOverflow(page, `random build ${width}`);
+    await page.locator("#random-roll").click();
+    await page.waitForFunction(() => document.querySelector(".random-champion h3")?.textContent === "Nunu & Willump" && !document.querySelector("#random-roll").disabled);
+    await assertRandomResult(page, 1);
+    assert.deepEqual(state.randomRequests, [{ index: 0, method: "POST", body: {} }, { index: 1, method: "POST", body: {} }]);
+    await noPageOverflow(page, `random reroll ${width}`);
+    await page.evaluate(() => { window.diceCard = document.querySelector("#random-build"); return loadPatch(); });
+    assert(await page.locator("#random-build").evaluate((card) => card === window.diceCard), "Patch polling does not replace the dice card");
+    await assertRandomResult(page, 1);
+    assert.equal(state.randomRequests.length, 2);
+    if (width <= 640) assert((await page.locator("#random-roll").boundingBox()).height >= 44, "The dice button has a usable tap target");
+    if (process.env.SCREENSHOTS && [375, 1280].includes(width)) {
+      await page.locator("#random-build").screenshot({ path: path.join(process.env.SCREENSHOTS, `random-build-${width}.png`) });
+    }
     // a champion in the patch table opens its build underneath
     await page.locator(".champ-btn").first().click();
     await page.waitForSelector(".build-row .build-line");
@@ -374,12 +427,16 @@ async function checkWidth(browser, width) {
         await page.locator("#mh-more").click();
         await page.waitForSelector('.mh-row[data-mid="EUW1_122"]');
         assert.equal(await page.locator(".mh-session").count(), 2, "Games days apart are separate sessions");
-        await page.locator('.mh-queues .chip[data-q="all"]').click();
-        await page.waitForSelector('.mh-row[data-mid="EUW1_124"]');
-        assert.equal(state.matchQueues.at(-1), "all");
-        assert.match(await page.locator('.mh-row[data-mid="EUW1_124"] .mh-champ small').textContent(), /ARAM/);
-        assert.equal(await page.locator('.mh-queues .chip[data-q="all"]').getAttribute("aria-pressed"), "true");
-        await noPageOverflow(page, `all matches ${width}`);
+        await assertHistoryQueues(page);
+        for (const queue of ["400", "480", "440"]) {
+          await page.locator(`.mh-queues .chip[data-q="${queue}"]`).click();
+          await page.waitForSelector("#mh-refresh:not([disabled])");
+          assert.equal(state.matchQueues.at(-1), queue);
+          assert.deepEqual(await historyIds(page), historyRows[queue].map((row) => row.match_id));
+          assert.match(await page.locator(".mh-champ small").textContent(), new RegExp(meta.queues.find((type) => type.key === queue).label));
+          assert.equal(await page.locator(`.mh-queues .chip[data-q="${queue}"]`).getAttribute("aria-pressed"), "true");
+          await noPageOverflow(page, `${queue} matches ${width}`);
+        }
         if (process.env.SCREENSHOTS && [375, 1280].includes(width)) {
           await page.screenshot({ path: path.join(process.env.SCREENSHOTS, `matches-${width}.png`) });
         }
@@ -402,6 +459,8 @@ async function checkWidth(browser, width) {
     }
     await page.locator(".wordmark").click();
     await page.waitForSelector(".board");
+    await assertRandomResult(page, 1);
+    assert.equal(state.randomRequests.length, 2, "Returning to the landing remembers only the last roll and does not auto-roll");
     const requests = state.liveRequests;
     await page.waitForTimeout(5200);
     assert.equal(state.liveRequests, requests, "Live polling should stop after leaving the live view");
@@ -477,10 +536,8 @@ async function checkUnrankedHistory(browser) {
         profile: width === 320 ? { ...data.profile, tier: "UNRANKED", division: "", lp: 0, season_wins: 0, season_losses: 0 } : data.profile,
         ranks: width === 320 ? [] : data.ranks,
         sync: width === 1280 ? { running: true, phase: "matches", total: 0, done: 0, error: null } : data.sync },
-      matchResponder: (request) => request.queue === "420" ? { body: historyPage("420", []) } : undefined,
-      // Placement teams must not acquire side labels even when their IDs overlap Rift's IDs.
-      detailResponder: (mid) => mid === arenaRow.match_id ? { ...arenaDetail,
-        teams: arenaDetail.teams.map((team, i) => ({ ...team, team_id: i < 2 ? [100, 200][i] : team.team_id })) } : undefined,
+      matchResponder: (request) => request.queue === "420" ? { body: historyPage("420", []) }
+        : request.queue === "440" ? { body: historyPage("440", []) } : undefined,
     });
     const { page, state } = fixture;
     try {
@@ -492,25 +549,22 @@ async function checkUnrankedHistory(browser) {
       await page.locator('.trend-stats .chip[data-stat="rank"]').click();
       assert.equal(await page.locator(".trend-stats .chip.active").getAttribute("data-stat"), "rank");
       assert.equal(await page.locator(".mh-row").count(), 0, "Ranked history really is empty in this fixture");
-      for (const [queue, rows, teams] of [["450", [aramRow], 2], ["1700", [arenaRow], 8], ["1710", [], 0], ["2400", [mayhemRow], 2], ["all", historyRows.all, 0]]) {
+      await assertHistoryQueues(page);
+      await page.evaluate(() => { view.player.queue = "all"; return tabMatches(); });
+      assert.equal(state.matchQueues.at(-1), "420", "An obsolete selected queue resets to ranked solo before fetching");
+      assert.equal(await page.locator('.mh-queues .chip[data-q="420"]').getAttribute("aria-pressed"), "true");
+      for (const [queue, rows, teams] of [["400", [normalRow], 2], ["480", [swiftplayRow], 2], ["440", [], 0]]) {
         await page.locator(`.mh-queues .chip[data-q="${queue}"]`).click();
         await page.waitForSelector("#mh-refresh:not([disabled])");
         assert.equal(state.matchQueues.at(-1), queue);
-        assert.equal(await page.locator(`.mh-queues .chip[data-q="${queue}"]`).textContent(), meta.queues.find((type) => type.key === queue)?.label || "All");
+        assert.equal(await page.locator(`.mh-queues .chip[data-q="${queue}"]`).textContent(), meta.queues.find((type) => type.key === queue).label);
         assert.deepEqual(await historyIds(page), rows.map((row) => row.match_id), "Only the selected mode's matches are shown");
         for (const row of rows) assert((await page.locator(`.mh-row[data-mid="${row.match_id}"] .mh-champ small`).textContent()).includes(row.queue));
         if (teams) {
           await page.locator(".mh-row").first().click();
           await page.waitForSelector(".mh-detail table");
           assert.equal(await page.locator(".mh-team").count(), teams);
-          assert.equal(await page.locator(".mh-team tbody tr").count(), teams === 8 ? 16 : 10);
-          if (queue === "1700") {
-            assert.equal(await page.locator(".mh-res").textContent(), "3rd");
-            assert.match(await page.locator(".mh-champ small").textContent(), /Arena · 3rd place/);
-            assert.equal(await page.locator(".mh-team.blue, .mh-team.red").count(), 0);
-            assert.doesNotMatch((await page.locator(".mh-team-head").allTextContents()).join(" "), /Blue side|Red side/);
-            assert.deepEqual(await page.locator(".mh-team-head b").allTextContents(), Array.from({ length: 8 }, (_, i) => `${i + 1}${["st", "nd", "rd"][i] || "th"} place`));
-          }
+          assert.equal(await page.locator(".mh-team tbody tr").count(), 10);
         }
         await noPageOverflow(page, `no-ranked ${queue} ${width}`);
       }
@@ -521,108 +575,108 @@ async function checkUnrankedHistory(browser) {
       assert.deepEqual(fixture.errors, []);
     } finally { await fixture.context.close(); }
   }
-  console.log("PASS: no-ranked Arena, Mayhem, ARAM, All and live navigation at 320px and 1280px");
+  console.log("PASS: no-ranked Normal, Swiftplay, empty Flex, removed queues and live navigation at 320px and 1280px");
 }
 
 async function checkHistoryPaginationRace(browser) {
-  const more = deferred(), mayhem = deferred();
-  const lateAram = { ...aramRow, match_id: "EUW1_224", game_start: aramRow.game_start - 60000 };
+  const more = deferred(), swiftplay = deferred();
+  const lateNormal = { ...normalRow, match_id: "EUW1_224", game_start: normalRow.game_start - 60000 };
   const fixture = await fixturePage(browser, 375, { matchResponder: async ({ queue, offset }) => {
-    if (queue === "450") {
-      if (offset === 0) return { body: historyPage(queue, [aramRow], 20) };
+    if (queue === "400") {
+      if (offset === 0) return { body: historyPage(queue, [normalRow], 20) };
       await more.promise;
-      return { body: historyPage(queue, [lateAram], 40) };
+      return { body: historyPage(queue, [lateNormal], 40) };
     }
-    if (queue === "2400") { await mayhem.promise; return { body: historyPage(queue, [mayhemRow]) }; }
+    if (queue === "480") { await swiftplay.promise; return { body: historyPage(queue, [swiftplayRow]) }; }
   } });
   const { page, state } = fixture;
   try {
     await openHistory(page);
     await watchHistory(page);
-    await page.locator('.mh-queues .chip[data-q="450"]').click();
+    await page.locator('.mh-queues .chip[data-q="400"]').click();
     await page.waitForSelector("#mh-more:not([disabled])");
-    const pendingMore = historyRequest(page, "450", 20);
+    const pendingMore = historyRequest(page, "400", 20);
     await page.locator("#mh-more").click();
     await pendingMore;
     await page.evaluate(() => renderPlayer());
     assert(await page.locator("#mh-more").isDisabled(), "Pagination stays busy across analysis re-renders");
     assert(await page.locator("#mh-refresh").isDisabled());
     await page.evaluate(() => moreMatches());
-    assert.equal(state.matchRequests.filter((request) => request.queue === "450" && request.offset === 20).length, 1);
+    assert.equal(state.matchRequests.filter((request) => request.queue === "400" && request.offset === 20).length, 1);
     const finished = await page.evaluate(() => window.historyFinished.more);
-    const pendingMayhem = historyRequest(page, "2400", 0);
-    await page.locator('.mh-queues .chip[data-q="2400"]').click();
-    await pendingMayhem;
+    const pendingSwiftplay = historyRequest(page, "480", 0);
+    await page.locator('.mh-queues .chip[data-q="480"]').click();
+    await pendingSwiftplay;
     more.resolve();
     await page.waitForFunction((before) => window.historyFinished.more > before, finished);
     assert.deepEqual(await historyIds(page), [], "Old pagination must not replace the new mode's loading panel");
     assert.equal(await page.locator("#mh-more").count(), 0, "The old mode's cursor must not become clickable");
-    assert.equal(await page.locator('.mh-queues .chip[data-q="2400"]').getAttribute("aria-pressed"), "true");
-    mayhem.resolve();
+    assert.equal(await page.locator('.mh-queues .chip[data-q="480"]').getAttribute("aria-pressed"), "true");
+    swiftplay.resolve();
     await page.waitForSelector("#mh-refresh:not([disabled])");
-    assert.deepEqual(await historyIds(page), [mayhemRow.match_id]);
-    await page.locator('.mh-queues .chip[data-q="450"]').click();
+    assert.deepEqual(await historyIds(page), [swiftplayRow.match_id]);
+    await page.locator('.mh-queues .chip[data-q="400"]').click();
     await page.waitForSelector("#mh-refresh:not([disabled])");
-    assert.deepEqual(await historyIds(page), [aramRow.match_id]);
-    assert.deepEqual(state.matchRequests.filter((request) => request.queue === "450").map((request) => request.offset), [0, 20, 0]);
+    assert.deepEqual(await historyIds(page), [normalRow.match_id]);
+    assert.deepEqual(state.matchRequests.filter((request) => request.queue === "400").map((request) => request.offset), [0, 20, 0]);
     assert.deepEqual(fixture.errors, []);
-  } finally { more.resolve(); mayhem.resolve(); await fixture.context.close(); }
+  } finally { more.resolve(); swiftplay.resolve(); await fixture.context.close(); }
   console.log("PASS: busy pagination and mode-switch response/cursor isolation");
 }
 
 async function checkHistoryInitialRace(browser) {
-  const arena = deferred(), mayhem = deferred();
-  const newerArena = { ...arenaRow, match_id: "EUW1_225" };
-  let arenaCalls = 0;
+  const flex = deferred(), swiftplay = deferred();
+  const newerFlex = { ...flexRow, match_id: "EUW1_225" };
+  let flexCalls = 0;
   const fixture = await fixturePage(browser, 375, { matchResponder: async ({ queue }) => {
-    if (queue === "1700") {
-      if (++arenaCalls === 1) {
-        await arena.promise;
-        return { body: historyPage(queue, [arenaRow], 5) };
+    if (queue === "440") {
+      if (++flexCalls === 1) {
+        await flex.promise;
+        return { body: historyPage(queue, [flexRow], 5) };
       }
-      return { body: historyPage(queue, [newerArena]) };
+      return { body: historyPage(queue, [newerFlex]) };
     }
-    if (queue === "2400") { await mayhem.promise; return { body: historyPage(queue, [mayhemRow]) }; }
+    if (queue === "480") { await swiftplay.promise; return { body: historyPage(queue, [swiftplayRow]) }; }
   } });
   const { page, state } = fixture;
   try {
     await openHistory(page);
     await watchHistory(page);
-    const firstArena = historyRequest(page, "1700", 0);
-    await page.locator('.mh-queues .chip[data-q="1700"]').click();
-    await firstArena;
-    const firstMayhem = historyRequest(page, "2400", 0);
-    await page.locator('.mh-queues .chip[data-q="2400"]').click();
-    await firstMayhem;
-    await page.locator('.mh-queues .chip[data-q="1700"]').click();
-    await page.waitForSelector(`.mh-row[data-mid="${newerArena.match_id}"]`);
+    const firstFlex = historyRequest(page, "440", 0);
+    await page.locator('.mh-queues .chip[data-q="440"]').click();
+    await firstFlex;
+    const firstSwiftplay = historyRequest(page, "480", 0);
+    await page.locator('.mh-queues .chip[data-q="480"]').click();
+    await firstSwiftplay;
+    await page.locator('.mh-queues .chip[data-q="440"]').click();
+    await page.waitForSelector(`.mh-row[data-mid="${newerFlex.match_id}"]`);
     await page.waitForFunction(() => window.historyFinished.load === 1);
-    arena.resolve();
+    flex.resolve();
     await page.waitForFunction(() => window.historyFinished.load === 2);
-    assert.deepEqual(await historyIds(page), [newerArena.match_id], "The first A request cannot overwrite the second A request");
+    assert.deepEqual(await historyIds(page), [newerFlex.match_id], "The first A request cannot overwrite the second A request");
     assert.equal(await page.locator("#mh-more").count(), 0);
-    assert.equal(state.matchRequests.filter((request) => request.queue === "1700").length, 2, "Obsolete multi-page fetches stop instead of continuing");
-    mayhem.resolve();
+    assert.equal(state.matchRequests.filter((request) => request.queue === "440").length, 2, "Obsolete multi-page fetches stop instead of continuing");
+    swiftplay.resolve();
     await page.waitForFunction(() => window.historyFinished.load === 3);
-    assert.deepEqual(await historyIds(page), [newerArena.match_id], "Late B also cannot overwrite the active A");
+    assert.deepEqual(await historyIds(page), [newerFlex.match_id], "Late B also cannot overwrite the active A");
     assert.deepEqual(fixture.errors, []);
-  } finally { arena.resolve(); mayhem.resolve(); await fixture.context.close(); }
+  } finally { flex.resolve(); swiftplay.resolve(); await fixture.context.close(); }
   console.log("PASS: A-B-A latest-request ordering and obsolete fetch cancellation");
 }
 
 async function checkHistoryRetries(browser) {
-  let arenaLoads = 0;
-  const refreshedArena = { ...arenaRow, match_id: "EUW1_226" };
+  let flexLoads = 0;
+  const refreshedFlex = { ...flexRow, match_id: "EUW1_226" };
   const empty = await fixturePage(browser, 320, { matchResponder: ({ queue, offset }) => {
-    if (queue !== "1700") return;
-    if (offset === 20) return { body: historyPage(queue, [arenaRow]) };
-    arenaLoads++;
-    return { body: arenaLoads === 1 ? historyPage(queue, [], 20, "Some Arena matches are temporarily unavailable.")
-      : arenaLoads === 2 ? historyPage(queue, [], 20) : historyPage(queue, [refreshedArena]) };
+    if (queue !== "440") return;
+    if (offset === 20) return { body: historyPage(queue, [flexRow]) };
+    flexLoads++;
+    return { body: flexLoads === 1 ? historyPage(queue, [], 20, "Some Ranked Flex matches are temporarily unavailable.")
+      : flexLoads === 2 ? historyPage(queue, [], 20) : historyPage(queue, [refreshedFlex]) };
   } });
   try {
     await openHistory(empty.page);
-    await empty.page.locator('.mh-queues .chip[data-q="1700"]').click();
+    await empty.page.locator('.mh-queues .chip[data-q="440"]').click();
     await empty.page.waitForSelector("#mh-retry:not([disabled])");
     assert.match(await empty.page.locator("#tab-body .error").textContent(), /temporarily unavailable/);
     assert.equal(await empty.page.locator(".mh-row").count(), 0);
@@ -630,81 +684,250 @@ async function checkHistoryRetries(browser) {
     await noPageOverflow(empty.page, "empty-page error controls 320");
     await empty.page.locator("#mh-retry").click();
     await empty.page.waitForSelector("#mh-refresh:not([disabled])");
-    assert.equal(arenaLoads, 2, "Retry bypasses the non-solo cache");
+    assert.equal(flexLoads, 2, "Retry bypasses the non-solo cache");
     assert.equal(await empty.page.locator("#tab-body .error").count(), 0);
     assert.equal(await empty.page.locator(".mh-row").count(), 0);
     assert(await empty.page.locator("#mh-more").isVisible(), "Empty successful pages also retain continuation");
     await empty.page.locator("#mh-more").click();
-    await empty.page.waitForSelector(`.mh-row[data-mid="${arenaRow.match_id}"]`);
+    await empty.page.waitForSelector(`.mh-row[data-mid="${flexRow.match_id}"]`);
     await empty.page.locator("#mh-refresh").click();
-    await empty.page.waitForSelector(`.mh-row[data-mid="${refreshedArena.match_id}"]`);
-    assert.equal(arenaLoads, 3, "Explicit history refresh bypasses a successful non-solo cache too");
-    assert.deepEqual(await historyIds(empty.page), [refreshedArena.match_id]);
+    await empty.page.waitForSelector(`.mh-row[data-mid="${refreshedFlex.match_id}"]`);
+    assert.equal(flexLoads, 3, "Explicit history refresh bypasses a successful non-solo cache too");
+    assert.deepEqual(await historyIds(empty.page), [refreshedFlex.match_id]);
     await noPageOverflow(empty.page, "empty-page retry 320");
     assert.deepEqual(empty.errors, []);
   } finally { await empty.context.close(); }
 
-  const partialAram = { ...aramRow, match_id: "EUW1_227", game_start: aramRow.game_start - 60000 };
-  const finalAram = { ...aramRow, match_id: "EUW1_228", game_start: aramRow.game_start - 120000 };
-  const freshAram = { ...aramRow, match_id: "EUW1_229", game_start: aramRow.game_start + 60000 };
-  let aramLoads = 0, secondPageCalls = 0;
+  const partialNormal = { ...normalRow, match_id: "EUW1_227", game_start: normalRow.game_start - 60000 };
+  const finalNormal = { ...normalRow, match_id: "EUW1_228", game_start: normalRow.game_start - 120000 };
+  const freshNormal = { ...normalRow, match_id: "EUW1_229", game_start: normalRow.game_start + 60000 };
+  let normalLoads = 0, secondPageCalls = 0;
   const partial = await fixturePage(browser, 320, { matchResponder: ({ queue, offset }) => {
-    if (queue !== "450") return;
-    if (offset === 20) return { body: ++secondPageCalls === 1 ? historyPage(queue, [partialAram], 40, "failed")
-      : historyPage(queue, [partialAram, finalAram]) };
+    if (queue !== "400") return;
+    if (offset === 20) return { body: ++secondPageCalls === 1 ? historyPage(queue, [partialNormal], 40, "failed")
+      : historyPage(queue, [partialNormal, finalNormal]) };
     if (offset === 5) return { status: 502, body: { detail: "History page unavailable" } };
-    aramLoads++;
-    return { body: aramLoads === 1 ? historyPage(queue, [aramRow], 20)
-      : aramLoads === 2 ? historyPage(queue, [freshAram], 5) : historyPage(queue, [freshAram, aramRow, partialAram, finalAram]) };
+    normalLoads++;
+    return { body: normalLoads === 1 ? historyPage(queue, [normalRow], 20)
+      : normalLoads === 2 ? historyPage(queue, [freshNormal], 5) : historyPage(queue, [freshNormal, normalRow, partialNormal, finalNormal]) };
   } });
   try {
     await openHistory(partial.page);
-    await partial.page.locator('.mh-queues .chip[data-q="450"]').click();
+    await partial.page.locator('.mh-queues .chip[data-q="400"]').click();
     await partial.page.waitForSelector("#mh-more:not([disabled])");
     await partial.page.locator("#mh-more").click();
     await partial.page.waitForSelector("#mh-retry:not([disabled])");
-    assert.deepEqual(await historyIds(partial.page), [aramRow.match_id, partialAram.match_id], "Good rows in a partially failed page are retained");
+    assert.deepEqual(await historyIds(partial.page), [normalRow.match_id, partialNormal.match_id], "Good rows in a partially failed page are retained");
     assert.equal(await partial.page.locator("#tab-body .error").textContent(), "failed");
     assert.equal(await partial.page.evaluate(() => view.player.mh.next), 20, "An error's forward cursor must not skip the failed page");
     await partial.page.locator("#mh-retry").click();
-    await partial.page.waitForSelector(`.mh-row[data-mid="${finalAram.match_id}"]`);
-    assert.deepEqual(await historyIds(partial.page), [aramRow.match_id, partialAram.match_id, finalAram.match_id], "Retry preserves prior rows and deduplicates the repeated partial row");
-    assert.deepEqual(partial.state.matchRequests.filter((request) => request.queue === "450").map((request) => request.offset), [0, 20, 20], "Retry must reissue the failed second page, not offset 40");
+    await partial.page.waitForSelector(`.mh-row[data-mid="${finalNormal.match_id}"]`);
+    assert.deepEqual(await historyIds(partial.page), [normalRow.match_id, partialNormal.match_id, finalNormal.match_id], "Retry preserves prior rows and deduplicates the repeated partial row");
+    assert.deepEqual(partial.state.matchRequests.filter((request) => request.queue === "400").map((request) => request.offset), [0, 20, 20], "Retry must reissue the failed second page, not offset 40");
     assert.equal(await partial.page.locator("#tab-body .error").count(), 0);
     await partial.page.locator("#mh-refresh").click();
     await partial.page.waitForSelector("#mh-retry:not([disabled])");
     assert.equal(await partial.page.locator("#tab-body .error").textContent(), "History page unavailable");
-    assert.deepEqual(await historyIds(partial.page), [freshAram.match_id, aramRow.match_id, partialAram.match_id, finalAram.match_id],
+    assert.deepEqual(await historyIds(partial.page), [freshNormal.match_id, normalRow.match_id, partialNormal.match_id, finalNormal.match_id],
       "A later HTTP failure preserves both the successful refresh page and previously loaded rows");
     await partial.page.locator("#mh-retry").click();
     await partial.page.waitForSelector("#mh-refresh:not([disabled])");
     assert.equal(await partial.page.locator("#tab-body .error").count(), 0);
-    assert.deepEqual(await historyIds(partial.page), [freshAram.match_id, aramRow.match_id, partialAram.match_id, finalAram.match_id]);
-    assert.deepEqual(partial.state.matchRequests.filter((request) => request.queue === "450").map((request) => request.offset), [0, 20, 20, 0, 5, 0]);
+    assert.deepEqual(await historyIds(partial.page), [freshNormal.match_id, normalRow.match_id, partialNormal.match_id, finalNormal.match_id]);
+    assert.deepEqual(partial.state.matchRequests.filter((request) => request.queue === "400").map((request) => request.offset), [0, 20, 20, 0, 5, 0]);
     assert.deepEqual(partial.errors, []);
   } finally { await partial.context.close(); }
 
   for (const [label, next] of [["unchanged", 0], ["backwards", -1], ["invalid", "bad"], ["HTTP failure", null]]) {
     let calls = 0;
     const stuck = await fixturePage(browser, 320, { matchResponder: ({ queue }) => {
-      if (queue !== "2400") return;
-      if (++calls > 1) return { body: historyPage(queue, [mayhemRow]) };
+      if (queue !== "480") return;
+      if (++calls > 1) return { body: historyPage(queue, [swiftplayRow]) };
       return next == null ? { status: 502, body: { detail: "History unavailable" } } : { body: historyPage(queue, [], next) };
     } });
     try {
       await openHistory(stuck.page);
-      await stuck.page.locator('.mh-queues .chip[data-q="2400"]').click();
+      await stuck.page.locator('.mh-queues .chip[data-q="480"]').click();
       await stuck.page.waitForSelector("#mh-retry:not([disabled])");
       assert.match(await stuck.page.locator("#tab-body .error").textContent(), next == null ? /History unavailable/ : /cursor did not advance/);
       assert.equal(calls, 1, `${label}: bad cursors and HTTP errors must not spin in a request loop`);
       await stuck.page.locator("#mh-retry").click();
-      await stuck.page.waitForSelector(`.mh-row[data-mid="${mayhemRow.match_id}"]`);
+      await stuck.page.waitForSelector(`.mh-row[data-mid="${swiftplayRow.match_id}"]`);
       assert.equal(calls, 2);
       assert.equal(await stuck.page.locator("#tab-body .error").count(), 0);
       assert.deepEqual(stuck.errors, []);
     } finally { await stuck.context.close(); }
   }
   console.log("PASS: empty continuation, explicit refresh/retry, partial-row preservation and cursor guards");
+}
+
+async function watchRandomBuild(page) {
+  await page.evaluate(() => {
+    window.randomFinished = 0;
+    const roll = rollRandomBuild;
+    document.querySelector("#random-roll").removeEventListener("click", roll);
+    rollRandomBuild = async (...args) => { try { return await roll(...args); } finally { window.randomFinished++; } };
+    document.querySelector("#random-roll").addEventListener("click", rollRandomBuild);
+  });
+}
+
+const randomRequest = (page) => page.waitForRequest((request) => new URL(request.url()).pathname === "/api/random-build");
+
+async function checkRandomBuildStates(browser) {
+  const gate = deferred();
+  const options = { randomDelay: 60, randomError: true, randomResponder: async ({ index }) => { if (index === 0) await gate.promise; } };
+  const fixture = await fixturePage(browser, 320, options);
+  const { page, state } = fixture;
+  try {
+    await page.goto("http://rift.test/#/");
+    await page.waitForSelector("#random-roll");
+    await watchRandomBuild(page);
+    const pending = randomRequest(page);
+    await page.evaluate(() => { const button = document.querySelector("#random-roll"); button.click(); button.click(); button.click(); });
+    await pending;
+    assert(await page.locator("#random-roll").isDisabled());
+    assert.equal(await page.locator("#random-roll > span").textContent(), "Rolling…");
+    assert.equal(await page.locator("#random-build").getAttribute("aria-busy"), "true");
+    assert.equal(await page.locator(".random-dice").evaluate((dice) => getComputedStyle(dice).animationName), "none", "Reduced motion disables the dice wiggle");
+    assert.deepEqual(state.randomRequests, [{ index: 0, method: "POST", body: {} }], "Rapid clicks make only one authenticated JSON POST");
+    await page.evaluate(() => loadPatch());
+    assert(await page.locator("#random-roll").isDisabled(), "Patch polling cannot clear an in-flight roll");
+    gate.resolve();
+    await page.waitForFunction(() => window.randomFinished === 1);
+    assert.match(await page.locator("#random-status.error").textContent(), /metadata is temporarily unavailable/);
+    assert.equal(await page.locator("#random-roll").isDisabled(), false, "A 503 re-enables the first-roll button");
+    assert.equal(await page.locator("#random-roll > span").textContent(), "Roll champion + build");
+    assert.equal(await page.locator("#random-result").isVisible(), false);
+    await noPageOverflow(page, "first-roll error 320");
+    options.randomError = false;
+    await page.locator("#random-roll").click();
+    await page.waitForFunction(() => window.randomFinished === 2);
+    await assertRandomResult(page, 1);
+    options.randomError = true;
+    await page.locator("#random-roll").click();
+    await page.waitForFunction(() => window.randomFinished === 3);
+    assert.match(await page.locator("#random-status.error").textContent(), /Your last roll is still here/);
+    await assertRandomResult(page, 1);
+    assert.equal(await page.locator("#random-roll").isDisabled(), false, "A failed reroll is retryable");
+    options.randomError = false;
+    await page.locator("#random-roll").click();
+    await page.waitForFunction(() => window.randomFinished === 4);
+    await assertRandomResult(page, 3);
+    assert.equal(await page.locator("#random-status.error").count(), 0, "A successful retry clears the old error");
+    assert.equal(await page.locator("#random-result").evaluate((result) => getComputedStyle(result).animationName), "none", "Reduced motion also disables the reveal");
+    await page.locator("#logout").click();
+    await page.waitForSelector("#login-form");
+    await page.locator('[name="username"]').fill("member");
+    await page.locator('[name="password"]').fill("password123");
+    await page.locator("#login-form button").click();
+    await page.waitForSelector("#random-roll");
+    assert.equal(await page.locator("#random-result").isVisible(), false, "Logout clears the last successful roll");
+    assert.deepEqual(fixture.errors, []);
+  } finally { gate.resolve(); await fixture.context.close(); }
+
+  const animated = await fixturePage(browser, 375, { reducedMotion: "no-preference" });
+  try {
+    await animated.page.goto("http://rift.test/#/");
+    await animated.page.waitForSelector("#random-roll");
+    const timing = await animated.page.evaluate(async () => {
+      const started = performance.now();
+      const pending = rollRandomBuild();
+      const animation = getComputedStyle(document.querySelector(".random-dice")).animationName;
+      await pending;
+      return { elapsed: performance.now() - started, animation };
+    });
+    assert(timing.elapsed >= 390, "The normal-motion roll has a short 400ms minimum reveal delay");
+    assert.equal(timing.animation, "dice-wiggle");
+    await assertRandomResult(animated.page, 0);
+    assert.deepEqual(animated.errors, []);
+  } finally { await animated.context.close(); }
+
+  for (const width of [320, 1280]) {
+    for (const label of ["error", "empty", "loading"]) {
+      const options = label === "error" ? { patchError: true } : label === "empty" ? { patch: { ...patch, matches: 0 } } : { patchDelay: 200 };
+      const independent = await fixturePage(browser, width, options);
+      try {
+        await independent.page.goto("http://rift.test/#/");
+        await independent.page.waitForSelector("#random-roll");
+        await independent.page.locator("#random-roll").click();
+        await independent.page.waitForSelector("#random-result:not([hidden])");
+        await assertRandomResult(independent.page, 0);
+        if (label === "loading") await independent.page.waitForSelector(".board");
+        else await independent.page.waitForSelector(label === "error" ? "#patch-body .error" : "#patch-body .empty");
+        await independent.page.evaluate(() => { window.diceCard = document.querySelector("#random-build"); return loadPatch(); });
+        assert(await independent.page.locator("#random-build").evaluate((card) => card === window.diceCard));
+        await assertRandomResult(independent.page, 0);
+        assert.equal(independent.state.randomRequests.length, 1, "Patch updates never roll again");
+        await noPageOverflow(independent.page, `random build with ${label} patch ${width}`);
+        assert.deepEqual(independent.errors, []);
+      } finally { await independent.context.close(); }
+    }
+  }
+
+  const expired = await fixturePage(browser, 320, { randomResponder: (_, state) => {
+    state.authenticated = false;
+    return { status: 401, body: { detail: "Not logged in" } };
+  } });
+  try {
+    await expired.page.goto("http://rift.test/#/");
+    await expired.page.locator("#random-roll").click();
+    await expired.page.waitForSelector("#login-form");
+    assert.equal(await expired.page.locator("#random-build").count(), 0, "Random rolls use the shared session-expiry handling");
+    assert.deepEqual(expired.errors, []);
+  } finally { await expired.context.close(); }
+  console.log("PASS: random-build busy guard, 503 retry, last-result preservation, auth, motion and patch independence");
+}
+
+async function checkRandomBuildStaleResponses(browser) {
+  for (const destination of ["navigation", "logout"]) {
+    for (const status of [200, 503, 401]) {
+      const gate = deferred();
+      const fixture = await fixturePage(browser, 375, { randomResponder: async ({ index }) => {
+        if (index !== 0) return;
+        await gate.promise;
+        return status === 200 ? { body: randomBuild(index) } : { status, body: { detail: status === 401 ? "Not logged in" : "Late metadata error" } };
+      } });
+      const { page } = fixture;
+      try {
+        await page.goto("http://rift.test/#/");
+        await page.waitForSelector("#random-roll");
+        await watchRandomBuild(page);
+        const pending = randomRequest(page);
+        await page.locator("#random-roll").click();
+        await pending;
+        if (destination === "navigation") {
+          await page.locator(".search.big input").fill("LongPlayerName#EUW12");
+          await page.locator(".search.big button").click();
+          await page.waitForSelector(".player-head");
+          assert.equal(await page.locator("#random-build").count(), 0);
+          await page.locator(".wordmark").click();
+          await page.waitForSelector("#random-roll:not([disabled])");
+          assert.equal(await page.locator("#random-result").isVisible(), false, "A pending roll does not get cached after leaving");
+          await page.locator("#random-roll").click();
+          await page.waitForFunction(() => window.randomFinished === 1);
+          await assertRandomResult(page, 1);
+          gate.resolve();
+          await page.waitForFunction(() => window.randomFinished === 2);
+          await assertRandomResult(page, 1);
+          assert.equal(await page.locator("#random-status.error").count(), 0, "An obsolete success or error cannot overwrite the newer landing roll");
+        } else {
+          await page.locator("#logout").click();
+          await page.waitForSelector("#login-form");
+          gate.resolve();
+          await page.waitForFunction(() => window.randomFinished === 1);
+          assert.equal(await page.locator("#login-form").count(), 1, "Late rolls cannot leave the logged-out view");
+          await page.locator('[name="username"]').fill("member");
+          await page.locator('[name="password"]').fill("password123");
+          await page.locator("#login-form button").click();
+          await page.waitForSelector("#random-roll:not([disabled])");
+          assert.equal(await page.locator("#random-result").isVisible(), false, "A late roll is not retained across logout");
+          assert.equal(await page.locator("#random-status.error").count(), 0);
+        }
+        assert.deepEqual(fixture.errors, [], `${destination}: late HTTP ${status}`);
+      } finally { gate.resolve(); await fixture.context.close(); }
+    }
+  }
+  console.log("PASS: random-build navigation A-B-A ordering and logout stale-success/error guards");
 }
 
 async function checkStates(browser) {
@@ -785,6 +1008,8 @@ async function checkStates(browser) {
     await checkHistoryPaginationRace(browser);
     await checkHistoryInitialRace(browser);
     await checkHistoryRetries(browser);
+    await checkRandomBuildStates(browser);
+    await checkRandomBuildStaleResponses(browser);
     await checkStates(browser);
   } finally { await browser.close(); }
 })().catch((error) => { console.error(error); process.exitCode = 1; });
