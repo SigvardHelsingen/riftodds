@@ -328,6 +328,25 @@ async function checkWidth(browser, width) {
     }
     await page.locator(".champ-btn").first().click();
     assert.equal(await page.locator(".build-row").count(), 0, "Clicking again closes the build");
+    // the champion search filters the table as you type, ignoring case and punctuation
+    const champNames = () => page.locator("#champ-table .champ > span").evaluateAll((spans) => spans.map((span) => span.firstChild.textContent));
+    await page.locator("#champ-search").fill("FORTUNE");
+    assert.deepEqual(await champNames(), ["Miss Fortune"]);
+    assert.equal(await page.locator("#champ-found").textContent(), "1 champion found");
+    assert.equal(await page.locator("#show-all").count(), 0);
+    if (process.env.SCREENSHOTS && [375, 1280].includes(width)) {
+      await page.locator("#champ-table").locator("xpath=..").screenshot({ path: path.join(process.env.SCREENSHOTS, `champion-search-${width}.png`) });
+    }
+    await page.locator("#champ-search").fill("nunuwill");
+    assert.deepEqual(await champNames(), ["Nunu & Willump"]);
+    await page.evaluate(() => loadPatch());  // the 30 s refresh redraws the page
+    assert(await page.locator("#champ-search").evaluate((input) => input === document.activeElement && input.selectionStart === 8), "Typing survives a refresh");
+    assert.deepEqual(await champNames(), ["Nunu & Willump"]);
+    await page.locator("#champ-search").pressSequentially("x");
+    assert.match(await page.locator("#champ-table .empty").textContent(), /No champion matching “nunuwillx” has games/);
+    await page.locator("#champ-search").fill("");
+    assert.equal(await page.locator("#champ-table .champ-btn").count(), 3);
+    await noPageOverflow(page, `champion search ${width}`);
     await page.locator(".search.big input").fill("LongPlayerName#EUW12");
     await page.locator(".search.big button").click();
     await page.waitForSelector(".player-head");

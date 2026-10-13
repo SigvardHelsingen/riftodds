@@ -17,7 +17,7 @@ const ordinal = (n) => `${n}${{ 1: "st", 2: "nd", 3: "rd" }[n] || "th"}`;
 const ROLE_NAMES = { TOP: "Top", JUNGLE: "Jungle", MIDDLE: "Mid", BOTTOM: "Bot", UTILITY: "Support", UNKNOWN: "Unknown" };
 
 let META = null;
-const view = { landing: { tier: "", sort: "wr", role: "", all: false, builds: new Set() }, player: { tab: "champions", role: null, queue: "420" },
+const view = { landing: { tier: "", sort: "wr", role: "", query: "", all: false, builds: new Set() }, player: { tab: "champions", role: null, queue: "420" },
   admin: { days: 30, user: "" } };
 let PATCH = null;
 let DATA = null;
@@ -318,16 +318,10 @@ function renderPatch() {
   const tierChips = [["", "All tiers", P.tiers.reduce((a, t) => a + t.matches, 0)], ...META.tiers.filter((t) => totalByTier[t]).map((t) => [t, title(t), totalByTier[t]])];
   const top = P.objectives[0];
 
-  // champion table
-  const minGames = Math.max(10, Math.round(P.matches * 0.01));
-  let rows = P.champions.filter((c) => !L.role || c.role === L.role);
-  const sorters = { wr: (c) => c.wr, pick: (c) => c.pick_rate, ban: (c) => c.ban_rate };
-  if (L.sort === "wr") rows = rows.filter((c) => c.games >= minGames);
-  rows.sort((a, b) => sorters[L.sort](b) - sorters[L.sort](a));
-  const shown = L.all ? rows : rows.slice(0, 15);
-  const maxPick = Math.max(...P.champions.map((c) => c.pick_rate), 0.01);
-  const maxBan = Math.max(...P.champions.map((c) => c.ban_rate), 0.01);
   const presence = [...P.champions].sort((a, b) => b.pick_rate + b.ban_rate - (a.pick_rate + a.ban_rate)).slice(0, 6);
+  // the 30 s refresh redraws everything: keep someone typing in the champion search where they were
+  const search = $("#champ-search");
+  const typing = search && search === document.activeElement ? [search.selectionStart, search.selectionEnd] : null;
 
   $("#patch-body").innerHTML = `
     ${stale}
@@ -356,27 +350,19 @@ function renderPatch() {
 
     <div class="card section">
       <div class="card-head"><div><h2>Champions</h2>
-        <p>${L.sort === "wr" ? `Champions with fewer than ${minGames} games are hidden when sorting by win rate.` : `${rows.length} champions`}
+        <p>${L.sort === "wr" ? `Champions with fewer than ${champMinGames(P)} games are hidden when sorting by win rate, unless you search for them.`
+          : `${P.champions.filter((c) => !L.role || c.role === L.role).length} champions.`}
         Select a champion to see its most successful build.</p></div>
         <div class="chips" id="sort-chips">${[["wr", "Win rate"], ["pick", "Pick rate"], ["ban", "Ban rate"]].map(([v, l]) => `<button class="chip ${L.sort === v ? "active" : ""}" data-v="${v}">${l}</button>`).join("")}</div>
       </div>
-      <div class="chips" id="role-chips" style="margin-bottom:16px">${[["", "All roles"], ...META.roles.map((r) => [r, ROLE_NAMES[r]])].map(([v, l]) => `<button class="chip ${L.role === v ? "active" : ""}" data-v="${v}">${l}</button>`).join("")}</div>
+      <div class="champ-filters">
+        <div class="chips" id="role-chips">${[["", "All roles"], ...META.roles.map((r) => [r, ROLE_NAMES[r]])].map(([v, l]) => `<button class="chip ${L.role === v ? "active" : ""}" data-v="${v}">${l}</button>`).join("")}</div>
+        <input type="search" id="champ-search" placeholder="Search champions" aria-label="Search champions" aria-controls="champ-table"
+          autocomplete="off" spellcheck="false" value="${esc(L.query)}">
+        <p class="sr-only" id="champ-found" role="status" aria-live="polite"></p>
+      </div>
       ${WR_LEGEND()}
-      <table>
-        <thead><tr><th></th><th>Champion</th><th>Win rate</th><th class="num"></th><th>Pick rate</th><th>Ban rate</th><th class="num">Games</th></tr></thead>
-        <tbody>${shown.map((c, i) => {
-          const sub = c.role ? `${ROLE_NAMES[c.role]}${c.role_share < 0.9 ? ` · ${pct(c.role_share)}` : ""}` : "";
-          const open = !!c.role && L.builds.has(c.champion_id);
-          return `<tr class="${open ? "open" : ""}"><td class="rank">${i + 1}</td>
-          <td>${c.role ? buildToggle(c.champion_id, open, sub) : champCell(c.champion_id, sub)}</td>
-          <td style="width:24%">${wrBar(c)}</td><td class="num" title="${esc(wrTip(c))}">${pct(c.wr, 1)}</td>
-          <td style="width:15%">${barCell(c.pick_rate / maxPick, pct(c.pick_rate, 1))}</td>
-          <td style="width:15%">${barCell(c.ban_rate / maxBan, pct(c.ban_rate, 1))}</td>
-          <td class="num muted">${c.games}</td></tr>
-          ${open ? buildRow(c.champion_id, c.role, 7) : ""}`;
-        }).join("") || `<tr><td colspan="7" class="empty">${L.sort === "wr" ? `No champion has ${minGames}+ games yet — sort by pick rate, or check back as the sampler collects more.` : "No games yet."}</td></tr>`}</tbody>
-      </table>
-      ${rows.length > 15 ? `<div class="table-foot"><button class="btn ghost" id="show-all">${L.all ? "Show top 15" : `Show all ${rows.length}`}</button></div>` : ""}
+      <div id="champ-table"></div>
     </div>
     ${leadCard(P.leads)}
     ${samplerLine(P.sampler)}`;
@@ -389,14 +375,65 @@ function renderPatch() {
   chipGroup("#tier-chips", "tier", true);
   chipGroup("#sort-chips", "sort");
   chipGroup("#role-chips", "role");
-  $("#show-all")?.addEventListener("click", () => { L.all = !L.all; renderPatch(); });
-  $$(".champ-btn").forEach((b) => b.addEventListener("click", () => {
+  $("#champ-search").addEventListener("input", (e) => { L.query = e.target.value; renderChampTable(); });
+  renderChampTable();
+  prepareTables($("#patch-body"));
+  if (typing) {
+    $("#champ-search").focus();
+    $("#champ-search").setSelectionRange(...typing);
+  }
+}
+
+const champMinGames = (P) => Math.max(10, Math.round(P.matches * 0.01));
+const searchKey = (text) => text.toLowerCase().replace(/[^a-z0-9]/g, "");  // "kaisa" finds Kai'Sa, "nunu" Nunu & Willump
+
+// the landing champion table, redrawn on its own so typing in the search box keeps focus
+function renderChampTable() {
+  const el = $("#champ-table");
+  if (!el) return;
+  const P = PATCH;
+  const L = view.landing;
+  const focused = document.activeElement?.closest("#champ-table .champ-btn")?.dataset.build;
+  const minGames = champMinGames(P);
+  const rows = P.champions.filter((c) => !L.role || c.role === L.role);
+  const sorters = { wr: (c) => c.wr, pick: (c) => c.pick_rate, ban: (c) => c.ban_rate };
+  rows.sort((a, b) => sorters[L.sort](b) - sorters[L.sort](a));
+  const ranked = L.sort === "wr" ? rows.filter((c) => c.games >= minGames) : rows;
+  const rank = new Map(ranked.map((c, i) => [c.champion_id, i + 1]));
+  const query = searchKey(L.query);
+  // a search finds every champion with games, including those too thinly sampled to rank by win rate
+  const found = query ? rows.filter((c) => searchKey(champ(c.champion_id).name).includes(query)) : ranked;
+  const shown = query || L.all ? found : found.slice(0, 15);
+  const maxPick = Math.max(...P.champions.map((c) => c.pick_rate), 0.01);
+  const maxBan = Math.max(...P.champions.map((c) => c.ban_rate), 0.01);
+  const where = L.role ? ` in ${ROLE_NAMES[L.role]}` : "";
+  const empty = query ? `No champion matching “${esc(L.query.trim())}” has games${where} on this patch yet.`
+    : L.sort === "wr" ? `No champion has ${minGames}+ games yet — sort by pick rate, or check back as the sampler collects more.` : "No games yet.";
+  el.innerHTML = `<table>
+      <thead><tr><th></th><th>Champion</th><th>Win rate</th><th class="num"></th><th>Pick rate</th><th>Ban rate</th><th class="num">Games</th></tr></thead>
+      <tbody>${shown.map((c) => {
+        const sub = c.role ? `${ROLE_NAMES[c.role]}${c.role_share < 0.9 ? ` · ${pct(c.role_share)}` : ""}` : "";
+        const open = !!c.role && L.builds.has(c.champion_id);
+        return `<tr class="${open ? "open" : ""}"><td class="rank" ${rank.has(c.champion_id) ? "" : `title="Fewer than ${minGames} games: not ranked by win rate"`}>${rank.get(c.champion_id) ?? "–"}</td>
+        <td>${c.role ? buildToggle(c.champion_id, open, sub) : champCell(c.champion_id, sub)}</td>
+        <td style="width:24%">${wrBar(c)}</td><td class="num" title="${esc(wrTip(c))}">${pct(c.wr, 1)}</td>
+        <td style="width:15%">${barCell(c.pick_rate / maxPick, pct(c.pick_rate, 1))}</td>
+        <td style="width:15%">${barCell(c.ban_rate / maxBan, pct(c.ban_rate, 1))}</td>
+        <td class="num muted">${c.games}</td></tr>
+        ${open ? buildRow(c.champion_id, c.role, 7) : ""}`;
+      }).join("") || `<tr><td colspan="7" class="empty">${empty}</td></tr>`}</tbody>
+    </table>
+    ${!query && ranked.length > 15 ? `<div class="table-foot"><button class="btn ghost" id="show-all">${L.all ? "Show top 15" : `Show all ${ranked.length}`}</button></div>` : ""}`;
+  $("#champ-found").textContent = query ? `${found.length} champion${found.length === 1 ? "" : "s"} found` : "";
+  $("#show-all", el)?.addEventListener("click", () => { L.all = !L.all; renderChampTable(); });
+  $$(".champ-btn", el).forEach((b) => b.addEventListener("click", () => {
     const id = +b.dataset.build;
     L.builds.has(id) ? L.builds.delete(id) : L.builds.add(id);
-    renderPatch();
+    renderChampTable();
   }));
-  $$("[data-build-slot]").forEach(loadBuildSlot);
-  prepareTables($("#patch-body"));
+  $$("[data-build-slot]", el).forEach(loadBuildSlot);
+  prepareTables(el);
+  if (focused) $(`#champ-table .champ-btn[data-build="${focused}"]`)?.focus();
 }
 
 function leadCard(leads) {
