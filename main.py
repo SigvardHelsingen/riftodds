@@ -33,6 +33,10 @@ from riot import PLATFORMS, Riot, RiotError, load_champions, load_items, load_ru
 SOLO_QUEUE = 420
 TIERS = ["IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD", "DIAMOND",
          "MASTER", "GRANDMASTER", "CHALLENGER"]
+# the sampler's target share of each patch's games: a softened ladder bell curve, so mid elo leads
+# but every tier keeps enough games for its own stats
+TIER_WEIGHTS = {"IRON": 6, "BRONZE": 10, "SILVER": 14, "GOLD": 16, "PLATINUM": 16, "EMERALD": 14,
+                "DIAMOND": 10, "MASTER": 6, "GRANDMASTER": 4, "CHALLENGER": 4}
 STATIC = Path(__file__).with_name("static")
 SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "auto").strip().lower()
 if SESSION_COOKIE_SECURE not in {"auto", "0", "1"}:
@@ -379,6 +383,24 @@ def patch_start(db, patch):
     return max(first / 1000, two_weeks_ago) if first else two_weeks_ago
 
 
+def tier_games(db, patch):
+    """{tier: games tagged with it} on `patch`: sampled games plus those from players' history syncs."""
+    return dict(db.execute(
+        """SELECT mt.tier, COUNT(*) FROM match_tier mt JOIN matches m ON m.match_id = mt.match_id
+           WHERE m.patch = ? AND m.queue_id = ? AND m.remake = 0 GROUP BY mt.tier""", (patch, SOLO_QUEUE)))
+
+
+def next_tier(games):
+    """A random tier (by TIER_WEIGHTS) among those still at or below their share of `games`.
+
+    Balancing on games rather than picks: apex players play far more games per patch than a
+    random lower-tier ladder page, so equal picks gave the apex tiers about half the sample."""
+    total = sum(games.get(t, 0) for t in TIER_WEIGHTS)
+    weight = sum(TIER_WEIGHTS.values())
+    behind = {t: w for t, w in TIER_WEIGHTS.items() if games.get(t, 0) * weight <= w * total}
+    return random.choices(list(behind), weights=list(behind.values()))[0]
+
+
 def users_active():
     """True while someone uses the site (or a player sync runs): the sampler must give way."""
     return history.any_running() or time.time() - state["last_activity"] < SAMPLER_QUIET
@@ -393,14 +415,13 @@ def sampler_share():
 
 
 async def sampler():
-    """Round-robin over tiers: several random players per tier, their games on this patch.
+    """Several random players from a tier still short of its TIER_WEIGHTS share, their games on this patch.
 
     Also backfills timelines for current-patch matches cached before timelines were
     collected, so the patch lead curve covers the whole sample.
     """
     s = state["sampler"]
     platform = SAMPLER["platform"]
-    i = 0
     while True:
         try:
             # users get the whole budget: wait until nobody has used the site for a full rate window
@@ -418,6 +439,7 @@ async def sampler():
                        WHERE m.patch = ? AND m.queue_id = ? AND m.remake = 0 AND t.match_id IS NULL LIMIT 40""",
                     (patch, SOLO_QUEUE))] if patch else []
                 since = patch_start(db, patch)
+                games = tier_games(db, patch) if patch else {}
             if no_timeline:
                 s.update(status="sampling", tier=None)
                 await fetch_matches(riot, platform, no_timeline, None, chunk=10, stop=users_active)
@@ -426,8 +448,7 @@ async def sampler():
                 s["status"] = "idle"
                 await asyncio.sleep(600)
                 continue
-            tier = TIERS[i % len(TIERS)]
-            i += 1
+            tier = next_tier(games)
             s.update(status="sampling", tier=tier)
             division = random.choice(["I", "II", "III", "IV"])
             pool = (await riot.tier_players(platform, tier, division, page=random.randint(1, 3))
@@ -494,7 +515,7 @@ def meta():
 
 @app.post("/api/random-build")
 def random_build():
-    """A just-for-fun champion and six-item loadout; no Riot calls or per-roll storage."""
+    """A just-for-fun champion, lane and six-item loadout; no Riot calls or per-roll storage."""
     champions = state.get("champions", {})
     items = state.get("items", {})
     version = state.get("items_version", state.get("ddragon"))
@@ -505,8 +526,8 @@ def random_build():
     if not version:
         raise HTTPException(503, "Item data isn't ready. Try again shortly.")
     return JSONResponse({
-        "champion_id": champion_id, "champion": champions[champion_id], "version": version,
-        "items": [{"id": i, "name": items[i]["name"], "boots": bool(items[i].get("boots")),
+        "champion_id": champion_id, "champion": champions[champion_id], "role": random.choice(stats.ROLES),
+        "version": version, "items": [{"id": i, "name": items[i]["name"], "boots": bool(items[i].get("boots")),
                    "icon": f"https://ddragon.leagueoflegends.com/cdn/{version}/img/item/{i}.png"}
                   for i in loadout],
     }, headers={"Cache-Control": "no-store"})
@@ -840,14 +861,18 @@ def match_detail(match_id: str):
 
 
 @app.get("/api/builds/{champion_id}")
-def build(champion_id: int, role: str, tier: str | None = None):
-    """The most successful build for a champion in a role on the patch the landing page shows."""
+def build(champion_id: int, role: str, tier: str | None = None, fallback: bool = False):
+    """The most successful build for a champion in a role on the patch the landing page shows.
+
+    With `fallback`, a tier with too few sampled games uses every tier instead (as suggested picks do)."""
     if role not in stats.ROLES:
         raise HTTPException(400, "Unknown role")
     if tier and tier not in TIERS:
         raise HTTPException(400, "Unknown tier")
     with closing(store.connect()) as db:
         patch = shown_patch(db)[2]
+        if fallback:
+            tier = stats.tier_population(db, tier, patch, SOLO_QUEUE)
         return stats.champion_build(db, champion_id, role, patch, state.get("items", {}), tier)
 
 

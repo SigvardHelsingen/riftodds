@@ -26,7 +26,7 @@ const meta = {
 };
 const randomBuild = (index) => {
   const champion_id = index % 2 + 1;
-  return { champion_id, champion: champions[champion_id], version: meta.ddragon,
+  return { champion_id, champion: champions[champion_id], role: meta.roles[index % 2], version: meta.ddragon,
     items: [3006, 3031, 3072, 3036, 3046, 6672].map((id) => ({ id, name: meta.items[id], icon: `https://images.test/items/${id}.png`, boots: id === 3006 })) };
 };
 const me = { username: "a-very-long-member-username", account: {
@@ -182,7 +182,7 @@ async function fixturePage(browser, width, options = {}) {
   const page = await context.newPage();
   const errors = [];
   page.on("pageerror", (err) => { errors.push(err.message); if (process.env.DEBUG) console.error(err); });
-  const state = { authenticated: options.authenticated !== false, liveRequests: 0, pickAlphas: [], matchQueues: [], matchRequests: [], randomRequests: [] };
+  const state = { authenticated: options.authenticated !== false, liveRequests: 0, pickAlphas: [], buildQueries: [], matchQueues: [], matchRequests: [], randomRequests: [] };
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
     if (url.host !== "rift.test" || url.pathname === "/favicon.ico" || /^\/static\/(favicon|apple-touch-icon)/.test(url.pathname)) {
@@ -218,7 +218,10 @@ async function fixturePage(browser, width, options = {}) {
       body = options.patchError ? { detail: "Upstream unavailable" } : options.patch || patch;
     }
     else if (url.pathname === "/api/player" || url.pathname.endsWith("/analysis")) body = options.data || data;
-    else if (url.pathname.startsWith("/api/builds/")) body = { ...build, champion_id: +url.pathname.split("/").pop() };
+    else if (url.pathname.startsWith("/api/builds/")) {
+      state.buildQueries.push(url.search);
+      body = { ...build, champion_id: +url.pathname.split("/").pop() };
+    }
     else if (url.pathname.endsWith("/picks")) body = picks;
     else if (url.pathname.endsWith("/matches")) {
       const q = url.searchParams;
@@ -265,6 +268,7 @@ async function noPageOverflow(page, label) {
 async function assertRandomResult(page, index) {
   const result = randomBuild(index);
   assert.equal(await page.locator(".random-champion h3").textContent(), result.champion.name);
+  assert.equal(await page.locator(".random-lane").textContent(), { MIDDLE: "Mid", BOTTOM: "Bot" }[result.role]);
   assert.equal(await page.locator(".random-champion > img").getAttribute("src"), result.champion.icon);
   assert.equal(await page.locator(".random-champion > img").getAttribute("alt"), `${result.champion.name} portrait`);
   assert.equal(await page.locator(".random-items > li").count(), 6, "Exactly six items, not an accumulating roll history");
@@ -275,7 +279,7 @@ async function assertRandomResult(page, index) {
   assert.equal(await page.locator("#random-build").getAttribute("aria-busy"), "false");
   assert.equal(await page.locator("#random-status").getAttribute("role"), "status");
   assert.equal(await page.locator("#random-status").getAttribute("aria-live"), "polite");
-  assert.match(await page.locator("#random-note").textContent(), /Just for fun.*not a meta recommendation.*shopping list, not build order/);
+  assert.equal(await page.locator("#random-note").count(), 0);
 }
 
 async function assertHistoryQueues(page) {
@@ -450,6 +454,23 @@ async function checkWidth(browser, width) {
         await page.locator("#pick-opp").selectOption("3");
         await page.waitForFunction(() => document.querySelector("#pick-out .callout")?.textContent.includes("Miss Fortune"));
         assert(state.pickAlphas.includes("0"), "Zero smoothing must remain selectable");
+        // a predicted champion folds out its build: the player's tier, or every tier while it's thinly sampled
+        await page.locator("#pick-out .champ-btn").first().click();
+        await page.waitForSelector("#pick-out .build-row .build-line");
+        assert.equal(await page.locator("#pick-out .champ-btn").first().getAttribute("aria-expanded"), "true");
+        assert(await page.locator("#pick-out .champ-btn").first().evaluate((b) => b === document.activeElement), "Focus stays on the toggle");
+        assert.match(state.buildQueries.at(-1), /role=MIDDLE&tier=EMERALD&fallback=1/);
+        const draftFits = await page.locator("#pick-out .build-slot").evaluate((el) => {
+          const view = el.closest(".table-scroll").getBoundingClientRect();
+          return [...el.querySelectorAll("*")].every((child) => child.getBoundingClientRect().right <= view.right + 1);
+        });
+        assert(draftFits, "The draft build stays inside the visible part of the scrolling table");
+        await noPageOverflow(page, `draft build ${width}`);
+        if (process.env.SCREENSHOTS && [375, 1280].includes(width)) {
+          await page.locator("#pick-out").screenshot({ path: path.join(process.env.SCREENSHOTS, `draft-build-${width}.png`) });
+        }
+        await page.locator("#pick-out .champ-btn").first().click();
+        assert.equal(await page.locator("#pick-out .build-row").count(), 0, "Clicking again closes the build");
       } else if (tab === "live") {
         await page.waitForSelector(".live-team table");
       }

@@ -260,14 +260,15 @@ h2 { font: 800 26px/1 var(--display); text-transform: uppercase; letter-spacing:
 .random-champion { min-width: 0; display: grid; gap: 10px; }
 .random-champion > img { border: 2px solid var(--ink); border-radius: var(--radius); object-fit: cover; }
 .random-champion h3 { font: 800 28px/1.1 var(--display); margin: 5px 0; overflow-wrap: anywhere; }
+.random-lane { display: block; width: fit-content; margin: 2px 0 6px; padding: 3px 9px; background: var(--ink); color: var(--peach);
+               border-radius: var(--radius); font: 800 12px/1.2 var(--display); text-transform: uppercase; letter-spacing: .06em; }
 .random-items { list-style: none; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0; padding: 0; }
 .random-items li { min-width: 0; display: flex; align-items: center; gap: 10px; padding: 10px; background: var(--card);
                    border: 1px solid var(--rule); border-radius: var(--radius); }
 .random-items img { flex: none; width: 40px; height: 40px; border: 1px solid var(--ink); border-radius: 5px; }
 .random-items li > span { min-width: 0; font-size: 12px; font-weight: 500; line-height: 1.35; overflow-wrap: anywhere; }
 .random-items small { display: block; color: var(--muted); font-weight: 400; margin-top: 3px; }
-.random-note { font-size: 12px; margin: 18px 0 0; }
-.random-status { min-height: 1.5em; margin: 6px 0 0; overflow-wrap: anywhere; }
+.random-status { min-height: 1.5em; margin: 14px 0 0; overflow-wrap: anywhere; }
 .random-build.is-rolling .random-dice { animation: dice-wiggle .4s ease-in-out; }
 .random-result.is-revealing { animation: dice-reveal .24s ease-out; }
 @keyframes dice-wiggle { 25% { transform: rotate(-18deg) translateY(-3px); } 65% { transform: rotate(16deg) translateY(-2px); } }

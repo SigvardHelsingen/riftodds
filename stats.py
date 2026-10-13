@@ -668,17 +668,22 @@ def player_roles(games, min_share=0.2, most=2):
 
 
 @_snapshot
+def tier_population(db, tier, patch, queue=420):
+    """`tier` when the sample has MIN_TIER_MATCHES of its games on `patch`, else None (every tier)."""
+    tier_matches = db.execute(
+        """SELECT COUNT(*) FROM match_tier mt JOIN matches m ON m.match_id = mt.match_id
+           WHERE mt.tier = ? AND m.patch = ? AND m.queue_id = ? AND m.remake = 0""",
+        (tier, patch, queue)).fetchone()[0] if tier else 0
+    return tier if tier_matches >= MIN_TIER_MATCHES else None
+
+
+@_snapshot
 def suggested_picks(db, games, tier, patch, items, per_role=4, queue=420):
     """The highest win-rate champions in the player's main roles on `patch`, each with its build.
 
     Uses games from the player's tier when the sample has enough of them, else every tier.
     Champions are ranked by win rate shrunk towards the role's average."""
-    with store.read_snapshot(db):
-        tier_matches = db.execute(
-            """SELECT COUNT(*) FROM match_tier mt JOIN matches m ON m.match_id = mt.match_id
-               WHERE mt.tier = ? AND m.patch = ? AND m.queue_id = ? AND m.remake = 0""",
-            (tier, patch, queue)).fetchone()[0] if tier else 0
-    population = tier if tier_matches >= MIN_TIER_MATCHES else None
+    population = tier_population(db, tier, patch, queue)
     mine = defaultdict(list)
     for g in games:
         mine[g["champion_id"]].append(g)

@@ -253,6 +253,19 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual((await self.client.get("/api/builds/1", params={"role": "MIDDLE", "tier": "WOOD"})).status_code, 400)
         self.assertEqual(build.call_count, 1)
 
+    async def test_build_endpoint_falls_back_to_every_tier_only_when_asked(self):
+        with patch.object(main.store, "connect", return_value=Mock()), \
+                patch.object(main, "shown_patch", return_value=("16.20", 10, "16.20")), \
+                patch.object(main.stats, "tier_population", return_value=None) as population, \
+                patch.object(main.stats, "champion_build", return_value={"games": 0}) as build, \
+                patch.dict(main.state, {"items": {}}):
+            await self.client.get("/api/builds/1", params={"role": "MIDDLE", "tier": "GOLD", "fallback": 1})
+            population.assert_called_once_with(ANY, "GOLD", "16.20", main.SOLO_QUEUE)
+            self.assertIsNone(build.call_args.args[5])  # thinly sampled Gold: every tier
+            await self.client.get("/api/builds/1", params={"role": "MIDDLE", "tier": "GOLD"})
+            self.assertEqual(population.call_count, 1)  # the landing tier filter never falls back
+            self.assertEqual(build.call_args.args[5], "GOLD")
+
     async def test_random_build_returns_six_named_items_without_riot_or_database_work(self):
         champions = {1: {"name": "Annie", "icon": "https://images.test/annie.png"}}
         items = {3006: {"name": "Greaves", "boots": True}}
@@ -264,6 +277,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["cache-control"], "no-store")
         result = response.json()
         self.assertEqual((result["champion_id"], result["champion"], result["version"]), (1, champions[1], "16.19.1"))
+        self.assertIn(result["role"], main.stats.ROLES)
         self.assertEqual(len(result["items"]), 6)
         self.assertEqual(result["items"][0], {"id": 3006, "name": "Greaves", "boots": True,
                                             "icon": "https://ddragon.leagueoflegends.com/cdn/16.19.1/img/item/3006.png"})
@@ -566,6 +580,35 @@ class PatchFallbackTests(unittest.TestCase):
     def test_new_patch_shown_once_it_has_enough_games(self):
         self.add_new_patch_games(main.MIN_PATCH_GAMES)
         self.assertEqual(main.patch()["patch"], "16.20")
+
+
+class SamplerTierTests(unittest.TestCase):
+    """The sampler aims for TIER_WEIGHTS' share of each patch's games, not an equal number of picks per tier."""
+
+    def test_weights_cover_every_tier(self):
+        self.assertEqual(list(main.TIER_WEIGHTS), main.TIERS)
+
+    def test_tiers_over_their_share_are_skipped(self):
+        # the skew seen on 16.20: apex tiers had about half the sample
+        games = {"IRON": 45, "BRONZE": 47, "SILVER": 39, "GOLD": 30, "PLATINUM": 30, "EMERALD": 18,
+                 "DIAMOND": 55, "MASTER": 70, "GRANDMASTER": 102, "CHALLENGER": 76, "UNRANKED": 500}
+        picks = {main.next_tier(games) for _ in range(500)}
+        self.assertEqual(picks, {"BRONZE", "SILVER", "GOLD", "PLATINUM", "EMERALD"})
+
+    def test_empty_sample_picks_by_weight(self):
+        with patch.object(main.random, "choices", wraps=main.random.choices) as choices:
+            self.assertIn(main.next_tier({}), main.TIERS)
+        self.assertEqual(choices.call_args.kwargs["weights"], list(main.TIER_WEIGHTS.values()))
+
+    def test_tier_games_counts_tagged_solo_games_on_the_patch(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                closing(test_data.fixture_db(Path(directory) / "cache.sqlite")) as db:
+            db.executemany("INSERT INTO matches VALUES (?, 'X', ?, 0, 1800, ?, ?, NULL)",
+                           [("A", 420, "16.20", 0), ("B", 420, "16.20", 0), ("C", 420, "16.19", 0),
+                            ("D", 440, "16.20", 0), ("E", 420, "16.20", 1)])
+            db.executemany("INSERT INTO match_tier VALUES (?, ?)",
+                           [("A", "GOLD"), ("B", "GOLD"), ("B", "MASTER"), ("C", "GOLD"), ("D", "GOLD"), ("E", "GOLD")])
+            self.assertEqual(main.tier_games(db, "16.20"), {"GOLD": 2, "MASTER": 1})
 
 
 class MatchHistoryTests(unittest.IsolatedAsyncioTestCase):

@@ -213,20 +213,20 @@ const DICE = `<svg class="random-dice" viewBox="0 0 40 40" aria-hidden="true" fo
 
 function randomBuildHtml(result) {
   return `<div class="random-champion"><img src="${esc(result.champion.icon)}" alt="${esc(result.champion.name)} portrait" width="80" height="80">
-      <div><span class="random-label">Your champion</span><h3>${esc(result.champion.name)}</h3><span class="muted small">Now that's a plan. Sort of.</span></div></div>
+      <div><span class="random-label">Your champion</span><h3>${esc(result.champion.name)}</h3>
+        <span class="random-lane">${ROLE_NAMES[result.role]}</span><span class="muted small">Now that's a plan. Sort of.</span></div></div>
     <ul class="random-items" aria-label="Six random items, not build order">${result.items.map((item) => `<li>
       <img src="${esc(item.icon)}" alt="" width="40" height="40"><span>${esc(item.name)}${item.boots ? `<small>Boots</small>` : ""}</span>
     </li>`).join("")}</ul>`;
 }
 
 function randomBuildCard() {
-  return `<section class="random-build" id="random-build" aria-labelledby="random-title" aria-describedby="random-note" aria-busy="false">
+  return `<section class="random-build" id="random-build" aria-labelledby="random-title" aria-busy="false">
     <div class="random-head"><div><span class="random-label">Just for fun</span><h2 id="random-title">Let the dice pick.</h2>
-      <p>Random champion. Six random items. Zero promises.</p></div>
-      <button type="button" class="btn random-roll" id="random-roll" aria-describedby="random-note">${DICE}<span>${randomBuildResult ? "Reroll" : "Roll champion + build"}</span></button></div>
-    <div class="random-result" id="random-result" role="region" aria-label="Your random champion and item shopping list" ${randomBuildResult ? "" : "hidden"}>${randomBuildResult ? randomBuildHtml(randomBuildResult) : ""}</div>
-    <p class="random-note" id="random-note">Just for fun — not a meta recommendation. A shopping list, not build order.</p>
-    <p class="random-status small" id="random-status" role="status" aria-live="polite" aria-atomic="true">${randomBuildResult ? "Your last roll. Feeling lucky again?" : "Roll for a little chaos."}</p>
+      <p>Random champion. Random lane. Six random items. Zero promises.</p></div>
+      <button type="button" class="btn random-roll" id="random-roll">${DICE}<span>${randomBuildResult ? "Reroll" : "Roll champion + build"}</span></button></div>
+    <div class="random-result" id="random-result" role="region" aria-label="Your random champion, lane and items" ${randomBuildResult ? "" : "hidden"}>${randomBuildResult ? randomBuildHtml(randomBuildResult) : ""}</div>
+    <p class="random-status small" id="random-status" role="status" aria-live="polite" aria-atomic="true">${randomBuildResult ? "Your last roll. Feeling lucky again?" : ""}</p>
   </section>`;
 }
 
@@ -258,7 +258,7 @@ async function rollRandomBuild() {
     output.classList.remove("is-revealing");
     void output.offsetWidth;
     output.classList.add("is-revealing");
-    status.textContent = `Rolled ${result.champion.name} and six random items. Want another?`;
+    status.textContent = `Rolled ${ROLE_NAMES[result.role]} ${result.champion.name} and six random items. Want another?`;
   } catch (error) {
     await pause;
     if (!current()) return;
@@ -368,14 +368,12 @@ function renderPatch() {
           const sub = c.role ? `${ROLE_NAMES[c.role]}${c.role_share < 0.9 ? ` · ${pct(c.role_share)}` : ""}` : "";
           const open = !!c.role && L.builds.has(c.champion_id);
           return `<tr class="${open ? "open" : ""}"><td class="rank">${i + 1}</td>
-          <td>${c.role ? `<button class="champ-btn" data-build="${c.champion_id}" aria-expanded="${open}">${champCell(c.champion_id, sub)}
-            <span class="build-cue" aria-hidden="true">${open ? "▴" : "▾"} Build</span></button>` : champCell(c.champion_id, sub)}</td>
+          <td>${c.role ? buildToggle(c.champion_id, open, sub) : champCell(c.champion_id, sub)}</td>
           <td style="width:24%">${wrBar(c)}</td><td class="num" title="${esc(wrTip(c))}">${pct(c.wr, 1)}</td>
           <td style="width:15%">${barCell(c.pick_rate / maxPick, pct(c.pick_rate, 1))}</td>
           <td style="width:15%">${barCell(c.ban_rate / maxBan, pct(c.ban_rate, 1))}</td>
           <td class="num muted">${c.games}</td></tr>
-          ${open ? `<tr class="build-row"><td colspan="7"><div class="build-slot" data-build-slot="${c.champion_id}" data-role="${c.role}">
-            <div class="loading"><div class="spinner"></div></div></div></td></tr>` : ""}`;
+          ${open ? buildRow(c.champion_id, c.role, 7) : ""}`;
         }).join("") || `<tr><td colspan="7" class="empty">${L.sort === "wr" ? `No champion has ${minGames}+ games yet — sort by pick rate, or check back as the sampler collects more.` : "No games yet."}</td></tr>`}</tbody>
       </table>
       ${rows.length > 15 ? `<div class="table-foot"><button class="btn ghost" id="show-all">${L.all ? "Show top 15" : `Show all ${rows.length}`}</button></div>` : ""}
@@ -426,6 +424,7 @@ async function showPlayer(platform, riotId, range) {
   view.player.trendGame = null;  // match_id of the game open beside the form chart
   view.player.picks = null;      // suggested picks for this player/range: { key, data }
   view.player.open = new Set();
+  view.player.builds = new Set();  // champions whose build is folded out in the Draft tab
   const [name] = riotId.split("#");
   const label = META.ranges.find((r) => r.key === range)?.label.toLowerCase() || "recent games";
   $("#app").innerHTML = `<div class="loading"><div class="spinner"></div>
@@ -691,7 +690,8 @@ function tabDraft() {
       <div class="meta">${r.games} games · ${pct(r.wr)} WR · plays like ${r.pool.effective_pool.toFixed(1)} champs</div>
       <div class="icons">${r.pool.top.map((t) => icon(t.champion_id)).join("")}</div></button>`).join("")}</div>
     <div class="card">
-      <div class="card-head"><div><h2>Pick predictor</h2><p>What will they pick in ${ROLE_NAMES[view.player.role]}? Choose a lane opponent to condition on the matchup.</p></div></div>
+      <div class="card-head"><div><h2>Pick predictor</h2><p>What will they pick in ${ROLE_NAMES[view.player.role]}? Choose a lane opponent to condition on the matchup.
+        Select a champion to see its most successful build.</p></div></div>
       <div class="controls">
         <label for="pick-opp">Lane opponent</label><select id="pick-opp"><option value="">Any opponent</option></select>
         <label for="pick-alpha" title="How strongly to lean on the overall role picks when there are few games vs this opponent">Smoothing <span style="text-transform:none">α</span></label>
@@ -704,7 +704,7 @@ function tabDraft() {
       <div class="pockets">${DATA.mastery.pockets.map((m) => `<div class="pocket">${icon(m.champion_id)}<div><b>${esc(champ(m.champion_id).name)}</b>
         <div class="muted small">${kpts(m.points)} pts · M${m.level} · last played ${day(m.last_play)}</div></div></div>`).join("")}</div>
     </div>` : ""}`;
-  $$(".role-card").forEach((b) => b.addEventListener("click", () => { view.player.role = b.dataset.role; view.player.opp = ""; tabDraft(); }));
+  $$(".role-card").forEach((b) => b.addEventListener("click", () => { view.player.role = b.dataset.role; view.player.opp = ""; view.player.builds.clear(); tabDraft(); }));
   $("#pick-opp").addEventListener("change", (e) => { view.player.opp = e.target.value; updatePick(); });
   $("#pick-alpha").addEventListener("change", (e) => { view.player.alpha = e.target.value; updatePick(); });
   fillOpponents();
@@ -748,6 +748,7 @@ async function updatePick(fill = false) {
 }
 
 function renderPick(res) {
+  const focused = document.activeElement?.closest("#pick-out .champ-btn")?.dataset.build;  // kept across re-renders
   const hasOpp = res.opp != null;
   const oppName = hasOpp ? esc(champ(res.opp).name) : "";
   const role = ROLE_NAMES[res.role];
@@ -761,11 +762,22 @@ function renderPick(res) {
     legend([["sq", "background:var(--mag)", hasOpp ? `P(pick | ${role}, vs ${oppName})` : `P(pick | ${role})`],
       ...(hasOpp ? [["line", "background:var(--ink)", `P(pick | ${role}) — usual rate`]] : [])]) +
     `<table><thead><tr><th>Champion</th><th>Probability</th><th class="num">Games</th><th class="num">${hasOpp ? "WR vs opp" : "Win rate"}</th></tr></thead><tbody>
-    ${res.rows.map((r) => `<tr><td>${champCell(r.champion_id)}</td>
+    ${res.rows.map((r) => {
+      const open = view.player.builds.has(r.champion_id);
+      return `<tr class="${open ? "open" : ""}"><td>${buildToggle(r.champion_id, open)}</td>
       <td style="width:50%" title="${pct(p(r), 1)}${hasOpp ? ` · usual ${pct(r.p_role, 1)}` : ""}">${barCell(p(r), pct(p(r), 1), { tick: hasOpp ? r.p_role : null, thick: true })}</td>
       <td class="num">${hasOpp ? `${r.games_vs} <span class="muted small">/ ${r.games}</span>` : r.games}</td>
-      <td class="num" title="${esc(wrTip(hasOpp ? r.wr_vs : r.wr))}">${wrText(hasOpp ? r.wr_vs : r.wr)}</td></tr>`).join("")}</tbody></table>`;
+      <td class="num" title="${esc(wrTip(hasOpp ? r.wr_vs : r.wr))}">${wrText(hasOpp ? r.wr_vs : r.wr)}</td></tr>
+      ${open ? buildRow(r.champion_id, res.role, 4, META.tiers.includes(DATA.profile.tier) ? DATA.profile.tier : "") : ""}`;
+    }).join("")}</tbody></table>`;
+  $$("#pick-out .champ-btn").forEach((b) => b.addEventListener("click", () => {
+    const id = +b.dataset.build;
+    view.player.builds.has(id) ? view.player.builds.delete(id) : view.player.builds.add(id);
+    renderPick(res);
+  }));
+  $$("#pick-out [data-build-slot]").forEach(loadBuildSlot);
   prepareTables($("#pick-out"));
+  if (focused) $(`#pick-out .champ-btn[data-build="${focused}"]`)?.focus();
 }
 
 function wrTable(head, rows) {
@@ -1357,13 +1369,25 @@ function buildHtml(b) {
   </div>`;
 }
 
-const buildCache = new Map();  // champion|role|tier|patch -> pending or finished build
+// a champion cell that folds its build out underneath, and that fold-out row
+function buildToggle(id, open, sub = "") {
+  return `<button class="champ-btn" data-build="${id}" aria-expanded="${open}">${champCell(id, sub)}
+    <span class="build-cue" aria-hidden="true">${open ? "▴" : "▾"} Build</span></button>`;
+}
+// `tier` set (even to "") = a player's tier, or every tier while it's thinly sampled; unset = the landing tier filter
+function buildRow(id, role, cols, tier) {
+  return `<tr class="build-row"><td colspan="${cols}"><div class="build-slot" data-build-slot="${id}" data-role="${role}"
+    ${tier == null ? "" : `data-tier="${tier}"`}><div class="loading"><div class="spinner"></div></div></div></td></tr>`;
+}
+
+const buildCache = new Map();  // champion|role|tier|fallback|patch -> pending or finished build
 async function loadBuildSlot(el) {
   const { buildSlot: champion, role } = el.dataset;
-  const tier = view.landing.tier;
-  const key = `${champion}|${role}|${tier}|${PATCH.patch}`;
+  const fallback = "tier" in el.dataset;
+  const tier = fallback ? el.dataset.tier : view.landing.tier;
+  const key = `${champion}|${role}|${tier}|${fallback}|${PATCH?.patch}`;  // PATCH is only loaded by the landing page
   if (!buildCache.has(key)) {
-    buildCache.set(key, api(`/api/builds/${champion}?role=${role}${tier ? `&tier=${tier}` : ""}`)
+    buildCache.set(key, api(`/api/builds/${champion}?role=${role}${tier ? `&tier=${tier}` : ""}${fallback ? "&fallback=1" : ""}`)
       .catch((e) => { buildCache.delete(key); return { error: e.message }; }));
   }
   const b = await buildCache.get(key);

@@ -396,6 +396,18 @@ class SuggestedPickTests(BuildTests):
             res = stats.suggested_picks(self.db, mine, "GOLD", "16.1", ITEMS)
         self.assertEqual((res["tier"], [p["champion_id"] for p in res["roles"][0]["picks"]]), ("GOLD", [901]))
 
+    def test_tier_population_needs_enough_tier_games_on_the_patch(self):
+        for i in range(10):
+            self.add(f"G{i}", 901, [3031], True)
+            store.tag_tier(self.db, f"G{i}", "GOLD")
+        with mock.patch.object(stats, "MIN_TIER_MATCHES", 10):
+            self.assertEqual(stats.tier_population(self.db, "GOLD", "16.1"), "GOLD")
+            self.assertIsNone(stats.tier_population(self.db, "SILVER", "16.1"))
+            self.assertIsNone(stats.tier_population(self.db, "GOLD", "16.2"))
+            self.assertIsNone(stats.tier_population(self.db, None, "16.1"))
+        with mock.patch.object(stats, "MIN_TIER_MATCHES", 11):
+            self.assertIsNone(stats.tier_population(self.db, "GOLD", "16.1"))
+
 
 def league(tier="GOLD", division="II", lp=40, wins=10, losses=8):
     return {"queueType": "RANKED_SOLO_5x5", "tier": tier, "rank": division, "leaguePoints": lp, "wins": wins, "losses": losses}

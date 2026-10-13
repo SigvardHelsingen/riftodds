@@ -166,8 +166,16 @@ class DataDragonTests(unittest.IsolatedAsyncioTestCase):
             "3867": entry("Bounty of Worlds", tags=["GoldPer"], total=400, into=["3877"]),
             "3877": entry("Bloodsong", tags=["GoldPer"], total=400),
             "447100": entry("Arena item", maps={"11": False, "30": True}),
+            # mode items Data Dragon still flags as on the Rift
+            "663056": entry("Demon King's Crown", total=2500),
+            "323003": entry("Archangel's Staff"),
+            "322065": entry("Shurelya's Battlesong"),
+            # a tier 3 boot without the Boots tag is boots, not a finished item
+            "3174": entry("Gunmetal Greaves", tags=["AttackSpeed"], total=1100, **{"from": ["3006"]}),
         }}, riot.load_items)
-        self.assertEqual({i for i, it in items.items() if it["random_eligible"]}, {3006, 3031})
+        self.assertEqual({i for i, it in items.items() if it["random_eligible"]}, {3006, 3031, 3174})
+        self.assertTrue(items[3174]["boots"])
+        self.assertFalse(items[3174]["completed"])
         # Keep historical-build classification unchanged even when an item cannot be rolled.
         self.assertTrue(items[7001]["completed"])
         self.assertTrue(items[3172]["boots"])

@@ -258,16 +258,21 @@ async def load_spells(version):
 
 
 LEGENDARY_GOLD = 1000  # finished items cost more than this; starters, potions and components less (or build into more)
+# Rift items have 4-digit IDs. Other modes' items and copies (Arena's 66xxxx prismatics, 32xxxx, 77xxxx…) have six,
+# and Data Dragon flags some of them as on the Rift (map 11) anyway.
+RIFT_ITEM_IDS = range(1, 10000)
 
 
 async def load_items(version):
     """Names and classification for Rift builds, plus purchase availability for the dice box.
 
-    `completed`: a finished, non-boots item (nothing builds out of it). `boots`: upgraded boots.
+    `completed`: a finished, non-boots item (nothing builds out of it). `boots`: upgraded boots (tier 3 too,
+    e.g. Gunmetal Greaves, which Data Dragon doesn't tag as boots).
     `support`: a finished support quest item, e.g. Bloodsong (Data Dragon prices those at 400)."""
     async with httpx.AsyncClient(timeout=20) as c:
         data = (await _ddragon_json(c, f"/cdn/{version}/data/en_US/item.json"))["data"]
     gold_income = lambda it: "GoldPer" in it.get("tags", [])
+    tagged_boots = {k for k, it in data.items() if "Boots" in it.get("tags", [])}
     support = {int(k) for parent in data.values() if gold_income(parent) for k in parent.get("into") or []
                if k in data and gold_income(data[k]) and not data[k].get("into")}
     items = {}
@@ -276,13 +281,14 @@ async def load_items(version):
             continue
         tags = set(it.get("tags", []))
         gold = it.get("gold", {}).get("total", 0)
-        boots = "Boots" in tags and gold > 300  # not the plain 300-gold Boots
+        boots = ("Boots" in tags or bool(tagged_boots & set(it.get("from", [])))) and gold > 300  # not plain Boots
         completed = (not boots and not it.get("into") and gold >= LEGENDARY_GOLD
                      and not tags & {"Consumable", "Trinket", "Jungle"})
         buyable = (it.get("gold", {}).get("purchasable", False) and it.get("inStore", True)
                    and not it.get("hideFromAll") and not it.get("requiredChampion") and not it.get("requiredAlly"))
         items[int(key)] = {"name": it["name"], "boots": boots, "support": int(key) in support, "completed": completed,
-                           "random_eligible": bool(buyable and (boots or completed) and int(key) not in support)}
+                           "random_eligible": bool(buyable and (boots or completed) and int(key) not in support
+                                                   and int(key) in RIFT_ITEM_IDS)}
     return items
 
 
