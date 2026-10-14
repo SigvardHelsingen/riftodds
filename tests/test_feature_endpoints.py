@@ -934,6 +934,20 @@ class StoryAndTimelineEndpoints(FeatureFixture):
             self.assertTrue(main.store.has_timeline(db, "STORY"))
             self.assertIsNone(main.store.digest(db, "STORY"))
 
+    async def test_explicit_missing_timeline_keeps_an_earlier_fetchs_legacy_rows(self):
+        self.story_match(cached=False)
+        with closing(self.connect()) as db:  # a v1-era fetch: marker and gold frames, no current digest
+            db.execute("INSERT INTO timelines VALUES ('STORY')")
+            db.execute(f"INSERT INTO frames VALUES ('STORY', '{PUUID}', 15, 5000, 6000, 120)")
+            db.commit()
+        before = self.timeline_rows("STORY")
+        self.riot.timeline.side_effect = None
+        self.riot.timeline.return_value = None
+        self.assertEqual(await self.request("POST", "/api/match/STORY/timeline"), {"available": False})
+        self.riot.timeline.assert_awaited_once_with("euw1", "STORY")
+        self.assertEqual(self.timeline_rows("STORY"), before)
+        self.assertEqual(len(before["frames"]), 1)
+
 
 class OddsEndpoints(FeatureFixture):
     async def test_scorecards_without_models_are_unavailable_not_placeholder_probabilities(self):

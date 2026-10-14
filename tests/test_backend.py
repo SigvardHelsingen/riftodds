@@ -96,6 +96,46 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 401)
         self.assertEqual(response.json(), {"detail": "Not logged in"})
 
+    async def test_generated_api_docs_are_not_published(self):
+        for path in ("/docs", "/redoc", "/openapi.json"):
+            with self.subTest(path=path):
+                self.assertEqual((await self.client.get(path)).status_code, 404)
+
+    async def test_security_headers_cover_the_page_and_early_401s(self):
+        page = await self.client.get("/")
+        self.user_for.return_value = None
+        rejected = await self.client.get("/api/me")
+        self.assertEqual(rejected.status_code, 401)
+        for response in (page, rejected):
+            csp = response.headers["content-security-policy"]
+            self.assertIn("script-src 'self'", csp)
+            self.assertIn("frame-ancestors 'none'", csp)
+            self.assertEqual(response.headers["x-content-type-options"], "nosniff")
+
+    async def test_incomplete_riot_ids_are_rejected_before_riot_or_cache(self):
+        main.state["riot"] = SimpleNamespace(account=AsyncMock())
+        for riot_id in ("NoTag", "#EUW", "Name#", "Name#   ", "  #  "):
+            with self.subTest(riot_id=riot_id):
+                response = await self.client.get("/api/player", params={"platform": "euw1", "riot_id": riot_id})
+                self.assertEqual(response.status_code, 400)
+        main.state["riot"].account.assert_not_awaited()
+        self.store_connect.assert_not_called()
+
+    async def test_timezone_offsets_beyond_a_day_are_validation_errors_not_500s(self):
+        for path in ("/api/player/dummy/analysis", "/api/player"):
+            with self.subTest(path=path):
+                response = await self.client.get(path, params={"platform": "euw1", "riot_id": "A#B", "tz": 1440})
+                self.assertEqual(response.status_code, 422)
+        self.store_connect.assert_not_called()
+
+    async def test_sample_size_and_division_are_bounded_before_outbound_calls(self):
+        main.state["riot"] = SimpleNamespace(tier_players=AsyncMock())
+        for params, status in (({"players": 9}, 422), ({"per_player": 11}, 422), ({"division": "V"}, 400)):
+            with self.subTest(params=params):
+                response = await self.client.post("/api/sample", params={"platform": "euw1", "tier": "GOLD", **params})
+                self.assertEqual(response.status_code, status)
+        main.state["riot"].tier_players.assert_not_awaited()
+
     async def test_sample_rejects_invalid_platform_before_outbound_calls(self):
         riot = SimpleNamespace(tier_players=AsyncMock())
         main.state["riot"] = riot
@@ -108,6 +148,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sample_accepts_known_platform(self):
         riot = SimpleNamespace(tier_players=AsyncMock(return_value=[]), match_ids=AsyncMock())
+        riot.background = lambda share: riot
         main.state["riot"] = riot
         with patch.object(main, "fetch_matches", new_callable=AsyncMock, return_value=0):
             response = await self.client.post("/api/sample", params={"platform": "euw1", "tier": "gold", "division": "I"})
@@ -128,6 +169,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             match=AsyncMock(side_effect=match),
             timeline=AsyncMock(return_value=None),
         )
+        riot.background = Mock(return_value=riot)
         main.state["riot"] = riot
 
         def has_match(db, mid):
@@ -150,6 +192,7 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(main.store, "has_match", side_effect=has_match), patch.object(main.store, "has_timeline", side_effect=has_timeline), patch.object(main.store, "save_match", side_effect=save_match), patch.object(main.store, "save_timeline", side_effect=save_timeline), patch.object(main.store, "tag_tier"):
                     response = await self.client.post("/api/sample", params={"platform": "euw1", "tier": "GOLD", "division": "I", "players": 1})
                 self.assertEqual(response.status_code, 502)
+                riot.background.assert_called_once_with(main.HISTORY_SHARE)  # leaves headroom for lookups
                 detail = response.json()["detail"]
                 self.assertIn("cached", detail)
                 self.assertIn("retry", detail)
@@ -448,6 +491,7 @@ class SnapshotBoundaryTests(unittest.TestCase):
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(main.store, "connect", return_value=self.db))
         self.stack.enter_context(patch.dict(main.state, {"ddragon": "26.20.1", "sampler": {"status": "off"}}))
+        self.stack.enter_context(patch.dict(main._patch_boards, clear=True))  # no boards from other fixtures
         self.rng = {"key": "20", "label": "Last 20 games", "count": 20, "since": None}
 
     def add_match(self, mid):
@@ -567,6 +611,7 @@ class PatchFallbackTests(unittest.TestCase):
         self.addCleanup(stack.close)
         stack.enter_context(patch.object(main.store, "connect", side_effect=lambda: test_data.fixture_db(self.path)))
         stack.enter_context(patch.dict(main.state, {"ddragon": "16.20.1", "sampler": {"status": "off"}}))
+        stack.enter_context(patch.dict(main._patch_boards, clear=True))
         stack.enter_context(patch.object(main.stats, "patch_overview", side_effect=lambda db, shown, tier: {"patch": shown, "matches": 0, "tiers": []}))
 
     def add_new_patch_games(self, n):
@@ -583,6 +628,28 @@ class PatchFallbackTests(unittest.TestCase):
     def test_new_patch_shown_once_it_has_enough_games(self):
         self.add_new_patch_games(main.MIN_PATCH_GAMES)
         self.assertEqual(main.patch()["patch"], "16.20")
+
+    def test_board_is_reused_until_sampled_games_change_or_it_expires(self):
+        self.add_new_patch_games(main.MIN_PATCH_GAMES)
+        board = {"patch": "16.20", "matches": 0, "tiers": []}
+        with patch.object(main.stats, "patch_overview", return_value=board) as overview:
+            main.patch()
+            main.state["sampler"] = {"status": "sampling"}
+            self.assertEqual(main.patch()["sampler"], {"status": "sampling"})  # live status, cached board
+            self.assertEqual(overview.call_count, 1)
+            main.patch("GOLD")  # another tier is another board
+            self.assertEqual(overview.call_count, 2)
+            with closing(test_data.fixture_db(self.path)) as db:
+                db.execute("INSERT INTO matches VALUES ('NEWEST', 'X', 420, 9999, 1800, '16.20', 0, NULL)")
+                db.commit()
+            self.assertEqual(main.patch()["current_patch_games"], main.MIN_PATCH_GAMES + 1)
+            self.assertEqual(overview.call_count, 3)
+            with patch.object(main, "PATCH_BOARD_TTL", 0):
+                main.patch()
+            self.assertEqual(overview.call_count, 4)
+        with self.assertRaises(main.HTTPException) as error:
+            main.patch("NOT_A_TIER")
+        self.assertEqual(error.exception.status_code, 400)
 
 
 class SamplerTierTests(unittest.TestCase):

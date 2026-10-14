@@ -288,7 +288,10 @@ async function fixturePage(browser, width, options = {}) {
       if (!options.admin) return route.fulfill({ status: 403, contentType: "application/json", body: JSON.stringify({ detail: "Admins only." }) });
       body = adminData;
     }
-    else if (url.pathname === "/api/meta") body = meta;
+    else if (url.pathname === "/api/meta") {
+      if (options.metaError) { status = 502; body = { detail: "Upstream unavailable" }; }
+      else body = meta;
+    }
     else if (url.pathname === "/api/random-build") {
       const request = { index: state.randomRequests.length, method: route.request().method(), body: route.request().postDataJSON() };
       state.randomRequests.push(request);
@@ -1950,6 +1953,20 @@ async function checkStates(browser) {
     assert.deepEqual(login.errors, []);
   } finally { await login.context.close(); }
 
+  const bootOptions = { metaError: true };
+  const boot = await fixturePage(browser, 320, bootOptions);
+  try {
+    await boot.page.goto("http://rift.test/#/");
+    await boot.page.waitForSelector("#boot-retry");
+    assert.match(await boot.page.locator("#app h2").textContent(), /couldn't load/, "A failed start explains itself instead of a blank page");
+    assert.equal(await boot.page.locator("#app p").textContent(), "Upstream unavailable");
+    await noPageOverflow(boot.page, "boot error 320");
+    bootOptions.metaError = false;
+    await boot.page.locator("#boot-retry").click();
+    await boot.page.waitForSelector(".board");
+    assert.deepEqual(boot.errors, []);
+  } finally { await boot.context.close(); }
+
   for (const sync of [
     { phase: "timelines", running: true, total: 100, done: 30, error: null },
     { phase: "matches", running: false, total: 100, done: 30, error: "Riot API unavailable. Please retry the missing games." },
@@ -1992,7 +2009,7 @@ async function checkStates(browser) {
     assert.equal(await invalid.page.locator("#pick-out .error").textContent(), "Smoothing must be nonnegative");
     assert.deepEqual(invalid.errors, []);
   } finally { await invalid.context.close(); }
-  console.log("PASS: login/logout, sync states, validation errors and stale-response handling");
+  console.log("PASS: login/logout, boot errors, sync states, validation errors and stale-response handling");
 }
 
 (async () => {

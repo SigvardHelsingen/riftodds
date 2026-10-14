@@ -47,6 +47,17 @@ class RiotTests(unittest.IsolatedAsyncioTestCase):
         self.client.limiter.acquire.assert_not_awaited()
         self.assertEqual(self.requests, [])
 
+    async def test_riot_ids_and_ids_stay_inside_their_path_segment(self):
+        await self.client.account("euw1", "../../../../lol/match/v5/matches/EUW1_1", "a/b?c")
+        await self.client.match_ids("euw1", "../summoner", 420, 5)
+        await self.client.timeline("euw1", "EUW1_1/../../x")
+        self.assertEqual([request.url.raw_path.decode().split("?")[0] for request in self.requests], [
+            "/riot/account/v1/accounts/by-riot-id/..%2F..%2F..%2F..%2Flol%2Fmatch%2Fv5%2Fmatches%2FEUW1_1/a%2Fb%3Fc",
+            "/lol/match/v5/matches/by-puuid/..%2Fsummoner/ids",
+            "/lol/match/v5/matches/EUW1_1%2F..%2F..%2Fx/timeline",
+        ])
+        self.assertEqual(self.requests[0].url.host, "europe.api.riotgames.com")
+
     async def test_all_platform_and_regional_hosts_are_allowed(self):
         for host in sorted(set(riot.PLATFORMS) | set(riot.PLATFORMS.values())):
             self.assertEqual(await self.client.get(host, "/test", "test"), {"ok": True})

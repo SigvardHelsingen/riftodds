@@ -12,9 +12,11 @@ import math
 import os
 import random
 import sys
+import threading
 import time
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
+from typing import Annotated
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
@@ -191,8 +193,11 @@ async def track_ranks():
         await asyncio.sleep(RANK_EVERY)
         try:
             linked = {a["puuid"] for a in await asyncio.to_thread(auth.all_accounts)}
-            with closing(store.connect()) as db:
-                players = store.tracked_players(db, linked, time.time() - RANK_RECENT)
+
+            def tracked():
+                with closing(store.connect()) as db:
+                    return store.tracked_players(db, linked, time.time() - RANK_RECENT)
+            players = await asyncio.to_thread(tracked)
             riot = state["riot"].background(RANK_SHARE)
             for puuid, platform in players:
                 try:
@@ -202,13 +207,17 @@ async def track_ranks():
                         raise
                     continue  # one player's hiccup doesn't stop the round
                 solo = next((e for e in entries if e.get("queueType") == "RANKED_SOLO_5x5"), {})
-                with closing(store.connect()) as db:
-                    store.update_rank(db, puuid, solo)
-                    db.commit()
+                await asyncio.to_thread(record_rank, puuid, solo)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.warning("rank tracking round failed", exc_info=True)
+
+
+def record_rank(puuid, solo):
+    with closing(store.connect()) as db:
+        store.update_rank(db, puuid, solo)
+        db.commit()
 
 
 async def train_models():
@@ -282,8 +291,22 @@ async def ensure_cache_matches_key(riot):
                 log.warning("could not re-resolve linked account for %s: %s", link["username"], e)
 
 
-app = FastAPI(lifespan=lifespan)
+# No /docs, /redoc or /openapi.json: they'd publish the members-only API to anyone.
+app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+# The client renders with innerHTML, so the CSP is the backstop for a missed esc(): scripts only from
+# this origin, images from Data Dragon, fonts from Google Fonts. Inline style attributes position the charts.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "; ".join((
+        "default-src 'self'", "script-src 'self'", "connect-src 'self'",
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com", "font-src 'self' https://fonts.gstatic.com",
+        "img-src 'self' data: https://ddragon.leagueoflegends.com",
+        "object-src 'none'", "base-uri 'none'", "form-action 'self'", "frame-ancestors 'none'")),
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "same-origin",
+    "X-Frame-Options": "DENY",
+}
 
 
 @app.exception_handler(RequestValidationError)
@@ -310,6 +333,14 @@ async def require_login(request: Request, call_next):
         if request.url.path.startswith(ACTIVE_PATHS):
             state["last_activity"] = time.time()  # the sampler backs off while people use the site
     return await call_next(request)
+
+
+@app.middleware("http")  # registered last, so it runs outermost and also covers require_login's 401s
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    for name, value in SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+    return response
 
 
 def track(username, kind, detail=""):
@@ -463,6 +494,19 @@ def sampler_share():
     return SAMPLER["share"] if per_minute >= 500 else 0.2
 
 
+def sampler_round():
+    """(patch, its games, up to 40 of them without a timeline, list-from time, {tier: games}): blocking reads."""
+    with closing(store.connect()) as db:
+        patch = current_patch(db)  # not the newest cached one: a finished old patch must not idle the sampler
+        if not patch:
+            return None, 0, [], patch_start(db, None), {}
+        no_timeline = [r[0] for r in db.execute(
+            """SELECT m.match_id FROM matches m LEFT JOIN timelines t ON t.match_id = m.match_id
+               WHERE m.patch = ? AND m.queue_id = ? AND m.remake = 0 AND t.match_id IS NULL LIMIT 40""",
+            (patch, SOLO_QUEUE))]
+        return patch, patch_matches(db, patch), no_timeline, patch_start(db, patch), tier_games(db, patch)
+
+
 async def sampler():
     """Several random players from a tier still short of its TIER_WEIGHTS share, their games on this patch.
 
@@ -481,16 +525,8 @@ async def sampler():
                 await asyncio.sleep(5)
                 continue
             riot = state["riot"].background(sampler_share())
-            with closing(store.connect()) as db:
-                patch = current_patch(db)  # not the newest cached one: a finished old patch must not idle the sampler
-                s.update(platform=platform, target=SAMPLER["target"], patch=patch,
-                         matches=patch_matches(db, patch) if patch else 0)
-                no_timeline = [r[0] for r in db.execute(
-                    """SELECT m.match_id FROM matches m LEFT JOIN timelines t ON t.match_id = m.match_id
-                       WHERE m.patch = ? AND m.queue_id = ? AND m.remake = 0 AND t.match_id IS NULL LIMIT 40""",
-                    (patch, SOLO_QUEUE))] if patch else []
-                since = patch_start(db, patch)
-                games = tier_games(db, patch) if patch else {}
+            patch, matches, no_timeline, since, games = await asyncio.to_thread(sampler_round)
+            s.update(platform=platform, target=SAMPLER["target"], patch=patch, matches=matches)
             done = bool(patch) and s["matches"] >= SAMPLER["target"]
             turn += 1
             if no_timeline and (done or turn % 2):
@@ -586,16 +622,34 @@ def random_build():
     }, headers={"Cache-Control": "no-store"})
 
 
+PATCH_BOARD_TTL = 60  # every landing page polls the board; reuse it until it changes or this long
+PATCH_BOARD_MAX = 16
+_patch_boards = {}  # (tier, live patch, its games, shown patch) -> (computed at, board)
+_patch_boards_lock = threading.Lock()
+
+
 @app.get("/api/patch")
 def patch(tier: str | None = None):
     """Stats for the live patch — or, right after a patch drops, the previous one until the
     sampler has enough games on the new one (`patch` vs `current_patch` tells the client)."""
+    if tier and tier not in TIERS:
+        raise HTTPException(400, "Unknown tier")
     with closing(store.connect()) as db, store.read_snapshot(db):
         current, current_games, shown = shown_patch(db)
-        overview = stats.patch_overview(db, shown, tier) if shown else {"patch": None, "matches": 0, "tiers": []}
-        if shown and overview["matches"]:
-            overview["leads"] = stats.patch_lead_curve(db, shown, tier)
-        return {**overview, "current_patch": current, "current_patch_games": current_games, "sampler": state["sampler"]}
+        key = (tier, current, current_games, shown)
+        with _patch_boards_lock:
+            hit = _patch_boards.get(key)
+        if hit and time.time() - hit[0] < PATCH_BOARD_TTL:
+            board = hit[1]
+        else:
+            board = stats.patch_overview(db, shown, tier) if shown else {"patch": None, "matches": 0, "tiers": []}
+            if shown and board["matches"]:
+                board["leads"] = stats.patch_lead_curve(db, shown, tier)
+            with _patch_boards_lock:
+                _patch_boards[key] = time.time(), board
+                while len(_patch_boards) > PATCH_BOARD_MAX:
+                    del _patch_boards[next(iter(_patch_boards))]
+    return {**board, "current_patch": current, "current_patch_games": current_games, "sampler": state["sampler"]}
 
 
 def analysis(puuid, rng, tz):
@@ -626,9 +680,25 @@ def analysis(puuid, rng, tz):
         }
 
 
+TzOffset = Annotated[int, Query(ge=-1439, le=1439)]  # minutes, as getTimezoneOffset() reports; datetime needs < 24 h
+
+
+def cached_player(platform, name, tag):
+    with closing(store.connect()) as db:
+        return store.find_player(db, platform, name, tag)
+
+
+def save_lookup(puuid, game_name, tag_line, platform, solo, profile):
+    with closing(store.connect()) as db:
+        store.save_player(db, puuid, game_name, tag_line, platform, solo, profile[0] if profile else None)
+        if profile:
+            store.save_mastery(db, puuid, profile[1])
+        db.commit()
+
+
 @app.get("/api/player")
 async def player(request: Request, platform: str, riot_id: str,
-                 range_: str = Query(history.DEFAULT_RANGE, alias="range"), tz: int = 0, tzname: str | None = None):
+                 range_: str = Query(history.DEFAULT_RANGE, alias="range"), tz: TzOffset = 0, tzname: str | None = None):
     """Resolve the player, start syncing their history for the range, and return what's cached.
 
     Small ranges usually finish within the wait below; big ones keep running in the
@@ -636,12 +706,11 @@ async def player(request: Request, platform: str, riot_id: str,
     """
     if platform not in PLATFORMS:
         raise HTTPException(400, "Unknown platform")
-    if "#" not in riot_id:
+    name, _, tag = (x.strip() for x in riot_id.rpartition("#"))
+    if not name or not tag:
         raise HTTPException(400, "Use the full Riot ID, e.g. Name#EUW")
-    name, tag = (x.strip() for x in riot_id.rsplit("#", 1))
     riot = state["riot"]
-    with closing(store.connect()) as db:
-        cached = store.find_player(db, platform, name, tag)
+    cached = await asyncio.to_thread(cached_player, platform, name, tag)
     fresh = cached and cached["profile_updated"] and time.time() - cached["profile_updated"] < PROFILE_TTL
     try:
         # a fresh cached profile skips 3 of the 5 lookup calls (account, summoner, mastery)
@@ -657,11 +726,7 @@ async def player(request: Request, platform: str, riot_id: str,
     except RiotError as e:
         raise riot_errors(e)
     solo = next((e for e in entries if e["queueType"] == "RANKED_SOLO_5x5"), {})
-    with closing(store.connect()) as db:
-        store.save_player(db, puuid, game_name, tag_line, platform, solo, profile[0] if profile else None)
-        if profile:
-            store.save_mastery(db, puuid, profile[1])
-        db.commit()
+    await asyncio.to_thread(save_lookup, puuid, game_name, tag_line, platform, solo, profile)
     if game:
         cached = _live_cached(puuid)
         same = cached and cached["game"] and cached["game"]["gameId"] == game["gameId"]
@@ -674,6 +739,11 @@ async def player(request: Request, platform: str, riot_id: str,
     # stats queries are blocking SQLite work: keep them off the event loop that drives the fetches
     return {**await asyncio.to_thread(analysis, puuid, rng, stats.local_zone(tzname, tz)),
             "live": live_summary(puuid, game)}
+
+
+def known_player(puuid):
+    with closing(store.connect()) as db:
+        return store.get_player(db, puuid)
 
 
 def live_summary(puuid, game):
@@ -694,8 +764,7 @@ async def live(puuid: str, form: bool = False):
     the client polls until `pending` is 0. Players who hide their identity in live games
     come without a PUUID and are shown champion-only.
     """
-    with closing(store.connect()) as db:
-        me = store.get_player(db, puuid)
+    me = await asyncio.to_thread(known_player, puuid)
     if not me:
         raise HTTPException(404, "Unknown player")
     platform = me["platform"]
@@ -724,10 +793,12 @@ async def live(puuid: str, form: bool = False):
     solo_of = {p["puuid"]: next((e for e in cached["extra"].get(p["puuid"], ([], []))[0]
                                  if e.get("queueType") == "RANKED_SOLO_5x5"), {}) for p in people}
     if fresh_ranks:  # each live check is a free rank snapshot for all ten players
-        with closing(store.connect()) as db:
-            for p in people:
-                store.save_rank(db, p["puuid"], solo_of[p["puuid"]])
-            db.commit()
+        def save_ranks():
+            with closing(store.connect()) as db:
+                for p in people:
+                    store.save_rank(db, p["puuid"], solo_of[p["puuid"]])
+                db.commit()
+        await asyncio.to_thread(save_ranks)
     if form:
         bg = riot.background(HISTORY_SHARE)
         for p in people:
@@ -784,7 +855,7 @@ def jungle_history(db, puuid, before=None):
 
 
 @app.get("/api/player/{puuid}/analysis")
-def player_analysis(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias="range"), tz: int = 0,
+def player_analysis(puuid: str, range_: str = Query(history.DEFAULT_RANGE, alias="range"), tz: TzOffset = 0,
                     tzname: str | None = None):
     history.touch(puuid)
     return analysis(puuid, history.resolve(range_), stats.local_zone(tzname, tz))
@@ -999,6 +1070,8 @@ async def fetch_story_timeline(match_id: str):
         except RiotError as e:
             raise riot_errors(e)
         with closing(store.connect()) as db:
+            if result is None and store.has_timeline(db, match_id):
+                return {"available": False}  # Riot has none: keep an earlier fetch's gold-at-10/15 rows
             try:
                 db.execute("BEGIN")
                 store.save_timeline(db, match_id, result)
@@ -1232,16 +1305,21 @@ def pick(puuid: str, role: str, opp: int | None = None, alpha: float = Query(5.0
 
 
 @app.post("/api/sample")
-async def sample(request: Request, platform: str, tier: str, division: str = "", players: int = Query(4, ge=1, le=20),
-                 per_player: int = Query(5, ge=1, le=20)):
-    """Grow one tier's baseline now: recent solo games from random players in `tier`."""
+async def sample(request: Request, platform: str, tier: str, division: str = "", players: int = Query(4, ge=1, le=8),
+                 per_player: int = Query(5, ge=1, le=10)):
+    """Grow one tier's baseline now: recent solo games from random players in `tier`.
+
+    Bounded (≤ 80 games, each with a timeline) and at the history-sync share, so one member's
+    click can't take a development key's whole rate window from everyone else's lookups."""
     if platform not in PLATFORMS:
         raise HTTPException(400, "Unknown platform")
     tier = tier.upper()
     if tier not in TIERS:
         raise HTTPException(400, "Unknown tier")
     division = division or random.choice(["I", "II", "III", "IV"])
-    riot = state["riot"]
+    if division not in ("I", "II", "III", "IV"):
+        raise HTTPException(400, "Unknown division")
+    riot = state["riot"].background(HISTORY_SHARE)
     await asyncio.to_thread(track, request.state.user, "sample", f"{tier.title()} {division} ({platform})")
     try:
         pool = await riot.tier_players(platform, tier, division, page=random.randint(1, 3))

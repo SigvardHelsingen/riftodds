@@ -203,7 +203,8 @@ async function showLanding() {
   $("#random-roll").addEventListener("click", rollRandomBuild);
   const token = nav;
   await loadPatch();
-  if (token === nav) pollTimer = setInterval(loadPatch, 30000);
+  // background tabs skip the refresh; coming back to the tab refreshes right away (see visibilitychange)
+  if (token === nav) pollTimer = setInterval(() => document.hidden || loadPatch(), 30000);
 }
 
 let randomBuildResult = null;
@@ -519,7 +520,9 @@ async function resumeSync() {
   if (DATA.sync?.running) pollSync(DATA.puuid);
 }
 document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && DATA?.sync?.phase === "paused" && !DATA.sync.running && location.hash.startsWith("#/p/")) resumeSync();
+  if (document.visibilityState !== "visible") return;
+  if (DATA?.sync?.phase === "paused" && !DATA.sync.running && location.hash.startsWith("#/p/")) resumeSync();
+  else if ($("#patch-body") && PATCH) loadPatch();
 });
 
 async function refreshAnalysis() {
@@ -2155,13 +2158,18 @@ async function start() {
   try {
     ME = await api("/api/me");
     META = await api("/api/meta");
-    renderUser();
-    // a fresh visit with a linked account goes straight to it; "#/" still shows the patch page
-    if (!location.hash && ME.account) location.hash = myHash();
-    else route();
-  } catch {
-    // api() already showed the login view on 401
+  } catch (e) {
+    if ($("#login-form")) return;  // api() already showed the login view on 401
+    // a restart or network hiccup: say so instead of leaving an empty page
+    $("#app").innerHTML = `<div class="card empty section"><h2 class="error">Rift Odds couldn't load</h2>
+      <p>${esc(e.message)}</p><button class="btn" id="boot-retry">Try again</button></div>`;
+    $("#boot-retry").addEventListener("click", start);
+    return;
   }
+  renderUser();
+  // a fresh visit with a linked account goes straight to it; "#/" still shows the patch page
+  if (!location.hash && ME.account) location.hash = myHash();
+  else route();
 }
 
 $("#logout").addEventListener("click", async () => {

@@ -24,6 +24,11 @@ PLATFORMS = {
 RIOT_HOSTS = frozenset(PLATFORMS) | frozenset(PLATFORMS.values())
 
 
+def _segment(value):
+    """One URL path segment: '/' and dot segments in a Riot ID must not change which endpoint is called."""
+    return quote(str(value), safe="")
+
+
 class RiotError(Exception):
     def __init__(self, status, msg):
         super().__init__(msg)
@@ -174,31 +179,31 @@ class Riot:
 
     async def account(self, platform, name, tag):
         return await self.get(self._account_host(platform),
-                              f"/riot/account/v1/accounts/by-riot-id/{quote(name)}/{quote(tag)}", "account-by-riot-id")
+                              f"/riot/account/v1/accounts/by-riot-id/{_segment(name)}/{_segment(tag)}", "account-by-riot-id")
 
     async def account_by_puuid(self, platform, puuid):
-        return await self.get(self._account_host(platform), f"/riot/account/v1/accounts/by-puuid/{puuid}",
+        return await self.get(self._account_host(platform), f"/riot/account/v1/accounts/by-puuid/{_segment(puuid)}",
                               "account-by-puuid")
 
     async def summoner(self, platform, puuid):
         """Profile icon + summoner level."""
-        return await self.get(platform, f"/lol/summoner/v4/summoners/by-puuid/{puuid}", "summoner")
+        return await self.get(platform, f"/lol/summoner/v4/summoners/by-puuid/{_segment(puuid)}", "summoner")
 
     async def league_entries(self, platform, puuid):
-        return await self.get(platform, f"/lol/league/v4/entries/by-puuid/{puuid}", "league-by-puuid")
+        return await self.get(platform, f"/lol/league/v4/entries/by-puuid/{_segment(puuid)}", "league-by-puuid")
 
     async def mastery(self, platform, puuid):
-        return await self.get(platform, f"/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}", "mastery")
+        return await self.get(platform, f"/lol/champion-mastery/v4/champion-masteries/by-puuid/{_segment(puuid)}", "mastery")
 
     async def clash_team(self, platform, team_id):
-        return await self.get(platform, f"/lol/clash/v1/teams/{quote(str(team_id), safe='')}", "clash-team")
+        return await self.get(platform, f"/lol/clash/v1/teams/{_segment(team_id)}", "clash-team")
 
     async def clash_players(self, platform, puuid):
-        return await self.get(platform, f"/lol/clash/v1/players/by-puuid/{quote(puuid, safe='')}", "clash-players")
+        return await self.get(platform, f"/lol/clash/v1/players/by-puuid/{_segment(puuid)}", "clash-players")
 
     async def active_game(self, platform, puuid):
         """The live game the player is in, or None."""
-        return await self.get(platform, f"/lol/spectator/v5/active-games/by-summoner/{puuid}", "spectator",
+        return await self.get(platform, f"/lol/spectator/v5/active-games/by-summoner/{_segment(puuid)}", "spectator",
                               allow_404=True)
 
     async def match_ids(self, platform, puuid, queue, count, start=0, start_time=None):
@@ -208,20 +213,20 @@ class Riot:
             params["queue"] = queue
         if start_time:
             params["startTime"] = int(start_time)  # epoch seconds
-        return await self.get(PLATFORMS[platform], f"/lol/match/v5/matches/by-puuid/{puuid}/ids", "match-ids", params)
+        return await self.get(PLATFORMS[platform], f"/lol/match/v5/matches/by-puuid/{_segment(puuid)}/ids", "match-ids", params)
 
     async def match(self, platform, match_id):
-        return await self.get(PLATFORMS[platform], f"/lol/match/v5/matches/{match_id}", "match")
+        return await self.get(PLATFORMS[platform], f"/lol/match/v5/matches/{_segment(match_id)}", "match")
 
     async def timeline(self, platform, match_id):
-        return await self.get(PLATFORMS[platform], f"/lol/match/v5/matches/{match_id}/timeline", "timeline",
+        return await self.get(PLATFORMS[platform], f"/lol/match/v5/matches/{_segment(match_id)}/timeline", "timeline",
                               allow_404=True)
 
     async def tier_players(self, platform, tier, division, page=1):
         """PUUIDs of players in a solo-queue tier/division. league-exp covers apex tiers too (division I)."""
         if tier in ("MASTER", "GRANDMASTER", "CHALLENGER"):
             division = "I"
-        entries = await self.get(platform, f"/lol/league-exp/v4/entries/RANKED_SOLO_5x5/{tier}/{division}",
+        entries = await self.get(platform, f"/lol/league-exp/v4/entries/RANKED_SOLO_5x5/{_segment(tier)}/{_segment(division)}",
                                  "league-exp", {"page": page})
         return [e["puuid"] for e in entries if e.get("puuid")]
 

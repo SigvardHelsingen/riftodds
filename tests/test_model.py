@@ -735,7 +735,8 @@ class TrainingJobTests(FixtureTests):
     def test_connection_path_and_small_memory_settings_do_not_mutate_store_default(self):
         original_path = store.DB_PATH
         with closing(model._training_connect(self.path)) as db:
-            self.assertEqual(Path(db.execute("PRAGMA database_list").fetchone()[2]), self.path)
+            # resolve(): on macOS the temp dir under /var is reported by SQLite as /private/var
+            self.assertEqual(Path(db.execute("PRAGMA database_list").fetchone()[2]).resolve(), self.path.resolve())
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
             self.assertEqual(db.execute("PRAGMA cache_size").fetchone()[0], -2048)
             self.assertEqual(db.execute("PRAGMA temp_store").fetchone()[0], 1)

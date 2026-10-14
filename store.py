@@ -277,10 +277,18 @@ def _save_bans(db, mid, info):
                            (mid, t["teamId"], b["pickTurn"], b["championId"]))
 
 
+DRAFT_QUEUES = (400, 420, 440, 700)  # Normal Draft, Ranked Solo/Flex, Clash: the only queues with bans
+
+
 def backfill_bans(db):
-    """Derive bans for matches cached before the bans table existed."""
+    """Derive bans for matches cached before the bans table existed.
+
+    Runs at every startup: blind-pick modes (Swiftplay, ARAM, Arena…) never have bans, so
+    re-decoding each of them on every restart would only grow with the match-history cache."""
+    marks = ",".join("?" * len(DRAFT_QUEUES))
     rows = db.execute(
-        "SELECT match_id, raw FROM matches WHERE match_id NOT IN (SELECT DISTINCT match_id FROM bans)")
+        f"""SELECT match_id, raw FROM matches WHERE queue_id IN ({marks})
+            AND match_id NOT IN (SELECT DISTINCT match_id FROM bans)""", DRAFT_QUEUES)
     for mid, raw in rows:
         _save_bans(db, mid, json.loads(zlib.decompress(raw))["info"])
     db.commit()
