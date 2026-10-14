@@ -6,3 +6,16 @@ dependencies = [
     "fastapi[standard]>=0.143.0",
     "httpx>=0.28.1",
 ]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Bugs, not style: pyflakes (undefined/unused names), syntax errors and bugbear.
+select = ["F", "E9", "B"]
+ignore = [
+    "B007",  # unused loop variables that document a tuple's shape
+    "B023",  # loop-local lambdas here are always called within the same iteration
+    "B904",  # translating RiotError into HTTPException relies on implicit exception chaining
+    "B905",  # zip() over rows that are equal length by construction
+]

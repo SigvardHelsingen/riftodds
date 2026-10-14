@@ -1,0 +1,65 @@
+# Fixture databases and mocked Riot/API responses only: no secrets, no Riot key, no network calls to Riot.
+# Actions are pinned to commits: when bumping one, update the hash and its version comment together.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Python tests and lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884  # v10.3.0
+        with:
+          python-version: "3.12"  # the oldest version pyproject.toml supports
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Lint (bug-finding rules only, see pyproject.toml)
+        run: uvx ruff@0.17.0 check --output-format=github .
+      - name: Unit tests
+        run: uv run --frozen python -m unittest discover -s tests
+
+  frontend:
+    name: Browser checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      PLAYWRIGHT_VERSION: 1.64.0  # keep in step with README.md
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: 24
+      - name: Syntax check
+        run: for f in static/*.js tests/*.cjs; do node --check "$f"; done
+      - name: Install Playwright and Chromium
+        # playwright pins playwright-core exactly, so the one exact version below fixes the whole tree
+        run: |  # zizmor: ignore[adhoc-packages]
+          npm install --prefix .browser-tools --no-save --package-lock=false "playwright@$PLAYWRIGHT_VERSION"
+          node .browser-tools/node_modules/playwright/cli.js install --with-deps chromium
+      - name: Phone, tablet and desktop checks
+        run: node tests/mobile.cjs
+        env:
+          NODE_PATH: .browser-tools/node_modules
+      - name: Insight panel checks
+        run: node tests/insights.cjs
+        env:
+          NODE_PATH: .browser-tools/node_modules

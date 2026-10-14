@@ -9,7 +9,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from itertools import combinations
-from statistics import NormalDist, median
+from statistics import NormalDist
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import store

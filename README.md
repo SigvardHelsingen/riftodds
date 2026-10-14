@@ -153,11 +153,12 @@ JavaScript and CSS assets together; content-hashed URLs cover both new insight a
 
 ```sh
 uv run python -m unittest discover -s tests
+uvx ruff@0.17.0 check .   # bug-finding rules only; see [tool.ruff] in pyproject.toml
 node --check static/app.js
 node --check static/insights.js
 ```
 
-Optional browser checks run against fully mocked responses at phone, tablet and desktop widths:
+Browser checks run against fully mocked responses at phone, tablet and desktop widths:
 
 ```sh
 npm install --prefix .browser-tools --no-save --package-lock=false playwright@1.64.0
@@ -169,3 +170,6 @@ NODE_PATH=.browser-tools/node_modules node tests/insights.cjs
 These checks use fixture cache/member databases and mocked API responses only. The suites cover
 schema/legacy transitions, malformed/undo/timestamp handling, bounded aggregation, temporal leakage,
 calibration, goal privacy, stale requests, explicit network actions, and mobile/keyboard interaction.
+
+[CI](.github/workflows/ci.yml) runs all of the above, browser checks included, on every push to `main` and
+every pull request. It needs no secrets or Riot key. When bumping Playwright, change it here and in the workflow.
