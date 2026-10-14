@@ -190,6 +190,12 @@ class Riot:
     async def mastery(self, platform, puuid):
         return await self.get(platform, f"/lol/champion-mastery/v4/champion-masteries/by-puuid/{puuid}", "mastery")
 
+    async def clash_team(self, platform, team_id):
+        return await self.get(platform, f"/lol/clash/v1/teams/{quote(str(team_id), safe='')}", "clash-team")
+
+    async def clash_players(self, platform, puuid):
+        return await self.get(platform, f"/lol/clash/v1/players/by-puuid/{quote(puuid, safe='')}", "clash-players")
+
     async def active_game(self, platform, puuid):
         """The live game the player is in, or None."""
         return await self.get(platform, f"/lol/spectator/v5/active-games/by-summoner/{puuid}", "spectator",

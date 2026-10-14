@@ -77,17 +77,19 @@ def match_fixture(mid, puuid="fixture-player"):
 
 
 def timeline_fixture(match):
-    people = match["info"]["participants"]
+    info = match["info"]
+    people = [(p.get("participantId", i + 1), p) for i, p in enumerate(info["participants"])]
     return {
-        "metadata": {"participants": [p["puuid"] for p in people]},
+        "metadata": {"matchId": match["metadata"]["matchId"], "participants": [p["puuid"] for _, p in people]},
         "info": {
-            "participants": [{"participantId": i + 1, "puuid": p["puuid"]}
-                             for i, p in enumerate(people)],
-            "frames": [{"participantFrames": {
-                str(i + 1): {"totalGold": 7000 if i < 5 else 6000, "xp": 1000,
-                             "minionsKilled": 80, "jungleMinionsKilled": 20}
-                for i in range(10)
-            }} for _ in range(16)],
+            "mapId": info.get("mapId", 11), "gameMode": info.get("gameMode", "CLASSIC"), "queueId": info["queueId"],
+            "participants": [{"participantId": pid, "puuid": p["puuid"], "teamId": p["teamId"]}
+                             for pid, p in people],
+            "frames": [{"timestamp": minute * 60000, "events": [], "participantFrames": {
+                str(pid): {"totalGold": 7000 if p["teamId"] == 100 else 6000, "xp": 1000,
+                           "minionsKilled": 80, "jungleMinionsKilled": 20}
+                for pid, p in people
+            }} for minute in range(16)],
         },
     }
 

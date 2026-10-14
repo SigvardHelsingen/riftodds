@@ -175,6 +175,8 @@ async function route() {
     top.outerHTML = searchForm("compact").replace("<form", '<form id="top-search"');
     bindSearch($("#top-search"));
     showPlayer(m[1], decodeURIComponent(m[2]), m[3] || META.default_range);
+  } else if (location.hash === "#/odds") {
+    showOdds();
   } else if (location.hash === "#/admin") {
     showAdmin();
   } else {
@@ -187,7 +189,7 @@ async function route() {
 async function showLanding() {
   $("#app").innerHTML = `
     <section class="hero">
-      <div class="hero-top"><span class="stamp" id="hero-stamp">Ranked solo</span><span>Ranked solo queue · probabilities, not tier lists</span></div>
+      <div class="hero-top"><span class="stamp" id="hero-stamp">Ranked solo</span><span>Ranked solo queue · probabilities, not tier lists · <a href="#/odds">How the odds work</a></span></div>
       <h1>What are<br>the <em>odds?</em></h1>
       <div class="side">
         <p class="lede">Look up a player to see how they pick, tilt and win. Or read the board below: what decides games on this patch.</p>
@@ -525,7 +527,8 @@ async function refreshAnalysis() {
   const data = await api(`/api/player/${DATA.puuid}/analysis?range=${view.player.range}&${tzQuery()}`);
   if (token !== nav) return;
   DATA = { ...data, live: DATA.live };  // the live flag only comes with the full lookup
-  renderPlayer();
+  view.player.picks = null;
+  renderPlayer({ preserveTab: true });
 }
 
 function renderSync() {
@@ -575,7 +578,10 @@ function rangeOptions(kind) {
     .map((r) => `<option value="${r.key}" ${r.key === view.player.range ? "selected" : ""}>${esc(r.label)}</option>`).join("");
 }
 
-function renderPlayer() {
+function renderPlayer({ preserveTab = false } = {}) {
+  const savedTab = preserveTab ? $("#tab-body") : null;
+  const savedKind = $(".tabs .active")?.dataset.tab;
+  const focused = savedTab?.contains(document.activeElement) ? document.activeElement : null;
   const p = DATA.profile;
   const isMe = ME?.account?.puuid === DATA.puuid;
   const rankText = p.tier === "UNRANKED" ? "<b>Unranked</b>" : `<b>${title(p.tier)} ${p.division}</b> · ${p.lp} LP`;
@@ -647,7 +653,7 @@ function renderPlayer() {
   }
   const tabs = [...(DATA.live ? [["live", "Live game"]] : []),
     ...(o ? [["champions", "Champions"], ["picks", "Suggested picks"]] : []), ["matches", "Matches"],
-    ...(o ? [["draft", "Draft"], ["habits", "Habits"], ["wincons", "Win conditions"]] : [])];
+    ...(o ? [["draft", "Draft"], ["habits", "Coaching & habits"], ["wincons", "Win conditions"]] : [])];
   if (!tabs.some(([tab]) => tab === view.player.tab)) view.player.tab = o ? "champions" : "matches";
   $("#player-body").innerHTML = `${summary}
     <nav class="tabs" aria-label="Player statistics">${tabs.map(([v, l]) => `<button data-tab="${v}" aria-pressed="${view.player.tab === v}" class="${view.player.tab === v ? "active" : ""}">${l}</button>`).join("")}</nav>
@@ -661,7 +667,21 @@ function renderPlayer() {
     renderTab();
   }));
   renderTrend();
-  renderTab();
+  if (savedTab && savedKind === view.player.tab && ["draft", "habits", "live"].includes(savedKind)
+        && (savedKind !== "draft" || DATA.overview.roles.some((r) => r.role !== "UNKNOWN"))) {
+    $("#tab-body").replaceWith(savedTab);
+    focused?.focus({ preventScroll: true });
+    if (view.player.tab === "habits") {
+      renderHabitTables();
+      loadCoaching($("#coaching-insights"));
+    }
+    if (view.player.tab === "draft") {
+      const changedRole = renderDraftRoles();
+      $("#draft-pockets").innerHTML = draftPocketsHtml();
+      changedRole ? fillOpponents() : updatePick();
+      loadDraftInsights($("#draft-insights"));
+    }
+  } else renderTab();
 }
 
 function renderTab() {
@@ -722,13 +742,9 @@ function tabDraft() {
   if (!roles.length) { $("#tab-body").innerHTML = `<div class="card empty">No games with a known role.</div>`; return; }
   view.player.role = view.player.role && roles.some((r) => r.role === view.player.role) ? view.player.role : roles[0].role;
   $("#tab-body").innerHTML = `
-    <div class="roles">${roles.map((r) => `<button class="role-card ${r.role === view.player.role ? "active" : ""}" data-role="${r.role}">
-      <div class="top"><span class="rname">${ROLE_NAMES[r.role]}</span><span class="share">${pct(r.share)}</span></div>
-      <div class="meta">${r.games} games · ${pct(r.wr)} WR · plays like ${r.pool.effective_pool.toFixed(1)} champs</div>
-      <div class="icons">${r.pool.top.map((t) => icon(t.champion_id)).join("")}</div></button>`).join("")}</div>
+    <div class="roles" id="draft-roles"></div>
     <div class="card">
-      <div class="card-head"><div><h2>Pick predictor</h2><p>What will they pick in ${ROLE_NAMES[view.player.role]}? Choose a lane opponent to condition on the matchup.
-        Select a champion to see its most successful build.</p></div></div>
+      <div class="card-head"><div><h2>Pick predictor</h2><p id="pick-role-description"></p></div></div>
       <div class="controls">
         <label for="pick-opp">Lane opponent</label><select id="pick-opp"><option value="">Any opponent</option></select>
         <label for="pick-alpha" title="How strongly to lean on the overall role picks when there are few games vs this opponent">Smoothing <span style="text-transform:none">α</span></label>
@@ -736,15 +752,56 @@ function tabDraft() {
       </div>
       <div id="pick-out"><div class="loading"><div class="spinner"></div></div></div>
     </div>
-    ${DATA.mastery.pockets.length ? `<div class="card section">
-      <div class="card-head"><div><h2>Pocket picks</h2><p>High mastery, but not played in this range. Not in the predictor above — but they know these.</p></div></div>
-      <div class="pockets">${DATA.mastery.pockets.map((m) => `<div class="pocket">${icon(m.champion_id)}<div><b>${esc(champ(m.champion_id).name)}</b>
-        <div class="muted small">${kpts(m.points)} pts · M${m.level} · last played ${day(m.last_play)}</div></div></div>`).join("")}</div>
-    </div>` : ""}`;
-  $$(".role-card").forEach((b) => b.addEventListener("click", () => { view.player.role = b.dataset.role; view.player.opp = ""; view.player.builds.clear(); tabDraft(); }));
-  $("#pick-opp").addEventListener("change", (e) => { view.player.opp = e.target.value; updatePick(); });
+    <div id="draft-insights" class="section"></div>
+    <div id="draft-pockets">${draftPocketsHtml()}</div>`;
+  renderDraftRoles();
+  $("#pick-opp").addEventListener("change", (e) => {
+      view.player.opp = e.target.value;
+      updatePick();
+      loadDraftInsights($("#draft-insights"));
+    });
   $("#pick-alpha").addEventListener("change", (e) => { view.player.alpha = e.target.value; updatePick(); });
   fillOpponents();
+  loadDraftInsights($("#draft-insights"));
+}
+
+function renderDraftRoles() {
+  const el = $("#draft-roles");
+  if (!el) return false;
+  const roles = DATA.overview.roles.filter((r) => r.role !== "UNKNOWN");
+  const focusedRole = document.activeElement?.closest("#draft-roles .role-card")?.dataset.role;
+  const changed = !roles.some((r) => r.role === view.player.role);
+  if (changed) {
+    view.player.role = roles[0]?.role;
+    view.player.opp = "";
+    view.player.builds.clear();
+    $("#pick-opp").value = "";
+  }
+  el.innerHTML = roles.map((r) => `<button class="role-card ${r.role === view.player.role ? "active" : ""}" data-role="${r.role}" aria-pressed="${r.role === view.player.role}">
+    <div class="top"><span class="rname">${ROLE_NAMES[r.role]}</span><span class="share">${pct(r.share)}</span></div>
+    <div class="meta">${r.games} games · ${pct(r.wr)} WR · plays like ${r.pool.effective_pool.toFixed(1)} champs</div>
+    <div class="icons">${r.pool.top.map((t) => icon(t.champion_id)).join("")}</div></button>`).join("");
+  $("#pick-role-description").textContent = `What will they pick in ${ROLE_NAMES[view.player.role]}? Choose a lane opponent to condition on the matchup. Select a champion to see its most successful build.`;
+  $$(".role-card", el).forEach((b) => b.addEventListener("click", () => {
+    if (b.dataset.role === view.player.role) return;
+    view.player.role = b.dataset.role;
+    view.player.opp = "";
+    view.player.builds.clear();
+    $("#pick-opp").value = "";
+    renderDraftRoles();
+    fillOpponents();
+    loadDraftInsights($("#draft-insights"));
+  }));
+  if (focusedRole) $(`[data-role="${focusedRole}"]`, el)?.focus({ preventScroll: true });
+  return changed;
+}
+
+function draftPocketsHtml() {
+  return DATA.mastery.pockets.length ? `<div class="card section">
+    <div class="card-head"><div><h2>Pocket picks</h2><p>High mastery, but not played in this range. Not in the predictor above — but they know these.</p></div></div>
+    <div class="pockets">${DATA.mastery.pockets.map((m) => `<div class="pocket">${icon(m.champion_id)}<div><b>${esc(champ(m.champion_id).name)}</b>
+      <div class="muted small">${kpts(m.points)} pts · M${m.level} · last played ${day(m.last_play)}</div></div></div>`).join("")}</div>
+    </div>` : "";
 }
 
 function fetchPick() {
@@ -823,10 +880,17 @@ function wrTable(head, rows) {
 }
 
 function tabHabits() {
+  $("#tab-body").innerHTML = `<div id="coaching-insights"></div>
+    <details class="insight-details section"><summary>Session habits and win-rate patterns</summary><div class="insight-detail-body" id="habit-tables"></div></details>`;
+  renderHabitTables();
+  loadCoaching($("#coaching-insights"));
+}
+
+function renderHabitTables() {
   const o = DATA.overview;
   const m = o.momentum;
   const card = (h, sub, body) => `<div class="card"><div class="card-head"><div><h2>${h}</h2><p>${sub}</p></div></div>${body}</div>`;
-  $("#tab-body").innerHTML = `${WR_LEGEND()}
+  $("#habit-tables").innerHTML = `${WR_LEGEND()}
     <div class="grid-2">
       ${card("After the last game", "Next-game win rate within a session (games under 30 min apart).",
         wrTable("Previous game", [["After a win", m.after_win], ["After a loss", m.after_loss], ["After 2 losses in a row", m.after_2_losses]]) +
@@ -836,6 +900,7 @@ function tabHabits() {
       ${card("Time of day", "Your local time when the game started.", wrTable("Time", o.time_of_day.map((w) => [w.label, w])))}
       ${card("Game length", "Early finishers or late-game closers?", wrTable("Length", o.duration.map((w) => [w.label, w])))}
     </div>`;
+  prepareTables($("#habit-tables"));
 }
 
 function tabWincons() {
@@ -1374,7 +1439,267 @@ async function renderTrendGame(swap = false) {
       ${t.players.map((p) => `<a href="${playerHash(m.platform, p.riot_id, view.player.range)}" class="${p.puuid === DATA.puuid ? "me" : ""}"
         title="${esc(`${p.riot_id} · ${champ(p.champion_id).name} · ${p.kills}/${p.deaths}/${p.assists}`)}"
         aria-label="${esc(`${p.riot_id}, ${champ(p.champion_id).name}, ${p.kills}/${p.deaths}/${p.assists}`)}"><img src="${champ(p.champion_id).icon}" alt=""></a>`).join("")}</div>`).join("")}
-    <p class="muted small tg-foot">${[m.queue && esc(m.queue), m.patch && `Patch ${patchName(m.patch)}`].filter(Boolean).join(" · ")}</p>`;
+    <p class="muted small tg-foot">${[m.queue && esc(m.queue), m.patch && `Patch ${patchName(m.patch)}`].filter(Boolean).join(" · ")}</p>
+    ${storySection(mid)}`;
+  loadStory($(".story", more), { compact: true });
+}
+
+// ---------------------------------------------------------------- game story (from the match timeline)
+const storyCache = new Map();  // bounded, short-lived: timelines and validated models can arrive later
+function matchStory(mid, puuid, current) {
+  const key = `${mid}|${puuid}`;
+  const cached = storyCache.get(key);
+  if (cached && Date.now() - cached.at < 60000) return cached.promise;
+  const promise = api(`/api/match/${encodeURIComponent(mid)}/story?puuid=${encodeURIComponent(puuid)}`, undefined, current)
+    .catch((e) => { storyCache.delete(key); return { error: e.message }; });
+  storyCache.delete(key);
+  storyCache.set(key, { at: Date.now(), promise });
+  while (storyCache.size > 64) storyCache.delete(storyCache.keys().next().value);
+  return promise;
+}
+const storyResize = new ResizeObserver((entries) => entries.forEach(({ target }) => {
+  if (!target.isConnected) { storyResize.unobserve(target); return; }
+  if (target.clientWidth !== +target.dataset.w) target.redraw?.();
+}));
+const clock = (t) => mmss(t);
+const signedK = (n) => (n == null ? "–" : `${n > 0 ? "+" : n < 0 ? "−" : "±"}${Math.abs(n) >= 1000 ? `${(Math.abs(n) / 1000).toFixed(1)}k` : Math.abs(Math.round(n))}`);
+const SKILL_KEYS = "QWER";
+const storyPlayer = (s, pid) => s.players.find((p) => p.participant_id === pid);
+const storyChamp = (s, pid) => (pid ? champ(storyPlayer(s, pid)?.champion_id).name : "a turret or minion");
+// what happened in one event, in words (used by tooltips, the swing sentence and the table)
+function eventText(s, e) {
+  if (e.kind === "execution") return `${storyChamp(s, e.victim)} was executed`;
+  if (e.kind === "kill") return `${storyChamp(s, e.killer)} killed ${storyChamp(s, e.victim)}`;
+  return `${e.side === "us" ? "You" : "They"} took ${e.label.toLowerCase().startsWith("voidgrub") ? e.label.toLowerCase() : `the ${e.label.toLowerCase()}`}`;
+}
+function swingText(s) {
+  const t = s.turning;
+  if (!t) return "";
+  const kills = t.events.filter((e) => e.kind === "kill");
+  const ours = kills.filter((e) => e.side === "us").length;
+  const parts = t.events.filter((e) => e.kind !== "kill").map((e) => eventText(s, e));
+  if (kills.length) parts.push(`${kills.length === 1 ? "a kill" : `${kills.length} kills`}${kills.length > 1 ? ` (${ours}–${kills.length - ours})` : ""}`);
+  const what = parts.length ? parts.join(", ") : "no tracked fights or objectives in this interval";
+  return `<b>The biggest estimated swing</b> came around ${clock(t.minute * 60)} — ${esc(what)}. Estimated win chance moved from <b>${pct(t.from)}</b> to <b>${pct(t.to)}</b>. This describes the interval, not which event caused the change.`;
+}
+
+function storySection(mid) {
+  return `<section class="story" data-story="${esc(mid)}" aria-label="How the game went"><div class="loading"><div class="spinner"></div></div></section>`;
+}
+
+async function loadStory(el, { compact = false } = {}) {
+  const mid = el.dataset.story;
+  const puuid = DATA.puuid;
+  const token = nav;
+  const current = () => token === nav && ME && el.isConnected && el.dataset.story === mid && DATA?.puuid === puuid;
+  const s = await matchStory(mid, puuid, current);
+  if (!current()) return;
+  if (s.error || !s.available) {
+    el.innerHTML = `<p class="${s.error ? "error" : "muted"} small">${esc(s.error || s.reason || "No game story cached yet.")}</p>
+      ${s.error || s.can_fetch ? `<button class="btn ghost story-fetch">${s.error ? "Retry story" : "Load game story · 1 Riot request"}</button><p class="small" role="status" aria-live="polite"></p>` : ""}`;
+    $(".story-fetch", el)?.addEventListener("click", async (e) => {
+      e.currentTarget.disabled = true;
+      try {
+        if (!s.error) await postJSON(`/api/match/${encodeURIComponent(mid)}/timeline`, {}, current);
+        if (!current()) return;
+        storyCache.delete(`${mid}|${puuid}`);
+        await loadStory(el, { compact });
+      } catch (error) {
+        if (current()) {
+          $("[role=status]", el).textContent = error.message;
+          $(".story-fetch", el).disabled = false;
+        }
+      }
+    });
+    return;
+  }
+  const hasChance = s.minutes.some((m) => m.chance != null);
+  const me = s.me ? storyPlayer(s, s.me) : null;
+  el.innerHTML = `
+    <div class="story-head"><b>${hasChance ? "Your win chance, minute by minute" : "Your team's gold lead, minute by minute"}</b>
+      <button class="btn ghost story-toggle" aria-pressed="false">Show table</button></div>
+    ${hasChance && s.turning ? `<p class="story-swing">${swingText(s)}</p>` : ""}
+    ${hasChance ? "" : `<p class="muted small story-note">${esc(s.odds_reason || "Win chances appear only after a model passes its held-out evaluation.")} <a href="#/odds">How the odds work</a></p>`}
+    <div class="story-grid ${compact ? "compact" : ""}">
+      <div><div class="story-plot"></div>${compact ? "" : `<p class="muted small">Events: dots are kills, diamonds are objectives, triangles are buildings. Rows show which team took them; grey dots are executions.</p>`}</div>
+      ${me && !compact ? `<figure class="story-map"><div class="map-box"></div>
+        <figcaption>${legend([["", "background:var(--pos)", "Your kills"], ["ring", "", "Your deaths"]])}<span class="muted small">Your base is bottom-left.</span></figcaption></figure>` : ""}
+    </div>
+    ${me && !compact ? storyBuild(s, me) : ""}
+    ${hasChance ? `<p class="muted small story-note">Retrospective estimates, not predictions recorded during this game. No causal attribution or betting use. <a href="#/odds">Held-out accuracy and reliability</a></p>` : ""}`;
+  const plot = $(".story-plot", el);
+  drawStory(plot, s, compact);
+  plot.redraw = () => drawStory(plot, s, compact);
+  storyResize.observe(plot);
+  if (me && !compact) {
+    const flip = (p) => (s.team === 200 ? { ...p, x: 15000 - p.x, y: 15000 - p.y } : p);
+    $(".map-box", el).innerHTML = mapSvg([
+      ...(s.kills || []).map((e) => ({ ...flip(e), kind: "kill", tip: `${clock(e.t)} · you killed ${storyChamp(s, e.victim)}` })),
+      ...(s.deaths || []).map((e) => ({ ...flip(e), kind: "death", tip: `${clock(e.t)} · killed by ${storyChamp(s, e.killer)}` })),
+    ]);
+  }
+  $(".story-toggle", el)?.addEventListener("click", (e) => {
+    const table = e.currentTarget.getAttribute("aria-pressed") !== "true";
+    e.currentTarget.setAttribute("aria-pressed", table);
+    e.currentTarget.textContent = table ? "Show chart" : "Show table";
+    plot.dataset.table = table ? "1" : "";
+    drawStory(plot, s, compact);
+  });
+}
+
+function storyBuild(s, me) {
+  const skills = s.skills || "";
+  const order = skills.length >= 9 ? skillLetters(skills) : "";
+  const completeMaxes = [1, 2, 3].every((c) => [...skills].filter((v) => +v === c).length === 5);
+  if (!s.build.length && !s.start.length && !skills) return "";
+  return `<div class="story-build">
+    ${s.first_shop != null ? `<div class="build-line"><span class="build-label">First shop</span><span class="small">${clock(s.first_shop)} · first later purchase, not necessarily first recall</span></div>` : ""}
+    ${s.start.length ? `<div class="build-line"><span class="build-label">Start</span><span class="build-icons">${s.start.map(([, id]) => itemImg(id)).join("")}</span></div>` : ""}
+    ${s.build.length ? `<div class="build-line"><span class="build-label">Build</span><span class="build-icons build-steps">${s.build.map(([t, id]) =>
+      `<span class="build-step">${itemImg(id)}<small>${Math.round(t / 60)} min</small></span>`).join('<span class="build-arrow" aria-hidden="true">›</span>')}</span></div>` : ""}
+    ${skills ? `<div class="build-line"><span class="build-label">Skills</span>${order ? `<span>${skillOrder(order)}<small class="muted">${completeMaxes ? "Observed max order" : "Partial ability priority"}</small></span>` : ""}
+      <span class="skill-seq" title="Every ability point, in order">${[...skills].map((c) => `<span class="${c === "4" ? "ult" : ""}">${SKILL_KEYS[c - 1]}</span>`).join("")}</span></div>` : ""}
+  </div>`;
+}
+// "QEW": the order abilities were maxed (the server does this for builds; one game's skills here)
+function skillLetters(skills) {
+  const points = { 1: 0, 2: 0, 3: 0 };
+  const maxed = [];
+  for (const c of skills) if (c in points && ++points[c] === 5) maxed.push(c);
+  const rest = ["1", "2", "3"].filter((c) => !maxed.includes(c)).sort((a, b) => points[b] - points[a] || skills.indexOf(a) - skills.indexOf(b));
+  return [...maxed, ...rest].map((c) => SKILL_KEYS[c - 1]).join("");
+}
+const skillOrder = (letters) => `<span class="skill-order" aria-label="Max order ${[...letters].join(", then ")}">${[...letters].map((l) => `<kbd>${l}</kbd>`).join('<span aria-hidden="true">›</span>')}</span>`;
+
+function drawStory(plot, s, compact) {
+  const hasChance = s.minutes.some((m) => m.chance != null);
+  const value = (m) => (hasChance ? m.chance : m.gold);
+  const pts = s.minutes.filter((m) => value(m) != null);
+  if (plot.dataset.table) return storyTable(plot, s, hasChance);
+  if (!pts.length) { plot.innerHTML = `<p class="muted small">No complete minute snapshots for this game yet.</p>`; plot.dataset.w = plot.clientWidth; return; }
+  const refocus = plot.contains(document.activeElement);
+  const W = plot.clientWidth || 600;
+  const H = compact ? 150 : matchMedia("(max-width: 640px)").matches ? 190 : 220;
+  const m = { l: compact ? 38 : 46, r: 10, t: 8, b: compact ? 44 : 58 };  // the bottom band: event rows, then minutes
+  const iw = W - m.l - m.r;
+  const ih = H - m.t - m.b;
+  const end = Math.max(1, s.minutes.at(-1).m);
+  const x = (minute) => m.l + (minute / end) * iw;
+  let lo = 0, hi = 1;
+  if (!hasChance) {
+    const top = Math.max(1000, ...pts.map((p) => Math.abs(p.gold)));
+    const t = niceTicks(-top, top);
+    [lo, hi] = [t[0], t.at(-1)];
+  }
+  const y = (v) => m.t + ih - ((v - lo) / (hi - lo)) * ih;
+  const ticks = hasChance ? [0, 0.25, 0.5, 0.75, 1] : niceTicks(lo, hi);
+  const fmt = hasChance ? (v) => pct(v) : (v) => signedK(v);
+  const rows = { us: m.t + ih + 13, them: m.t + ih + 26 };
+  const swing = s.turning;
+  const marks = s.events.map((e) => {
+    const cx = x(e.t / 60);
+    const cy = rows[e.side] ?? (rows.us + rows.them) / 2;
+    if (e.kind === "kill" || e.kind === "execution") return `<circle class="ev ev-kill ${e.side}" cx="${cx}" cy="${cy}" r="2.5"/>`;
+    if (e.kind === "building") return `<path class="ev ev-building ${e.side}" d="M${cx - 4},${cy + 3.5}L${cx},${cy - 4}L${cx + 4},${cy + 3.5}Z"/>`;
+    return `<rect class="ev ev-monster ${e.side}" x="${cx - 3.5}" y="${cy - 3.5}" width="7" height="7" transform="rotate(45 ${cx} ${cy})"/>`;
+  }).join("");
+  const minuteTicks = niceTicks(0, end, W < 420 ? 3 : 6).filter((t) => t >= 0 && t <= end);
+  plot.dataset.w = W;
+  plot.innerHTML = `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" aria-hidden="true">
+      ${swing && hasChance ? `<rect class="sel-band" x="${x(swing.minute - 1)}" y="${m.t}" width="${Math.max(4, x(swing.minute) - x(swing.minute - 1))}" height="${ih}"/>` : ""}
+      ${ticks.map((v) => `<line class="${v === (hasChance ? 0.5 : 0) ? "zero" : "grid"}" x1="${m.l}" x2="${W - m.r}" y1="${y(v)}" y2="${y(v)}"/>
+        <text x="${m.l - 6}" y="${y(v)}" text-anchor="end" dominant-baseline="middle">${fmt(v)}</text>`).join("")}
+      <text x="${m.l - 6}" y="${rows.us}" text-anchor="end" dominant-baseline="middle">You</text>
+      <text x="${m.l - 6}" y="${rows.them}" text-anchor="end" dominant-baseline="middle">Them</text>
+      ${marks}
+      ${minuteTicks.map((t) => `<text x="${x(t)}" y="${H - 4}" text-anchor="middle">${t}′</text>`).join("")}
+      <path class="avg" d="${pts.map((p, i) => `${i ? "L" : "M"}${x(p.m).toFixed(1)},${y(value(p)).toFixed(1)}`).join("")}"/>
+      <line class="cross" x1="0" x2="0" y1="${m.t}" y2="${m.t + ih}" visibility="hidden"/>
+      <circle class="focus-dot" r="5" visibility="hidden"/>
+    </svg>
+    <div class="story-hit" tabindex="0" role="slider" aria-label="${hasChance ? "Win chance" : "Gold lead"} by minute — arrow keys move between minutes"
+      aria-valuemin="0" aria-valuemax="${pts.length - 1}" style="left:${m.l}px;top:${m.t}px;width:${iw}px;height:${ih + 32}px"></div>
+    <div class="trend-tip" hidden aria-live="polite"></div>`;
+  const hit = $(".story-hit", plot);
+  const tip = $(".trend-tip", plot);
+  const cross = $(".cross", plot);
+  const ring = $(".focus-dot", plot);
+  let at = null;
+  const show = (i) => {
+    at = Math.max(0, Math.min(pts.length - 1, i));
+    const p = pts[at];
+    const prev = pts[at - 1];
+    cross.setAttribute("x1", x(p.m)); cross.setAttribute("x2", x(p.m)); cross.setAttribute("visibility", "visible");
+    ring.setAttribute("cx", x(p.m)); ring.setAttribute("cy", y(value(p))); ring.setAttribute("visibility", "visible");
+    const head = document.createElement("b");
+    head.textContent = p.final && hasChance ? (p.chance === 1 ? "Victory" : "Defeat") : hasChance ? `${pct(p.chance)} win chance` : `${signedK(p.gold)} gold`;
+    const lines = [head];
+    const add = (text, cls = "") => { const d = document.createElement("div"); d.textContent = text; if (cls) d.className = cls; lines.push(d); };
+    if (!p.final) add(`${hasChance ? `Gold ${signedK(p.gold)} · ` : ""}kills ${p.kills[0]}–${p.kills[1]}`);
+    const happened = s.events.filter((e) => e.t > (prev ? prev.m * 60 : -1) && e.t <= p.m * 60);
+    happened.slice(0, 4).forEach((e) => add(`${clock(e.t)} ${eventText(s, e)}`));
+    if (happened.length > 4) add(`and ${happened.length - 4} more`, "muted");
+    add(clock(p.m * 60), "muted");
+    tip.replaceChildren(...lines);
+    tip.hidden = false;
+    const left = x(p.m) + 14;
+    tip.style.left = `${left + tip.offsetWidth > W ? Math.max(0, x(p.m) - 14 - tip.offsetWidth) : left}px`;
+    tip.style.top = `${m.t}px`;
+    hit.setAttribute("aria-valuenow", at);
+    hit.setAttribute("aria-valuetext", lines.map((l) => l.textContent).join(", "));
+  };
+  const hide = () => { at = null; tip.hidden = true; cross.setAttribute("visibility", "hidden"); ring.setAttribute("visibility", "hidden"); };
+  const nearest = (px) => pts.reduce((best, p, i) => (Math.abs(x(p.m) - px) < Math.abs(x(pts[best].m) - px) ? i : best), 0);
+  const pick = (e) => show(nearest(e.clientX - hit.getBoundingClientRect().left + m.l));
+  hit.addEventListener("pointermove", pick);
+  hit.addEventListener("pointerdown", pick);
+  hit.addEventListener("pointerleave", hide);
+  hit.addEventListener("focus", () => show(at ?? (swing ? pts.findIndex((p) => p.m === swing.minute) : pts.length - 1)));
+  hit.addEventListener("blur", hide);
+  hit.addEventListener("keydown", (e) => {
+    const step = { ArrowLeft: -1, ArrowDown: -1, ArrowRight: 1, ArrowUp: 1, PageDown: -5, PageUp: 5 }[e.key];
+    if (step) show((at ?? pts.length - 1) + step);
+    else if (e.key === "Home") show(0);
+    else if (e.key === "End") show(pts.length - 1);
+    else if (e.key === "Escape") hide();
+    else return;
+    e.preventDefault();
+  });
+  if (refocus) hit.focus({ preventScroll: true });
+}
+
+// the chart's table twin: every minute without hovering
+function storyTable(plot, s, hasChance) {
+  plot.dataset.w = plot.clientWidth;
+  const rows = s.minutes;
+  plot.innerHTML = `<table class="trend-table"><thead><tr><th>Minute</th>${hasChance ? '<th class="num">Win chance</th>' : ""}
+      <th class="num">Gold</th><th class="num">Kills</th><th>What happened</th></tr></thead>
+    <tbody>${rows.map((m, i) => {
+      const happened = s.events.filter((e) => e.t > (i ? rows[i - 1].m * 60 : -1) && e.t <= m.m * 60);
+      return `<tr class="${s.turning?.minute === m.m ? "me" : ""}"><td class="num">${clock(m.m * 60)}${m.final ? " · result" : ""}</td>${hasChance ? `<td class="num">${pct(m.chance)}</td>` : ""}
+        <td class="num">${signedK(m.gold)}</td><td class="num">${m.kills[0]}–${m.kills[1]}</td>
+        <td class="small">${happened.map((e) => esc(eventText(s, e))).join(" · ") || '<span class="muted">–</span>'}</td></tr>`;
+    }).join("")}</tbody></table>`;
+  prepareTables(plot);
+}
+
+// a schematic Summoner's Rift: the player's base bottom-left; points in map units (0–15000)
+function mapSvg(points, { size = 220 } = {}) {
+  const k = size / 15000;
+  const X = (v) => (v * k).toFixed(1);
+  const Y = (v) => (size - v * k).toFixed(1);
+  const lane = (pts) => `M${pts.map(([a, b]) => `${X(a)},${Y(b)}`).join("L")}`;
+  return `<svg class="rift-map" viewBox="0 0 ${size} ${size}" role="img" aria-label="Map of Summoner's Rift with ${points.length} marked event${points.length === 1 ? "" : "s"}">
+    <rect class="map-ground" x="0" y="0" width="${size}" height="${size}" rx="8"/>
+    <path class="map-river" d="${lane([[1800, 13000], [13000, 1800]])}"/>
+    <path class="map-lane" d="${lane([[1300, 4000], [1300, 13700], [11000, 13700]])}"/>
+    <path class="map-lane" d="${lane([[4000, 1300], [13700, 1300], [13700, 11000]])}"/>
+    <path class="map-lane" d="${lane([[3600, 3600], [11400, 11400]])}"/>
+    <path class="map-base mine" d="M0,${Y(0)}L0,${Y(4600)}A${(4600 * k).toFixed(1)},${(4600 * k).toFixed(1)} 0 0 0 ${X(4600)},${Y(0)}Z"/>
+    <path class="map-base theirs" d="M${size},0L${size},${(4600 * k).toFixed(1)}A${(4600 * k).toFixed(1)},${(4600 * k).toFixed(1)} 0 0 1 ${X(10400)},0Z"/>
+    ${points.filter((p) => p.x != null && p.y != null).map((p) => `<g class="map-pt ${p.kind}" tabindex="0" aria-label="${esc(p.tip || "")}"><title>${esc(p.tip || "")}</title>
+      <circle class="hit" cx="${X(p.x)}" cy="${Y(p.y)}" r="12"/><circle class="mark" cx="${X(p.x)}" cy="${Y(p.y)}" r="4"/></g>`).join("")}
+  </svg>`;
 }
 
 // ---------------------------------------------------------------- builds & suggested picks
@@ -1385,7 +1710,7 @@ const itemImg = (id) => {
 const runeImg = (id) => (META.runes?.[id]
   ? `<img src="${META.runes[id].icon}" alt="${esc(META.runes[id].name)}" title="${esc(META.runes[id].name)}" loading="lazy">` : "");
 const buildWr = (o) => `<span class="build-wr" title="${esc(wrTip(o))}"><b>${pct(o.wr)}</b> win rate · ${o.games} game${o.games === 1 ? "" : "s"}</span>`;
-const BUILD_NOTE = "Core items are three finished items from the same game, most built first (Riot's match data has no purchase order).";
+const BUILD_NOTE = "With timelines, purchase order and typical completion times are shown. Otherwise core items come from final inventories, not purchase order. Item win rates are associations, not proof an item causes wins.";
 
 function buildHtml(b) {
   if (!b?.games) return `<p class="muted small">No build data for this champion on this patch yet.</p>`;
@@ -1393,8 +1718,16 @@ function buildHtml(b) {
     `<div class="build-line"><span class="build-label">${label}</span><span class="build-icons">${icons}</span>${name}${buildWr(o)}</div>`;
   const [core, ...alternatives] = b.core;
   const rune = b.runes[0];
+  const order = b.order;
+  const ordered = order?.core?.[0];
+  const skill = order?.skills?.[0];
   return `<div class="build">
-    ${core ? line("Core items", core.items.map(itemImg).join(""), core) : ""}
+    ${ordered ? line("Buy order", ordered.items.map((id, i) => `<span class="build-step">${itemImg(id)}<small>${ordered.minutes[i] == null ? "Time unavailable" : `${ordered.minutes[i]} min`}</small></span>`).join('<span class="build-arrow" aria-hidden="true">›</span>'), ordered)
+      : core ? line("Core items", core.items.map(itemImg).join(""), core) : ""}
+    ${!ordered && order?.first?.[0] ? line("First item", itemImg(order.first[0].item), order.first[0], `<span class="small">Typically ${order.first[0].minute ?? "–"} min</span>`) : ""}
+    ${order?.start?.[0] ? line("Start", order.start[0].items.map(itemImg).join(""), order.start[0]) : ""}
+    ${order?.first_shop ? `<div class="build-line"><span class="build-label">First shop</span><span class="small">${order.first_shop.minute == null ? "Timing unavailable" : `Typically ${order.first_shop.minute} min`} · ${order.first_shop.games} timeline games. ${esc(order.first_shop.label)}</span></div>` : ""}
+    ${skill ? line("Skills", skillOrder(skill.order), skill, `<span class="small">${esc(skill.label || "Partial ability priority")}${skill.first ? ` · first three: ${esc(skill.first)}` : ""}</span>`) : ""}
     ${b.boots[0] ? line("Boots", itemImg(b.boots[0].item), b.boots[0]) : ""}
     ${b.support?.[0] ? line("Support item", itemImg(b.support[0].item), b.support[0]) : ""}
     ${rune ? line("Runes", runeImg(rune.keystone) + runeImg(rune.primary) + runeImg(rune.secondary), rune,
@@ -1663,7 +1996,10 @@ async function loadMatchDetail(mid) {
   const el = $(`#d-${CSS.escape(mid)}`);
   if (!el || el.dataset.loaded) return;
   el.innerHTML = `<div class="loading"><div class="spinner"></div></div>`;
-  const m = await api(`/api/match/${mid}`).catch((e) => ({ error: e.message }));
+  const token = nav, puuid = DATA.puuid;
+  const current = () => el.isConnected && nav === token && DATA?.puuid === puuid && ME;
+  const m = await api(`/api/match/${mid}`, undefined, current).catch((e) => ({ error: e.message }));
+  if (!current()) return;
   if (m.error) { el.innerHTML = `<p class="error">${esc(m.error)}</p>`; return; }
   el.dataset.loaded = "1";
   const maxDmg = Math.max(...m.teams.flatMap((t) => t.players.map((p) => p.damage)), 1);
@@ -1681,6 +2017,8 @@ async function loadMatchDetail(mid) {
       <td style="width:20%">${barCell(p.damage / maxDmg, kpts(p.damage))}</td>
       <td class="num">${p.gold15 == null ? "–" : kpts(p.gold15)}</td>
       <td>${items(p.items)}</td></tr>`).join("")}</tbody></table></div>`).join("");
+  el.insertAdjacentHTML("afterbegin", storySection(mid));
+  loadStory($(".story", el));
   prepareTables(el);
 }
 
@@ -1689,7 +2027,7 @@ let livePoll = null;
 let liveRequest = 0;
 
 async function tabLive() {
-  $("#tab-body").innerHTML = `<div class="loading"><div class="spinner"></div>Loading the live game…</div>`;
+  if (!$("#live-insights")) $("#tab-body").innerHTML = `<div class="loading"><div class="spinner"></div>Loading the live game…</div>`;
   const token = nav;
   const puuid = DATA.puuid;
   const request = ++liveRequest;
@@ -1710,6 +2048,9 @@ function renderLive(live) {
   if (!el) return;
   if (live.error) { el.innerHTML = `<div class="card empty"><p class="error">${esc(live.error)}</p></div>`; return; }
   if (!live.in_game) { el.innerHTML = `<div class="card empty"><h2>Not in a game anymore</h2><p>The game has ended — refresh to include it.</p></div>`; return; }
+  const gameKey = JSON.stringify([live.game_id, live.started, live.players.map((p) => [p.team, p.champion_id]).sort()]);
+  const retained = el.dataset.liveGame === gameKey ? $("#live-insights", el) : null;
+  const focused = retained?.contains(document.activeElement) ? document.activeElement : null;
   const team = (id) => live.players.filter((p) => p.team === id);
   const bans = (id) => live.bans.filter((b) => b.team === id).map((b) => icon(b.champion_id)).join("");
   const rankText = (p) => p.tier === "UNRANKED" ? `<span class="muted">Unranked</span>` : `${title(p.tier)} ${p.division} <span class="muted small">${p.lp} LP</span>`;
@@ -1730,8 +2071,12 @@ function renderLive(live) {
       Form and champion records come from each player's cached ranked solo games${live.pending ? ` — <b>still fetching for ${live.pending} player${live.pending > 1 ? "s" : ""}</b>, this updates by itself` : ""}.
       ${live.without_history && !live.pending ? `<button class="btn ghost" id="live-form">Load recent form for ${live.without_history} player${live.without_history > 1 ? "s" : ""}</button>
         <span class="muted small">≈${live.without_history * (live.form_games + 1)} API requests</span>` : ""}</div>
-    ${side(100, "Blue side")}${side(200, "Red side")}`;
+    ${side(100, "Blue side")}${side(200, "Red side")}<div id="live-insights" class="section"></div>`;
   $("#live-form")?.addEventListener("click", () => { view.player.liveForm = true; tabLive(); });
+  if (retained) $("#live-insights", el).replaceWith(retained);
+  el.dataset.liveGame = gameKey;
+  mountLiveInsights($("#live-insights"), live);
+  focused?.focus({ preventScroll: true });
   prepareTables(el);
 }
 
@@ -1824,4 +2169,5 @@ $("#logout").addEventListener("click", async () => {
   showLogin();
 });
 window.addEventListener("hashchange", () => ME && META && route());
-start();
+if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });
+else start();

@@ -449,7 +449,7 @@ class MemoryBackendTests(unittest.IsolatedAsyncioTestCase):
                 patches.enter_context(patch.object(main, "Riot", return_value=riot))
                 patches.enter_context(patch.object(main, "load_champions", new_callable=AsyncMock, return_value=("26.20.1", {})))
                 patches.enter_context(patch.object(main, "load_spells", new_callable=AsyncMock, return_value={}))
-                for name in ("load_build_data", "ensure_cache_matches_key", "refresh_ddragon", "backfill_builds", "track_ranks"):
+                for name in ("load_build_data", "ensure_cache_matches_key", "refresh_ddragon", "backfill_derived", "track_ranks"):
                     patches.enter_context(patch.object(main, name, new_callable=AsyncMock))
                 patches.enter_context(patch.dict(main.SAMPLER, {"enabled": False}))
                 if fails:

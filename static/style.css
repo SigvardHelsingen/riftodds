@@ -645,6 +645,59 @@ td.rank { font: 900 22px/1 var(--display); color: var(--plum); width: 36px; }
   .spinner, .live-dot, .dotlive { flex: none; }
 }
 
+/* Game stories stay inside the existing match fold-out, with a numeric table twin. */
+.story { min-width: 0; margin: 12px 0 20px; padding-bottom: 16px; border-bottom: 1px solid var(--rule); overflow-wrap: anywhere; }
+.story-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; }
+.story-head > b { font: 800 22px/1.2 var(--display); }
+.story .btn { max-width: 100%; min-height: 44px; white-space: normal; }
+.story-note { margin: 8px 0 12px; }
+.story-note a { display: inline-block; padding: 8px 0; }
+.story-swing { max-width: 760px; margin: 0 0 14px; padding: 10px 12px; background: var(--peach-wash); border-radius: 6px; font-size: 13px; }
+.story-grid { display: grid; grid-template-columns: minmax(0, 1fr) 220px; align-items: start; gap: 20px; }
+.story-grid.compact { grid-template-columns: minmax(0, 1fr); }
+.story-plot { min-width: 0; position: relative; }
+.story-plot svg { display: block; max-width: 100%; overflow: visible; }
+.story-plot text { fill: var(--muted); font: 10px var(--mono); }
+.story-plot .grid { stroke: var(--rule); stroke-width: 1; }
+.story-plot .zero { stroke: var(--ref); stroke-width: 1; }
+.story-plot .avg { fill: none; stroke: var(--mag); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.story-plot .cross { stroke: var(--ink); stroke-width: 1; }
+.story-plot .focus-dot { fill: none; stroke: var(--ink); stroke-width: 2; }
+.story-plot .sel-band { fill: var(--peach-wash); }
+.story-plot .ev { fill: var(--ref); }
+.story-plot .ev.us { fill: var(--pos); }
+.story-plot .ev.them { fill: var(--neg); }
+.story-hit { position: absolute; cursor: crosshair; touch-action: pan-y; }
+.story-hit:focus-visible { outline: 2px solid var(--ink); outline-offset: 3px; }
+.story-plot .trend-tip { min-width: min(170px, 100%); max-width: min(240px, 100%); }
+.story-plot .table-scroll { max-height: 360px; overflow-y: auto; }
+.story-plot .trend-table { min-width: 420px; }
+.story-map { margin: 0; min-width: 0; }
+.story-map .legend { gap: 10px; margin: 8px 0 4px; }
+.rift-map { display: block; width: 220px; height: 220px; max-width: 100%; }
+.rift-map .map-ground { fill: var(--paper); }
+.rift-map .map-river { fill: none; stroke: var(--ref); stroke-width: 14; opacity: .4; }
+.rift-map .map-lane { fill: none; stroke: var(--track); stroke-width: 9; }
+.rift-map .map-base { fill: var(--track); }
+.map-pt .hit { fill: transparent; }
+.map-pt .mark { fill: var(--pos); stroke: var(--card); stroke-width: 2; }
+.map-pt.death .mark { fill: var(--card); stroke: var(--neg); stroke-width: 2; }
+.map-pt:focus .mark, .map-pt:hover .mark { stroke: var(--ink); stroke-width: 3; }
+.story-build { display: grid; gap: 10px; margin-top: 14px; }
+.build-steps { flex-wrap: wrap; }
+.build-step { display: inline-grid; justify-items: center; gap: 3px; }
+.build-step small { font: 10px var(--mono); white-space: nowrap; }
+.build-arrow { font-size: 22px; }
+.skill-order { display: inline-flex; gap: 4px; align-items: center; }
+.skill-order kbd { padding: 3px 7px; background: var(--peach-wash); border-radius: 4px; font: 600 12px var(--mono); }
+.skill-seq { display: inline-flex; flex-wrap: wrap; gap: 3px; }
+.skill-seq span { padding: 2px 5px; background: var(--track); font: 11px var(--mono); border-radius: 3px; }
+.skill-seq .ult { background: var(--ink); color: var(--card); }
+@media (max-width: 760px) {
+  .story-grid { grid-template-columns: minmax(0, 1fr); gap: 14px; }
+  .story-map { width: 220px; justify-self: center; }
+}
+
 @media (prefers-reduced-motion: reduce) {
   .spinner, .live-dot, .sampler .dotlive, .random-build.is-rolling .random-dice, .random-result.is-revealing { animation: none; }
   .trend-plot.animate *, .trend-game-inner.swap { animation: none !important; }

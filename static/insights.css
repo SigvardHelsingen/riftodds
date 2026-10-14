@@ -1,0 +1,114 @@
+/* Optional insights UI. Every rule is scoped to .insight or an insight-prefixed class. */
+.insight {
+  min-width: 0;
+  max-width: 100%;
+  margin-block: 20px;
+  padding: 20px;
+  background: var(--card);
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  overflow-wrap: anywhere;
+}
+.insight *, .insight *::before, .insight *::after { box-sizing: border-box; }
+.insight-content { min-height: 9rem; min-width: 0; }
+.insight-refreshing > .insight-content { opacity: .75; }
+.insight-head { margin-bottom: 16px; }
+.insight h1 { font-size: clamp(32px, 5vw, 58px); line-height: 1.08; margin: 8px 0 16px; }
+.insight h2 { margin: 0 0 8px; font: 800 28px/1.15 var(--display); }
+.insight h3 { margin: 0 0 10px; font: 800 22px/1.2 var(--display); }
+.insight h4 { margin: 0 0 8px; font-size: 16px; }
+.insight p { margin: 8px 0 12px; }
+.insight-eyebrow { font: 500 12px/1.5 var(--mono); text-transform: uppercase; letter-spacing: .04em; }
+.insight-muted, .insight-sub { color: var(--muted); font-size: 13px; }
+.insight-sub { display: block; margin-top: 3px; white-space: normal; }
+.insight-error { color: var(--plum); }
+.insight-details { min-width: 0; margin-block: 12px; border-top: 1px solid var(--rule); }
+.insight-details > summary {
+  min-height: 48px;
+  padding: 13px 4px;
+  cursor: pointer;
+  font-weight: 600;
+  list-style-position: inside;
+}
+.insight-details > summary:hover { background: var(--peach-wash); }
+.insight-details > summary:focus-visible, .insight a:focus-visible,
+.insight-button:focus-visible, .insight input:focus-visible, .insight select:focus-visible {
+  outline: 3px solid var(--rose);
+  outline-offset: 2px;
+}
+.insight-detail-body { min-width: 0; padding: 4px 4px 12px; }
+.insight-details[open] > summary { color: var(--plum); }
+.insight-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 14px; margin-block: 16px; }
+.insight-box { min-width: 0; padding: 16px; border: 1px solid var(--rule); border-radius: var(--radius); background: var(--paper); }
+.insight .champ { max-width: 100%; white-space: normal; }
+.insight .champ > span { min-width: 0; overflow-wrap: anywhere; }
+.insight .champ img { width: 32px; height: 32px; flex: none; border-radius: 5px; }
+.insight .champ .role { white-space: normal; }
+.insight-button {
+  min-width: 100px;
+  min-height: 44px;
+  max-width: 100%;
+  padding: 10px 14px;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  background: var(--ink);
+  color: var(--peach);
+  font: 700 16px/1.3 var(--display);
+  text-align: center;
+  white-space: normal;
+  cursor: pointer;
+}
+.insight-button:hover { background: var(--plum); border-color: var(--plum); color: var(--card); }
+.insight-button:disabled { cursor: default; opacity: .6; }
+.insight-secondary { color: var(--ink); background: transparent; }
+.insight-status { display: grid; grid-template-columns: minmax(0, 1fr) 100px; align-items: center; gap: 8px; min-height: 60px; margin-top: 8px; }
+.insight-status p { min-width: 0; margin: 0; font-size: 13px; }
+.insight-retry { visibility: hidden; }
+.insight-retry.insight-visible { visibility: visible; }
+.insight-action { margin-top: 12px; }
+.insight-goal-button { min-width: min(100%, 165px); }
+.insight-action-status { min-height: 3em; font-size: 13px; }
+.insight-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(100px, .6fr); gap: 12px; align-items: end; }
+.insight-form label, .insight-role-picker { display: grid; min-width: 0; gap: 6px; font-weight: 500; }
+.insight-role-picker { width: min(100%, 330px); margin-bottom: 18px; }
+.insight input, .insight select { min-width: 0; width: 100%; min-height: 44px; max-width: 100%; }
+.insight .table-scroll { max-width: 100%; min-width: 0; overflow-x: auto; overscroll-behavior-x: contain; }
+.insight-table { width: 100%; min-width: 650px; font-size: 13px; }
+.insight-table th, .insight-table td { vertical-align: top; white-space: normal; }
+.insight-table th { font-size: 12px; }
+.insight-table td { font-variant-numeric: tabular-nums; }
+.insight-table .insight-sub { font-size: 11px; }
+.insight-small-table { min-width: 380px; }
+.insight-fingerprint { display: grid; gap: 16px; margin: 16px 0 8px; }
+.insight-axis { min-width: 0; }
+.insight-axis-label { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; margin-bottom: 6px; font-size: 13px; }
+.insight-axis-label b { font: 500 12px/1.5 var(--mono); }
+.insight-percentile { position: relative; height: 12px; overflow: hidden; border-radius: 2px; background: var(--track); }
+.insight-percentile > span { display: block; height: 100%; background: var(--you); }
+.insight-percentile::after { content: ''; position: absolute; left: 50%; top: 0; bottom: 0; border-left: 2px solid var(--ink); }
+.insight-scale { display: flex; justify-content: space-between; gap: 6px; font: 400 11px/1.4 var(--mono); color: var(--muted); }
+.insight-goals { margin-top: 20px; }
+.insight-goal + .insight-goal { margin-top: 12px; }
+.insight-scorecards { align-items: start; }
+.insight-scorecard { min-width: 0; }
+.insight-readiness { font-weight: 600; padding-left: 12px; border-left: 4px solid var(--ink); }
+.insight-counts { margin: 20px 0; }
+.insight-counts > div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; padding: 8px 0; border-bottom: 1px solid var(--rule); }
+.insight-counts dt { font-size: 13px; }
+.insight-counts dd { margin: 0; font: 500 13px/1.5 var(--mono); }
+.insight-pregame { padding: 16px; border-left: 4px solid var(--ink); background: var(--peach-wash); }
+.insight-pregame a { display: inline-flex; align-items: center; min-height: 44px; }
+.insight-fieldset { min-width: 0; margin: 0; padding: 12px; border: 1px solid var(--rule); border-radius: var(--radius); }
+.insight-fieldset legend { font-weight: 600; padding-inline: 4px; }
+.insight-assignment { display: grid; grid-template-columns: minmax(0, 1fr) minmax(100px, .8fr); align-items: center; gap: 10px; margin-bottom: 12px; }
+.insight-pool { padding: 0; margin: 12px 0; list-style: none; }
+.insight-pool li { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; padding: 10px 0; border-bottom: 1px solid var(--rule); }
+.insight-pool li > span:not(.champ) { font-size: 12px; }
+@media (max-width: 560px) {
+  .insight { padding: 12px; }
+  .insight-box { padding: 12px; }
+  .insight-form { grid-template-columns: minmax(0, 1fr); }
+  .insight-form .insight-button, .insight-action .insight-button, .insight-live-form > .insight-button { width: 100%; }
+  .insight-assignment { grid-template-columns: minmax(0, 1fr); }
+  .insight-grid { grid-template-columns: minmax(0, 1fr); }
+}

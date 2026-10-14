@@ -10,6 +10,9 @@ import zlib
 from contextlib import contextmanager
 from pathlib import Path
 
+import perf
+import timeline
+
 DB_PATH = Path(__file__).with_name("cache.db")
 
 SCHEMA = """
@@ -81,7 +84,21 @@ CREATE TABLE IF NOT EXISTS mastery (
     puuid TEXT, champion_id INTEGER, level INTEGER, points INTEGER, last_play INTEGER,
     PRIMARY KEY (puuid, champion_id)
 );
+-- a timeline boiled down to a few KB (timeline.extract), zlib-compressed JSON; NULL when Riot has none
+CREATE TABLE IF NOT EXISTS timeline_digest (match_id TEXT PRIMARY KEY, data BLOB);
+-- purchase and skill order per player, from timelines: "itemId:second,..." and one digit per ability point
+CREATE TABLE IF NOT EXISTS purchases (
+    match_id TEXT, puuid TEXT, items TEXT, skills TEXT, PRIMARY KEY (match_id, puuid)
+);
+-- per-player coaching numbers from the raw match (perf.METRICS)
+CREATE TABLE IF NOT EXISTS perf (
+    match_id TEXT, puuid TEXT, """ + ", ".join(f"{c} REAL" for c in perf.COLUMNS) + """,
+    PRIMARY KEY (match_id, puuid)
+);
+-- trained win-probability models and their scorecards (model.py)
+CREATE TABLE IF NOT EXISTS models (name TEXT PRIMARY KEY, trained_at INTEGER, params TEXT, report TEXT);
 """
+VERSION = 2  # non-destructive migration; digest version is independently timeline.DIGEST_VERSION
 FRAME_MINUTES = (10, 15)
 # columns added after the first release; connect() adds them to older databases
 MIGRATIONS = [("players", "profile_icon", "INTEGER"), ("players", "level", "INTEGER"),
@@ -95,6 +112,13 @@ def init(db):
     for table, col, kind in MIGRATIONS:
         if col not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
             db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {kind}")
+    if db.execute("PRAGMA user_version").fetchone()[0] < VERSION:
+        # Keep fetched markers AND old SQL gold frames. Missing/v1 digests cannot
+        # recover actual timestamps, but are not permission for a bulk re-download.
+        # digest() reports them unavailable; explicit bounded refreshes may replace
+        # them later. has_timeline() continues to mean 'already fetched', not v2-ready.
+        db.execute(f"PRAGMA user_version = {VERSION}")
+        db.commit()
 
 
 def connect():
@@ -188,6 +212,34 @@ def save_match(db, platform, m):
         )
     _save_bans(db, mid, info)
     _save_builds(db, mid, info)
+    _save_perf(db, mid, info)
+
+
+def _save_perf(db, mid, info):
+    duration = timeline.number(info.get("gameDuration"))
+    minutes = duration / 60 if duration is not None else None
+    cols = ", ".join(perf.COLUMNS)
+    marks = ", ".join("?" for _ in perf.COLUMNS)
+    for p in info["participants"]:
+        values = perf.values(p, minutes, info["participants"])
+        db.execute(f"INSERT OR REPLACE INTO perf (match_id, puuid, {cols}) VALUES (?, ?, {marks})",
+                   (mid, p["puuid"], *(values[c] for c in perf.COLUMNS)))
+
+
+def backfill_perf(db, after="", limit=50):
+    """Coaching numbers for matches cached before the perf table existed, a batch at a time.
+
+    Returns the last match_id handled (pass it back as `after`), or None when nothing is left."""
+    ids = [r[0] for r in db.execute(
+        """SELECT match_id FROM matches WHERE match_id > ? AND queue_id = 420
+           AND match_id NOT IN (SELECT DISTINCT match_id FROM perf) ORDER BY match_id LIMIT ?""",
+        (after, limit))]
+    for mid in ids:
+        raw = match_raw(db, mid)  # one decoded match at a time
+        if raw is not None:
+            _save_perf(db, mid, raw["info"])
+    db.commit()
+    return ids[-1] if ids else None
 
 
 def _save_builds(db, mid, info):
@@ -301,27 +353,107 @@ def find_player(db, platform, name, tag):
 
 
 def has_timeline(db, match_id):
+    """Fetched marker, including missing/legacy/unsupported digests; NOT digest availability."""
     return db.execute("SELECT 1 FROM timelines WHERE match_id=?", (match_id,)).fetchone() is not None
 
 
 def save_timeline(db, match_id, tl):
-    """Keep only gold/xp/cs per participant at FRAME_MINUTES; timelines are ~1 MB raw."""
-    db.execute("INSERT OR IGNORE INTO timelines VALUES (?)", (match_id,))
-    if not tl:
-        return
-    info = tl["info"]
-    by_id = {p["participantId"]: p["puuid"] for p in info.get("participants", [])} or \
-        {i + 1: puuid for i, puuid in enumerate(tl["metadata"]["participants"])}
-    frames = info["frames"]
-    for minute in FRAME_MINUTES:
-        if minute >= len(frames):
-            continue
-        for pid, f in frames[minute]["participantFrames"].items():
-            puuid = by_id.get(int(pid))
-            if puuid:
-                db.execute("INSERT OR REPLACE INTO frames VALUES (?,?,?,?,?,?)",
-                           (match_id, puuid, minute, f["totalGold"], f["xp"],
-                            f["minionsKilled"] + f["jungleMinionsKilled"]))
+    """Atomically replace derived timeline data, leaving the caller's transaction open.
+
+    Gold10/15 retain their SQL/API names: use the nearest actual timestamp within
+    timeline.FRAME_TOLERANCE (15 seconds), never an array index. An incomplete
+    participant snapshot yields absent SQL rows, not zeros. Only standard Rift
+    metadata permits map/model/lead data; None is the sole missing-timeline value.
+    """
+    dg, orders = None, {}
+    if tl is not None:
+        if not isinstance(tl, dict):
+            raise ValueError("Timeline must be an object or None")
+        mid = (tl.get("metadata") or {}).get("matchId")
+        if mid is not None and mid != match_id:
+            raise ValueError("Timeline matchId disagrees with requested match")
+        raw = match_raw(db, match_id)
+        dg, orders = timeline.extract(tl, raw["info"] if raw else None)
+    data = zlib.compress(json.dumps(dg, separators=(",", ":"), allow_nan=False).encode()) if dg else None
+    # BEGIN ensures releasing our savepoint never commits an outermost savepoint.
+    owned = not db.in_transaction
+    if owned:
+        db.execute("BEGIN")
+    db.execute("SAVEPOINT timeline_write")
+    try:
+        db.execute("INSERT OR IGNORE INTO timelines VALUES (?)", (match_id,))
+        db.execute("INSERT OR REPLACE INTO timeline_digest VALUES (?, ?)", (match_id, data))
+        db.execute("DELETE FROM purchases WHERE match_id = ?", (match_id,))
+        db.execute("DELETE FROM frames WHERE match_id = ?", (match_id,))
+        if dg is not None and timeline.supported(dg):
+            db.executemany("INSERT INTO purchases VALUES (?, ?, ?, ?)",
+                           ((match_id, puuid, items, skills) for puuid, (items, skills) in orders.items()))
+            for minute in FRAME_MINUTES:
+                index = timeline.nearest_frame(dg, minute * 60)
+                if index is None:
+                    continue
+                for puuid, gold, xp, cs in zip(dg["puuids"], dg["gold"][index], dg["xp"][index], dg["cs"][index]):
+                    if all(timeline.number(v) is not None for v in (gold, xp, cs)):
+                        db.execute("INSERT INTO frames VALUES (?,?,?,?,?,?)", (match_id, puuid, minute, gold, xp, cs))
+        db.execute("RELEASE SAVEPOINT timeline_write")
+    except BaseException:
+        db.execute("ROLLBACK TO SAVEPOINT timeline_write")
+        db.execute("RELEASE SAVEPOINT timeline_write")
+        if owned:
+            db.rollback()
+        raise
+
+
+def _stored_digest(db, match_id):
+    row = db.execute("SELECT data FROM timeline_digest WHERE match_id = ?", (match_id,)).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        if len(row[0]) > timeline.MAX_DIGEST_BYTES:
+            return None
+        decoder = zlib.decompressobj()
+        data = decoder.decompress(row[0], timeline.MAX_DIGEST_BYTES + 1)
+        if len(data) > timeline.MAX_DIGEST_BYTES or not decoder.eof or decoder.unused_data:
+            return None
+        return json.loads(data)
+    except (ValueError, TypeError, zlib.error):
+        return None
+
+
+def digest_status(db, match_id):
+    """available/missing/legacy/unsupported/not_rift/invalid/not_fetched.
+
+    Availability is independent of has_timeline(), so schema upgrades do not
+    invalidate fetch markers. v1 data/old gold rows remain untouched on disk;
+    unavailable digests require an explicit, bounded refresh, not an automatic
+    full-cache re-download. No attempt is made to invent missing timestamps.
+    """
+    row = db.execute("SELECT data FROM timeline_digest WHERE match_id = ?", (match_id,)).fetchone()
+    if row is None:
+        return "legacy" if has_timeline(db, match_id) else "not_fetched"
+    if row[0] is None:
+        return "missing"
+    dg = _stored_digest(db, match_id)
+    if not isinstance(dg, dict):
+        return "invalid"
+    if dg.get("v") == 1:
+        return "legacy"
+    if dg.get("v") != timeline.DIGEST_VERSION:
+        return "unsupported"
+    if dg.get("map_id") != 11:
+        return "not_rift"
+    return "available" if timeline.supported(dg) else "invalid"
+
+
+def digest(db, match_id):
+    """Current standard-Rift digest, or None (missing, legacy, unknown version/map).
+
+    Fetched markers are deliberately independent; see digest_status(). Consumers
+    that read timeline_digest.data directly must also check version/map before
+    interpreting arrays or training (timeline.states does this automatically).
+    """
+    dg = _stored_digest(db, match_id)
+    return dg if timeline.supported(dg) else None
 
 
 def save_mastery(db, puuid, entries):

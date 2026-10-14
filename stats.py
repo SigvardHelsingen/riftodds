@@ -9,10 +9,11 @@ from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from itertools import combinations
-from statistics import NormalDist
+from statistics import NormalDist, median
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import store
+import timeline
 
 ROLES = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 SESSION_GAP_MS = 30 * 60 * 1000  # a new "session" starts after 30 min idle
@@ -606,9 +607,9 @@ def _ranked(table, mean, n):
 def champion_build(db, champion_id, role, patch, items, tier=None, queue=420):
     """The most successful core items, boots, runes and summoner spells for a champion in a role.
 
-    `items` is Data Dragon's {itemId: {completed, boots, support}}. Matches only record the final
-    inventory, not the purchase order: a core is three finished items from the same game,
-    listed most-built first."""
+    `items` is Data Dragon's {itemId: {completed, boots, support}}. The core comes from final
+    inventories (three finished items from the same game, most-built first); games with a
+    timeline add the actual purchase order, starting items and skill order (`order`)."""
     where, args = _population(patch, tier, queue)
     rows = db.execute(
         f"""SELECT b.items, b.keystone, b.primary_style, b.sub_style, b.spells, p.win
@@ -657,6 +658,148 @@ def champion_build(db, champion_id, role, patch, items, tier=None, queue=420):
     floor = max(MIN_BUILD_GAMES, MIN_BUILD_SHARE * n)
     out["situational"] = [{"item": i, **entry(g, w)} for i, (g, w) in sorted(
         tables["item"].items(), key=lambda kv: -kv[1][0]) if i not in in_core and g >= floor][:5]
+    out["order"] = build_order(db, where, args, champion_id, role, items)
+    return out
+
+
+def skill_order(skills, *, details=False):
+    """Q/W/E priority, with optional observed-vs-estimated evidence.
+
+    The default remains a string. Only reaching five points is observed; a
+    remaining priority inferred from partial allocations is not a completed max.
+    Nonstandard rank counts cannot establish the usual five-point max order.
+    """
+    skills = skills if isinstance(skills, str) else ""
+    valid = bool(skills) and all(c in "1234" for c in skills)
+    points = {c: 0 for c in "1234"}
+    maxed = []
+    if valid:
+        for c in skills:
+            points[c] += 1
+            if c != "4" and points[c] == 5:
+                maxed.append(c)
+    standard = all(points[c] <= 5 for c in "123") and points["4"] <= 3
+    if not standard:
+        maxed = []
+    first_point = lambda c: skills.find(c) if c in skills else len(skills)
+    rest = sorted((c for c in "123" if c not in maxed), key=lambda c: (-points[c], first_point(c)))
+    letters = lambda digits: "".join("QWER"[int(c) - 1] for c in digits)
+    evidence = {"order": letters(maxed + rest) if valid and any(points[c] for c in "123") else "",
+                "observed_order": letters(maxed),
+                "inferred_order": letters(c for c in rest if points[c]),
+                "unknown": letters(c for c in rest if not points[c]),
+                "estimated": len(maxed) < 3, "standard_ranks": standard,
+                "label": "Estimated ability priority (partial points)" if standard and len(maxed) < 3
+                         else "Estimated ability priority (nonstandard ranks)" if not standard
+                         else "Observed five-point ability order"}
+    return evidence if details else evidence["order"]
+
+
+@_snapshot
+def build_order(db, where, args, champion_id, role, items):
+    """Actual first three distinct finished purchases, starters and skill evidence.
+
+    Stream one cursor in the caller's snapshot (or own/release one). Per-option
+    timings use bounded whole-second histograms, not per-game timestamp arrays;
+    medians are displayed in rounded minutes. Values beyond three hours go into
+    an overflow bin: a median landing there is unknown, never a capped fake time.
+    First later shop timing uses each player's first retained non-ward/trinket
+    purchase at or after 60 seconds; it is an observation, not an inferred recall.
+    """
+    rows = db.execute(
+        f"""SELECT pu.items, pu.skills, p.win FROM participants p JOIN matches m ON m.match_id = p.match_id
+            JOIN purchases pu ON pu.match_id = p.match_id AND pu.puuid = p.puuid
+            WHERE {where} AND p.champion_id = ? AND p.position = ?""", (*args, champion_id, role))
+    n = wins = 0
+    max_seconds = 180 * 60
+    tables = defaultdict(lambda: defaultdict(lambda: [0, 0]))
+    timings = defaultdict(dict)  # kind -> option -> bounded per-slot histograms
+    skill_starts = defaultdict(Counter)
+    first_shop_times = Counter()
+
+    def add_time(histogram, t):
+        bucket = round(t) if t <= max_seconds else max_seconds + 1
+        histogram[bucket] += 1
+
+    def add(kind, key, win, seconds=()):
+        row = tables[kind][key]
+        row[0] += 1
+        row[1] += win
+        if seconds:
+            histograms = timings[kind].get(key)
+            if histograms is None:
+                histograms = tuple(Counter() for _ in seconds)
+                timings[kind][key] = histograms
+            for histogram, t in zip(histograms, seconds):
+                add_time(histogram, t)
+
+    def minute(histogram):
+        count = sum(histogram.values())
+        if not count:
+            return None
+        middle, cumulative = [], 0
+        for seconds, frequency in sorted(histogram.items()):
+            for rank in ((count - 1) // 2, count // 2):
+                if cumulative <= rank < cumulative + frequency:
+                    middle.append(seconds)
+            cumulative += frequency
+            if len(middle) == 2:
+                return None if max(middle) > max_seconds else round(sum(middle) / 120)
+        return None
+
+    for item_text, skills, win in rows:
+        n += 1
+        wins += win
+        bought = sorted(timeline.parse_items(item_text), key=lambda buy: buy[0])
+        start = tuple(sorted(i for t, i in bought if t < 60 and i not in timeline.NOT_BUILD))
+        if start:
+            add("start", start, win)
+        first_shop = next((t for t, i in bought if t >= 60 and i not in timeline.NOT_BUILD), None)
+        if first_shop is not None:
+            add_time(first_shop_times, first_shop)
+        done, seen = [], set()
+        for t, i in bought:
+            kind = items.get(i, {})
+            if kind.get("completed") and not kind.get("boots") and not kind.get("support") \
+                    and i not in timeline.NOT_BUILD and i not in seen:
+                seen.add(i)
+                done.append((t, i))
+        if done:
+            add("first", done[0][1], win, (done[0][0],))
+        if len(done) >= 3:
+            add("core", tuple(i for _, i in done[:3]), win, tuple(t for t, _ in done[:3]))
+        if isinstance(skills, str) and len(skills) >= 9:
+            evidence = skill_order(skills, details=True)
+            if evidence["order"]:
+                key = (evidence["order"], evidence["observed_order"], evidence["inferred_order"],
+                       evidence["unknown"], evidence["standard_ranks"])
+                add("skills", key, win)
+                skill_starts[key]["".join("QWER"[int(c) - 1] for c in skills[:3])] += 1
+    out = {"games": n, "core": [], "first": [], "start": [], "skills": [], "first_shop": None,
+           "timing_resolution_seconds": 1}
+    if not n:
+        return out
+    if first_shop_times:
+        out["first_shop"] = {"minute": minute(first_shop_times), "games": sum(first_shop_times.values()),
+                             "label": "First later shop purchase (not necessarily first recall)"}
+    mean = wins / n
+    ranked = lambda kind: _ranked(tables[kind], mean, n)
+    entry = lambda g, w: {**winrate(w, g), "share": g / n}
+    out["core"] = [{"items": list(trio), "minutes": [minute(h) for h in timings["core"][trio]],
+                    **entry(g, w)} for trio, g, w in ranked("core")[:2]]
+    out["first"] = [{"item": i, "minute": minute(timings["first"][i][0]), **entry(g, w)} for i, g, w in ranked("first")[:3]]
+    out["start"] = [{"items": list(s), **entry(g, w)} for s, g, w in ranked("start")[:1]]
+    for key, g, w in ranked("skills")[:1]:
+        order, observed, inferred, unknown, standard = key
+        starts = skill_starts[key]
+        first = min(starts, key=lambda s: (-starts[s], s)) if starts else None
+        estimated = len(observed) < 3
+        out["skills"].append({"order": order, "first": first, "observed_order": observed,
+                              "inferred_order": inferred, "unknown": unknown,
+                              "estimated": estimated, "standard_ranks": standard,
+                              "label": "Estimated ability priority (partial points)" if standard and estimated
+                                       else "Estimated ability priority (nonstandard ranks)" if not standard
+                                       else "Observed five-point ability order", **entry(g, w)})
     return out
 
 

@@ -12,6 +12,7 @@ cookie, and only a SHA-256 of each token is stored.
 import getpass
 import hashlib
 import hmac
+import math
 import secrets
 import sqlite3
 import sys
@@ -20,6 +21,8 @@ import time
 from collections import deque
 from contextlib import closing
 from pathlib import Path
+
+import perf
 
 DB_PATH = Path(__file__).with_name("users.db")
 SESSION_DAYS = 30
@@ -97,11 +100,21 @@ CREATE TABLE IF NOT EXISTS activity (
     id INTEGER PRIMARY KEY, username TEXT NOT NULL, at INTEGER NOT NULL, kind TEXT NOT NULL, detail TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_activity_at ON activity(at);
+-- private coaching goals for the member's linked Riot account
+CREATE TABLE IF NOT EXISTS goals (
+    username TEXT NOT NULL, puuid TEXT NOT NULL, role TEXT NOT NULL, metric TEXT NOT NULL,
+    target REAL NOT NULL CHECK (target >= 0 AND target <= 10000), created INTEGER NOT NULL,
+    PRIMARY KEY (username, puuid, role, metric),
+    FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
+);
 """
 # columns added after the first release; connect() adds them to older databases
 MIGRATIONS = [("users", "role", "TEXT NOT NULL DEFAULT 'member'"), ("users", "last_seen", "INTEGER")]
 ROLES = ("member", "admin")
 ACTIVITY_DAYS = 90  # activity older than this is deleted
+GOAL_ROLES = perf.ROLES
+GOAL_METRICS = tuple(k for k, m in perf.METRICS.items() if m[3])
+MAX_GOAL_TARGET = 10000  # bounded finite raw units; pct metrics instead use 0..1
 
 
 def connect():
@@ -202,6 +215,7 @@ def get_account(username):
 def set_account(username, platform, game_name, tag_line, puuid):
     with closing(connect()) as db:
         db.execute("INSERT OR REPLACE INTO accounts VALUES (?, ?, ?, ?, ?)", (username, platform, game_name, tag_line, puuid))
+        db.execute("DELETE FROM goals WHERE username = ? AND puuid IS NOT ?", (username, puuid))
         db.commit()
 
 
@@ -214,7 +228,85 @@ def all_accounts():
 def clear_account(username):
     with closing(connect()) as db:
         db.execute("DELETE FROM accounts WHERE username = ?", (username,))
+        db.execute("DELETE FROM goals WHERE username = ?", (username,))
         db.commit()
+
+
+# --- private coaching goals --------------------------------------------------
+
+GOAL_FIELDS = ("puuid", "role", "metric", "target", "created")
+
+
+def get_goals(username, puuid):
+    """Return [{puuid, role, metric, target, created}], sorted by role/metric.
+
+    Only an existing member's currently linked puuid is readable, otherwise [].
+    `created` is Unix seconds and survives target updates. Targets use perf's raw
+    units (pct metrics are fractions, not percentages). Authentication at the API
+    boundary must supply username from the session, never from a request body.
+    """
+    with closing(connect()) as db:
+        rows = db.execute(
+            """SELECT g.puuid, g.role, g.metric, g.target, g.created FROM goals g
+               JOIN users u ON u.username = g.username
+               JOIN accounts a ON a.username = g.username AND a.puuid = g.puuid
+               WHERE g.username = ? AND g.puuid = ? ORDER BY g.role, g.metric""",
+            (username, puuid))
+        return [dict(zip(GOAL_FIELDS, row)) for row in rows]
+
+
+def set_goal(username, puuid, role, metric, target):
+    """Upsert one goal and return {puuid, role, metric, target, created}.
+
+    ValueError: invalid role, non-actionable/inapplicable metric, non-finite or
+    out-of-range target, missing member, or puuid not currently linked to them.
+    Targets must be int/float (not bool/string), 0..MAX_GOAL_TARGET inclusive,
+    or 0..1 for pct metrics. The conditional write serializes with unlink/remove
+    so a concurrent revocation cannot leave an orphaned goal.
+    """
+    if role not in GOAL_ROLES or metric not in GOAL_METRICS or role not in perf.METRICS[metric][4]:
+        raise ValueError("Goal metric must be actionable and applicable to this role")
+    if type(target) not in (int, float):
+        raise ValueError("Goal target must be a finite number")
+    try:
+        target = float(target)
+    except OverflowError:
+        raise ValueError("Goal target must be a finite number") from None
+    maximum = 1 if perf.METRICS[metric][1] == "pct" else MAX_GOAL_TARGET
+    if not math.isfinite(target) or not 0 <= target <= maximum:
+        raise ValueError(f"Goal target must be between 0 and {maximum} in raw metric units")
+    with closing(connect()) as db:
+        written = db.execute(
+            """INSERT INTO goals (username, puuid, role, metric, target, created)
+               SELECT ?, ?, ?, ?, ?, ? WHERE EXISTS (
+                   SELECT 1 FROM users u JOIN accounts a ON a.username = u.username
+                   WHERE u.username = ? AND a.puuid = ?)
+               ON CONFLICT (username, puuid, role, metric) DO UPDATE SET target = excluded.target""",
+            (username, puuid, role, metric, target, int(time.time()), username, puuid))
+        if written.rowcount != 1:
+            raise ValueError("Goals require an existing member and their currently linked Riot account")
+        row = db.execute(
+            """SELECT puuid, role, metric, target, created FROM goals
+               WHERE username = ? AND puuid = ? AND role = ? AND metric = ?""",
+            (username, puuid, role, metric)).fetchone()
+        db.commit()
+        return dict(zip(GOAL_FIELDS, row))
+
+
+def delete_goal(username, puuid, role, metric):
+    """Delete just this member/account/role/metric goal; return whether it existed.
+
+    Unknown or unlinked accounts return False. Like get/set, username must come
+    from the authenticated session. This cannot delete another member's goals.
+    """
+    with closing(connect()) as db:
+        removed = db.execute(
+            """DELETE FROM goals WHERE username = ? AND puuid = ? AND role = ? AND metric = ?
+               AND EXISTS (SELECT 1 FROM users u JOIN accounts a ON a.username = u.username
+                           WHERE u.username = ? AND a.puuid = ?)""",
+            (username, puuid, role, metric, username, puuid))
+        db.commit()
+        return removed.rowcount > 0
 
 
 # --- roles and activity --------------------------------------------------------
@@ -310,6 +402,7 @@ def main(argv):
             db.execute("DELETE FROM users WHERE username = ?", (name,))
             db.execute("DELETE FROM sessions WHERE username = ?", (name,))
             db.execute("DELETE FROM accounts WHERE username = ?", (name,))
+            db.execute("DELETE FROM goals WHERE username = ?", (name,))
             db.commit()
             print(f"Removed {name}.")
         else:

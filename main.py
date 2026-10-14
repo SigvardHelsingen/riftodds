@@ -8,14 +8,17 @@ Run:  uv run fastapi dev main.py
 import asyncio
 import hashlib
 import logging
+import math
 import os
 import random
+import sys
 import time
 from contextlib import asynccontextmanager, closing
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -25,9 +28,14 @@ load_env()
 
 import auth
 import history
+import insights
+import model
+import perf
 import randomizer
+import scouting
 import stats
 import store
+import timeline
 from riot import PLATFORMS, Riot, RiotError, load_champions, load_items, load_runes, load_spells, profile_icon
 
 SOLO_QUEUE = 420
@@ -67,6 +75,8 @@ HISTORY_SHARE = 0.85  # player history syncs; leaves headroom so new lookups nev
 RANK_EVERY = 20 * 60      # tracked players' solo rank is re-checked this often (Riot keeps no LP history)
 RANK_RECENT = 14 * 86400  # players looked up this recently are tracked; linked accounts always are
 RANK_SHARE = 0.2          # rank checks only use this much of the rate limits
+MODEL_EVERY = 6 * 3600    # the win-probability models are retrained this often
+LIVE_ODDS_ENABLED = os.environ.get("LIVE_ODDS", "0") == "1"  # requires Riot use-case review before public enablement
 
 SEEN_EVERY = 60  # seconds between "last seen" writes per user
 SEEN_MAX = 1024
@@ -74,7 +84,7 @@ SEEN_MAX = 1024
 log = logging.getLogger("sampler")
 state = {"sampler": {"status": "off"}, "live": {}, "last_activity": 0.0}
 _seen = {}  # username -> when "last seen" was last written
-ACTIVE_PATHS = ("/api/player", "/api/sync", "/api/live", "/api/pick")
+ACTIVE_PATHS = ("/api/player", "/api/sync", "/api/live", "/api/pick", "/api/clash", "/api/match")
 
 
 def _live_cached(puuid, entry=None):
@@ -118,8 +128,9 @@ async def lifespan(app):
         with closing(store.connect()) as db:
             store.backfill_bans(db)
         tasks.append(asyncio.create_task(refresh_ddragon()))
-        tasks.append(asyncio.create_task(backfill_builds()))
+        tasks.append(asyncio.create_task(backfill_derived()))
         tasks.append(asyncio.create_task(track_ranks()))
+        tasks.append(asyncio.create_task(train_models()))
         if SAMPLER["enabled"]:
             tasks.append(asyncio.create_task(sampler()))
         yield
@@ -157,19 +168,20 @@ async def load_build_data():
         state.setdefault("runes", {})
 
 
-async def backfill_builds():
-    """Builds were added after release: flatten them out of the cached raw matches in the
-    background, a batch at a time, so startup isn't delayed by a large cache."""
-    after = ""
-    try:
-        while after is not None:
-            def batch():
-                with closing(store.connect()) as db:
-                    return store.backfill_builds(db, after)
-            after = await asyncio.to_thread(batch)
-            await asyncio.sleep(0)
-    except Exception:
-        log.exception("could not backfill builds; the rest are done at the next start")
+async def backfill_derived():
+    """Tables added after release (builds, coaching numbers) are flattened out of the cached raw
+    matches in the background, a batch at a time, so startup isn't delayed by a large cache."""
+    for what, step in (("builds", store.backfill_builds), ("coaching numbers", store.backfill_perf)):
+        after = ""
+        try:
+            while after is not None:
+                def batch(step=step, after=after):
+                    with closing(store.connect()) as db:
+                        return step(db, after)
+                after = await asyncio.to_thread(batch)
+                await asyncio.sleep(0)
+        except Exception:
+            log.exception("could not backfill %s; the rest are done at the next start", what)
 
 
 async def track_ranks():
@@ -197,6 +209,35 @@ async def track_ranks():
             raise
         except Exception:
             log.warning("rank tracking round failed", exc_info=True)
+
+
+async def train_models():
+    """Retrain both win-probability models every MODEL_EVERY in a separate, low-priority process:
+    fitting is up to a minute of pure-Python CPU that must never hold up requests."""
+    await asyncio.sleep(120)  # startup and the first lookups go first
+    while True:
+        proc = None
+        try:
+            def age():
+                with closing(store.connect()) as db:
+                    return time.time() - min(model.load(db, name, ttl=0)[2] or 0 for name in ("ingame", "pregame"))
+            if await asyncio.to_thread(age) >= MODEL_EVERY:
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, str(Path(__file__).with_name("model.py")), "train", "--db", str(store.DB_PATH),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=300)
+                if proc.returncode:
+                    log.warning("model training failed: %s", out.decode(errors="replace")[-2000:])
+                model._loaded.clear()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("model training round failed", exc_info=True)
+        finally:
+            if proc and proc.returncode is None:
+                proc.kill()
+                await proc.wait()
+        await asyncio.sleep(600)
 
 
 def current_patch(db):
@@ -243,6 +284,14 @@ async def ensure_cache_matches_key(riot):
 
 app = FastAPI(lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error(request, error):
+    # Never echo passwords/request bodies or non-JSON values such as infinity from failed inputs.
+    return JSONResponse({"detail": [{key: e[key] for key in ("loc", "msg", "type")} for e in error.errors()]},
+                        status_code=422)
+
 
 PUBLIC_API = {"/api/login", "/api/logout"}
 
@@ -417,11 +466,13 @@ def sampler_share():
 async def sampler():
     """Several random players from a tier still short of its TIER_WEIGHTS share, their games on this patch.
 
-    Also backfills timelines for current-patch matches cached before timelines were
-    collected, so the patch lead curve covers the whole sample.
+    Every other round instead fetches timelines for current-patch matches cached without one
+    (or before timeline digests existed), so lead curves, build order and the win-probability
+    model cover the whole sample while it keeps growing.
     """
     s = state["sampler"]
     platform = SAMPLER["platform"]
+    turn = 0
     while True:
         try:
             # users get the whole budget: wait until nobody has used the site for a full rate window
@@ -440,11 +491,13 @@ async def sampler():
                     (patch, SOLO_QUEUE))] if patch else []
                 since = patch_start(db, patch)
                 games = tier_games(db, patch) if patch else {}
-            if no_timeline:
+            done = bool(patch) and s["matches"] >= SAMPLER["target"]
+            turn += 1
+            if no_timeline and (done or turn % 2):
                 s.update(status="sampling", tier=None)
                 await fetch_matches(riot, platform, no_timeline, None, chunk=10, stop=users_active)
                 continue
-            if patch and s["matches"] >= SAMPLER["target"]:
+            if done:
                 s["status"] = "idle"
                 await asyncio.sleep(600)
                 continue
@@ -474,7 +527,7 @@ def index_html():
     """index.html with content-hashed asset URLs: after a deploy, browsers can't pair the new API
     with a cached old app.js."""
     html = (STATIC / "index.html").read_text()
-    for name in ("app.js", "style.css"):
+    for name in ("app.js", "style.css", "insights.js", "insights.css"):
         digest = hashlib.sha256((STATIC / name).read_bytes()).hexdigest()[:12]
         html = html.replace(f"/static/{name}", f"/static/{name}?v={digest}")
     return html
@@ -682,7 +735,7 @@ async def live(puuid: str, form: bool = False):
                           history.last_n(LIVE_FORM_GAMES), replace=False, timelines=False)  # form only needs matches
 
     def build_rows():  # blocking SQLite reads: run in a worker thread
-        with closing(store.connect()) as db:
+        with closing(store.connect()) as db, store.read_snapshot(db):
             rows = []
             for p in people:
                 solo = solo_of[p["puuid"]]
@@ -698,6 +751,7 @@ async def live(puuid: str, form: bool = False):
                     "mastery_level": m.get("championLevel"), "mastery_points": m.get("championPoints"),
                     "form": stats.wr_of(games[-LIVE_FORM_GAMES:]), "on_champ": stats.wr_of(on_champ),
                     "cached_games": len(games), "loading": (history.status(p["puuid"]) or {}).get("running", False),
+                                        "jungle": jungle_history(db, p["puuid"], game.get("gameStartTime")),
                 })
             return rows
 
@@ -707,9 +761,26 @@ async def live(puuid: str, form: bool = False):
     pending = sum(1 for p in people if (history.status(p["puuid"]) or {}).get("running"))
     missing = sum(1 for r in rows if not r.get("hidden") and not r["cached_games"] and not r["loading"])
     return {"in_game": True, "form_games": LIVE_FORM_GAMES, "without_history": missing, "queue": QUEUES.get(game.get("gameQueueConfigId"), game.get("gameMode", "Game").title()),
-            "started": game.get("gameStartTime") or None, "pending": pending, "players": rows,
+            "game_id": game.get("gameId"), "started": game.get("gameStartTime") or None, "pending": pending, "players": rows,
+                        "odds_enabled": LIVE_ODDS_ENABLED,
             "bans": [{"team": b["teamId"], "champion_id": b["championId"]}
                      for b in game.get("bannedChampions", []) if b["championId"] > 0]}
+
+
+def jungle_history(db, puuid, before=None):
+    """Only past cached jungle games; no role/path inference for the current spectator game."""
+    def digests():
+        ids = db.execute(
+            """SELECT p.match_id FROM participants p JOIN matches m ON m.match_id = p.match_id
+               WHERE p.puuid = ? AND p.position = 'JUNGLE' AND m.queue_id = ? AND m.remake = 0
+                 AND m.game_start < ? ORDER BY m.game_start DESC LIMIT 10""",
+            (puuid, SOLO_QUEUE, before or time.time() * 1000))
+        for row in ids:
+            dg = store.digest(db, row[0])
+            if dg and puuid in dg["puuids"]:
+                yield dg, dg["pids"][dg["puuids"].index(puuid)]
+    habits = timeline.jungle_habits(digests())
+    return habits if habits["games"] >= 3 else None
 
 
 @app.get("/api/player/{puuid}/analysis")
@@ -858,6 +929,264 @@ def match_detail(match_id: str):
     teams.sort(key=lambda t: (t["placement"] or 0, t["team_id"]))  # blue, red — or Arena's standings
     return {"match_id": match_id, "platform": platform, "queue": queue_name(info), "game_start": info["gameStartTimestamp"],
             "duration": info["gameDuration"], "patch": ".".join(info["gameVersion"].split(".")[:2]), "teams": teams}
+
+
+def build_steps(bought, items):
+    """Starting items (bought in the first minute) and each finished item, boots or support item
+    the first time it was bought, as [second, itemId]."""
+    start = [[t, i] for t, i in bought if t < 60]
+    seen, steps = set(), []
+    for t, i in bought:
+        kind = items.get(i, {})
+        if t >= 60 and i not in seen and (kind.get("completed") or kind.get("boots") or kind.get("support")):
+            seen.add(i)
+            steps.append([t, i])
+    return start, steps
+
+
+@app.get("/api/match/{match_id}/story")
+def match_story(match_id: str, puuid: str | None = None):
+    """How one game went, minute by minute, from `puuid`'s team (blue if not given): gold leads,
+    kills and objectives, win chance with its biggest swing, and the player's build, skill order
+    and where they died. Needs the match's timeline digest."""
+    with closing(store.connect()) as db, store.read_snapshot(db):
+        raw = store.match_raw(db, match_id)
+        if not raw:
+            raise HTTPException(404, "Match not in the cache")
+        dg = store.digest(db, match_id)
+        order = db.execute("SELECT items, skills FROM purchases WHERE match_id = ? AND puuid = ?",
+                           (match_id, puuid)).fetchone() if puuid else None
+        params, report, trained = model.load(db, "ingame")
+        if raw["info"].get("queueId") != SOLO_QUEUE:
+            params = None  # Normal/Flex/Clash/bot games are outside the validated model population.
+    if not dg:
+        return {"available": False, "reason": "A current timeline digest is not cached for this game.",
+                "can_fetch": timeline.rift_map(raw["info"]) == 11}
+    people = raw["info"]["participants"]
+    me = dg["pids"][dg["puuids"].index(puuid)] if puuid in dg["puuids"] else None
+    if puuid and me is None:
+        raise HTTPException(400, "Player did not participate in this match")
+    team = timeline.team_of(me, dg) if me is not None else 100
+    by_puuid = {p["puuid"]: p for p in people}
+    bought = timeline.parse_items(order["items"]) if order else []
+    start, steps = build_steps(bought, state.get("items", {}))
+    return {"available": True, "team": team, "me": me,
+            "odds_reason": "The win-probability model is evaluated on ranked solo queue only. Other match types show gold and events."
+                           if raw["info"].get("queueId") != SOLO_QUEUE else (report or {}).get("reason"),
+            "players": [{"participant_id": pid, "champion_id": by_puuid[who]["championId"],
+                         "position": by_puuid[who].get("teamPosition") or "", "team": timeline.team_of(pid, dg)}
+                        for pid, who in zip(dg["pids"], dg["puuids"])],
+            "start": start, "build": steps, "skills": order["skills"] if order else "",
+                        "first_shop": next((t for t, _ in bought if t >= 60), None),
+            "model": {"trained_at": trained, "label": params.get("label"),
+                                  "accuracy": ((report or {}).get("overall") or {}).get("accuracy")} if params else None,
+            **timeline.story(dg, team, me, model.ingame_chance(params))}
+
+
+@app.post("/api/match/{match_id}/timeline")
+async def fetch_story_timeline(match_id: str):
+    """Explicit, one-request timeline upgrade; legacy cached snapshots stay intact until success."""
+    with closing(store.connect()) as db:
+        raw = store.match_raw(db, match_id)
+        if not raw:
+            raise HTTPException(404, "Match not in the cache")
+        platform = db.execute("SELECT platform FROM matches WHERE match_id = ?", (match_id,)).fetchone()[0]
+    if timeline.rift_map(raw["info"]) != 11:
+        raise HTTPException(400, "Game stories are available for standard Summoner's Rift games")
+    async with history.fetch_slots():
+        try:
+            result = await state["riot"].timeline(platform, match_id)
+        except RiotError as e:
+            raise riot_errors(e)
+        with closing(store.connect()) as db:
+            try:
+                db.execute("BEGIN")
+                store.save_timeline(db, match_id, result)
+                db.commit()
+            except Exception:
+                db.rollback()
+                raise
+    return {"available": result is not None}
+
+
+@app.get("/api/player/{puuid}/draft")
+def draft_insights(puuid: str, role: str, opp: int | None = Query(None, ge=1),
+                   range_: str = Query(history.DEFAULT_RANGE, alias="range")):
+    if role not in stats.ROLES:
+        raise HTTPException(400, "Unknown role")
+    with closing(store.connect()) as db, store.read_snapshot(db):
+        player = store.get_player(db, puuid)
+        if not player:
+            raise HTTPException(404, "Unknown player")
+        games = history.window(stats.player_games(db, puuid), history.resolve(range_))
+        patch = shown_patch(db)[2]
+        population = stats.tier_population(db, player["tier"], patch)
+        return insights.draft(db, games, puuid, population, patch, role, opp)
+
+
+def goal_progress(db, puuid, goals):
+    """The newest ten role-games STARTED after a goal was set, independent of profile range."""
+    for goal in goals:
+        metric = goal["metric"]
+        if metric not in perf.METRICS:
+            continue
+        rows = db.execute(
+            f"""SELECT f.{metric} FROM participants p JOIN matches m ON m.match_id = p.match_id
+                LEFT JOIN perf f ON f.match_id = p.match_id AND f.puuid = p.puuid
+                WHERE p.puuid = ? AND p.position = ? AND m.queue_id = ? AND m.remake = 0
+                  AND m.game_start > ? ORDER BY m.game_start DESC, m.match_id DESC LIMIT 10""",
+            (puuid, goal["role"], SOLO_QUEUE, goal["created"] * 1000))
+        values = [r[0] for r in rows if isinstance(r[0], (int, float)) and math.isfinite(r[0])]
+        goal["progress"] = {"games": len(values), "value": sum(values) / len(values) if values else None}
+    return goals
+
+
+@app.get("/api/player/{puuid}/coaching")
+def coaching_insights(puuid: str, request: Request, range_: str = Query(history.DEFAULT_RANGE, alias="range")):
+    link = auth.get_account(request.state.user)
+    can_edit = bool(link and link["puuid"] == puuid)
+    goals = auth.get_goals(request.state.user, puuid) if can_edit else []
+    with closing(store.connect()) as db, store.read_snapshot(db):
+        player = store.get_player(db, puuid)
+        if not player:
+            raise HTTPException(404, "Unknown player")
+        games = history.window(stats.player_games(db, puuid), history.resolve(range_))
+        result = insights.coaching(db, games, puuid, player["tier"], shown_patch(db)[2])
+        result["forecast"] = insights.rank_forecast(store.rank_history(db, puuid, int(history.SEASON_TS)), dict(player))
+        result["goals"] = goal_progress(db, puuid, goals)
+    return {**result, "can_edit": can_edit}
+
+
+class CoachingGoal(BaseModel):
+    role: str
+    metric: str
+    target: float = Field(ge=0, le=10000, allow_inf_nan=False, strict=True)
+
+
+def require_own_account(request, puuid):
+    linked = auth.get_account(request.state.user)
+    if not linked or linked["puuid"] != puuid:
+        raise HTTPException(403, "Goals are private to your linked account")
+
+
+@app.post("/api/player/{puuid}/goals")
+def set_coaching_goal(puuid: str, body: CoachingGoal, request: Request):
+    require_own_account(request, puuid)
+    try:
+        auth.set_goal(request.state.user, puuid, body.role, body.metric, body.target)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from e
+    return {"goals": auth.get_goals(request.state.user, puuid)}
+
+
+@app.delete("/api/player/{puuid}/goals")
+def delete_coaching_goal(puuid: str, request: Request, role: str, metric: str):
+    require_own_account(request, puuid)
+    auth.delete_goal(request.state.user, puuid, role, metric)
+    return {"goals": auth.get_goals(request.state.user, puuid)}
+
+
+class LiveRole(BaseModel):
+    team: int
+    champion_id: int = Field(gt=0)
+    role: str
+
+
+class LiveRoles(BaseModel):
+    roles: list[LiveRole] = Field(min_length=10, max_length=10)
+    game_id: int | None = None
+
+
+@app.post("/api/live/{puuid}/odds")
+async def live_odds(puuid: str, body: LiveRoles):
+    """Only user-confirmed roles for the actual cached spectator lineup, never invented identities."""
+    if not LIVE_ODDS_ENABLED:
+        return {"ready": False, "reason": "Live odds are disabled pending Riot use-case review. Post-game estimates and model evidence remain available."}
+    cached = _live_cached(puuid)
+    game = cached["game"] if cached else None
+    if cached and time.time() - cached["at"] > LIVE_TTL:
+        # One explicit odds request can renew stale spectator data. Assignment may take >60s;
+        # a retry must not dead-end. live() reuses ranks/mastery if the game hasn't changed.
+        await live(puuid, form=False)
+        cached = _live_cached(puuid)
+        game = cached["game"] if cached else None
+    if not game:
+        raise HTTPException(409, "No current game. Refresh the live view before assigning roles")
+    if body.game_id is not None and body.game_id != game.get("gameId"):
+        raise HTTPException(409, "The game changed. Refresh the live view and assign the new lineup")
+    if game.get("gameQueueConfigId") != SOLO_QUEUE:
+        return {"ready": False, "reason": "The odds model covers ranked solo queue only"}
+    people = game["participants"]
+    slots = {(p["teamId"], p["championId"]): p for p in people}
+    assignments = {(r.team, r.champion_id): r.role for r in body.roles}
+    if len(people) != 10 or len(slots) != 10 or len(assignments) != 10 or slots.keys() != assignments.keys():
+        raise HTTPException(400, "Roles must match all ten champions in this live game")
+    if any({assignments[key] for key in assignments if key[0] == team} != set(stats.ROLES) for team in (100, 200)):
+        raise HTTPException(400, "Assign each role once per team")
+    players = [{"team_id": team, "champion_id": champion, "position": role,
+                "puuid": slots[(team, champion)].get("puuid")} for (team, champion), role in assignments.items()]
+    def prediction():
+        with closing(store.connect()) as db, store.read_snapshot(db):
+            return model.pregame_prediction(db, players, current_patch(db), start_cutoff=game.get("gameStartTime") or None)
+    return await asyncio.to_thread(prediction)
+
+
+@app.get("/api/clash/{platform}/{team_id}")
+async def clash_scout(platform: str, team_id: str, sync: bool = False):
+    if platform not in PLATFORMS:
+        raise HTTPException(400, "Unknown platform")
+    if not team_id or len(team_id) > 128:
+        raise HTTPException(400, "Invalid Clash team ID")
+    riot = state["riot"]
+    try:
+        team = await riot.clash_team(platform, team_id)
+    except RiotError as e:
+        raise riot_errors(e)
+    roster = team.get("players") or []
+    if len(roster) > 5:
+        raise HTTPException(502, "Riot returned an unexpected Clash roster")
+    members = []
+    for member in roster:
+        who = member.get("puuid")
+        role = scouting.normalize_role(member.get("position"))
+        if not who:
+            members.append({"puuid": None, "riot_id": "Unresolved player", "role": role, "tier": None})
+            continue  # legacy summoner IDs are not PUUIDs; do not invent a mapping
+        with closing(store.connect()) as db:
+            player = store.get_player(db, who)
+        if player and not sync:
+            members.append({"puuid": who, "riot_id": f'{player["game_name"]}#{player["tag_line"]}',
+                            "role": role, "tier": player["tier"]})
+            continue
+        try:
+            account = await riot.account_by_puuid(platform, who)
+            entries = await riot.league_entries(platform, who)
+            solo = next((e for e in entries if e.get("queueType") == "RANKED_SOLO_5x5"), {})
+            if sync:
+                mastery = await riot.mastery(platform, who)
+                with closing(store.connect()) as db:
+                    store.save_player(db, who, account["gameName"], account["tagLine"], platform, solo)
+                    store.save_mastery(db, who, mastery)
+                    db.commit()
+                history.start(riot.background(HISTORY_SHARE), platform, who, solo.get("tier", "UNRANKED"),
+                              history.last_n(scouting.RECENT_GAMES), replace=False, timelines=False)
+            members.append({"puuid": who, "riot_id": f'{account["gameName"]}#{account["tagLine"]}',
+                            "role": role, "tier": solo.get("tier", "UNRANKED")})
+        except RiotError as e:
+            if e.status in (401, 403):
+                raise riot_errors(e)
+            members.append({"puuid": who, "riot_id": "Name unavailable", "role": role, "tier": None})
+    def report():
+        with closing(store.connect()) as db:
+            return scouting.report(db, team, members)
+    return await asyncio.to_thread(report)
+
+
+@app.get("/api/odds")
+def odds():
+    """The win-probability models' scorecards: graded on the newest games, which they never saw."""
+    with closing(store.connect()) as db, store.read_snapshot(db):
+        return model.scorecards(db)
 
 
 @app.get("/api/builds/{champion_id}")

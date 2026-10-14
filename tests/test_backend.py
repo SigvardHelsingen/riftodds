@@ -318,14 +318,17 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
             meta = (await self.client.get("/api/meta")).json()
         self.assertEqual((meta["items"], meta["runes"]), ({"3031": "Infinity Edge"}, {"8010": runes[8010]}))
 
-    async def test_builds_backfill_runs_in_batches_until_done(self):
+    async def test_derived_backfills_run_in_batches_until_done(self):
         with patch.object(main.store, "connect", return_value=Mock()), \
-                patch.object(main.store, "backfill_builds", side_effect=["B1", "B2", None]) as backfill:
-            await main.backfill_builds()
-        self.assertEqual([c.args[1] for c in backfill.call_args_list], ["", "B1", "B2"])
+                patch.object(main.store, "backfill_builds", side_effect=["B1", "B2", None]) as builds, \
+                patch.object(main.store, "backfill_perf", side_effect=["P1", None]) as perf:
+            await main.backfill_derived()
+        self.assertEqual([c.args[1] for c in builds.call_args_list], ["", "B1", "B2"])
+        self.assertEqual([c.args[1] for c in perf.call_args_list], ["", "P1"])
         with patch.object(main.store, "connect", side_effect=sqlite3.OperationalError("database is locked")), \
-                self.assertLogs("sampler", "ERROR"):
-            await main.backfill_builds()  # logged, not raised into the event loop
+                self.assertLogs("sampler", "ERROR") as logs:
+            await main.backfill_derived()  # logged, not raised into the event loop
+        self.assertEqual(len(logs.records), 2, "A failing builds backfill doesn't skip the coaching one")
 
     async def test_item_data_failure_does_not_stop_startup(self):
         with patch.object(main, "load_items", new_callable=AsyncMock, side_effect=httpx.ConnectError("down")), \
@@ -422,11 +425,11 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         riot = SimpleNamespace(http=SimpleNamespace(aclose=AsyncMock()))
         self.store_connect.side_effect = None
         self.store_connect.return_value = Mock()
-        with patch.object(main, "Riot", return_value=riot), patch.object(main, "load_champions", new_callable=AsyncMock, return_value=("26.20.1", {})), patch.object(main, "load_spells", new_callable=AsyncMock, return_value={}), patch.object(main, "load_items", new_callable=AsyncMock, return_value={}), patch.object(main, "load_runes", new_callable=AsyncMock, return_value={}), patch.object(main, "ensure_cache_matches_key", new_callable=AsyncMock), patch.object(main.store, "backfill_bans"), patch.object(main, "refresh_ddragon", side_effect=refresh), patch.object(main, "backfill_builds", new_callable=AsyncMock) as backfill_builds, patch.dict(main.SAMPLER, {"enabled": False}):
+        with patch.object(main, "Riot", return_value=riot), patch.object(main, "load_champions", new_callable=AsyncMock, return_value=("26.20.1", {})), patch.object(main, "load_spells", new_callable=AsyncMock, return_value={}), patch.object(main, "load_items", new_callable=AsyncMock, return_value={}), patch.object(main, "load_runes", new_callable=AsyncMock, return_value={}), patch.object(main, "ensure_cache_matches_key", new_callable=AsyncMock), patch.object(main.store, "backfill_bans"), patch.object(main, "refresh_ddragon", side_effect=refresh), patch.object(main, "backfill_derived", new_callable=AsyncMock) as backfill_derived, patch.dict(main.SAMPLER, {"enabled": False}):
             async with main.lifespan(main.app):
                 await asyncio.sleep(0)
             self.assertTrue(stopped.is_set())
-            backfill_builds.assert_awaited_once_with()
+            backfill_derived.assert_awaited_once_with()
         riot.http.aclose.assert_awaited_once_with()
 
 

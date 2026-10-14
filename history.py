@@ -159,6 +159,13 @@ class FetchChunkError(RuntimeError):
         super().__init__("Failed to cache results: " + "; ".join(errors))
 
 
+def fetch_slots():
+    """Shared bounded download slots, including explicit single-timeline refreshes."""
+    global _fetch_slots
+    _fetch_slots = _fetch_slots or asyncio.Semaphore(FETCH_BATCHES)
+    return _fetch_slots
+
+
 async def fetch_chunk(riot, db, platform, ids, tier, timelines=True):
     """Commit valid results in bounded batches, then report failures across all IDs.
 
@@ -167,15 +174,14 @@ async def fetch_chunk(riot, db, platform, ids, tier, timelines=True):
     No transaction spans a network/slot wait. Cancellation rolls back only the
     current batch, leaving earlier commits cached.
     """
-    global _fetch_slots
     if db.in_transaction:
         raise ValueError("commit pending work before fetching matches")
     errors = []
     try:
-        _fetch_slots = _fetch_slots or asyncio.Semaphore(FETCH_BATCHES)
+        slots = fetch_slots()
         for i in range(0, len(ids), FETCH_BATCH):
             batch = ids[i:i + FETCH_BATCH]
-            async with _fetch_slots:
+            async with slots:
                 need_match = [m for m in batch if not store.has_match(db, m)]
                 need_tl = [m for m in batch if timelines and not store.has_timeline(db, m)]
                 results = await asyncio.gather(*(riot.match(platform, m) for m in need_match),
