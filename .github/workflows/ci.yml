@@ -50,6 +50,12 @@ jobs:
           node-version: 24
       - name: Syntax check
         run: for f in static/*.js tests/*.cjs; do node --check "$f"; done
+      - name: Training core, review, lab and clock checks
+        run: |
+          node tests/training-core.cjs
+          node tests/training-review.cjs
+          node tests/training-lab.cjs
+          node tests/training-sync.cjs
       - name: Install Playwright and Chromium
         # playwright pins playwright-core exactly, so the one exact version below fixes the whole tree
         run: |  # zizmor: ignore[adhoc-packages]
@@ -61,5 +67,33 @@ jobs:
           NODE_PATH: .browser-tools/node_modules
       - name: Insight panel checks
         run: node tests/insights.cjs
+        env:
+          NODE_PATH: .browser-tools/node_modules
+      - name: Training hub and experiment browser checks
+        run: node tests/training-core.cjs --browser
+        env:
+          NODE_PATH: .browser-tools/node_modules
+      - name: Training review, lesson and puzzle browser checks
+        run: node tests/training-review.cjs --browser
+        env:
+          NODE_PATH: .browser-tools/node_modules
+      - name: Training lab save and draft regressions
+        run: node tests/training-lab.cjs --browser
+        env:
+          NODE_PATH: .browser-tools/node_modules
+      - name: Training local clock and cached context browser checks
+        run: node tests/training-sync.cjs --browser
+        env:
+          NODE_PATH: .browser-tools/node_modules
+      - name: Training match tracking and review queue fixture/browser checks
+        run: node tests/training-matches.cjs
+        env:
+          NODE_PATH: .browser-tools/node_modules
+      - name: Private training team browser checks
+        run: node tests/training-team.cjs
+        env:
+          NODE_PATH: .browser-tools/node_modules
+      - name: Integrated training browser journeys
+        run: node tests/training.cjs
         env:
           NODE_PATH: .browser-tools/node_modules

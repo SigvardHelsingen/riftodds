@@ -399,6 +399,10 @@ def main(argv):
         elif cmd == "remove" and name:
             if not exists:
                 sys.exit(f"No user {name}.")
+            # Training imports auth for the member DB path; keep this import local.
+            import training
+            db.execute("BEGIN IMMEDIATE")
+            training.erase_member(db, name)
             db.execute("DELETE FROM users WHERE username = ?", (name,))
             db.execute("DELETE FROM sessions WHERE username = ?", (name,))
             db.execute("DELETE FROM accounts WHERE username = ?", (name,))

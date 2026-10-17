@@ -5,4 +5,6 @@ cache.db*
 users.db*
 riot.txt
 .browser-tools/
+# Superseded simulator preserved locally; never serve or deploy these files.
+/legacy-practice/
 .DS_Store

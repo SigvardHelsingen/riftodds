@@ -1,0 +1,854 @@
+/* Training workspace — Ember ink, warm paper, one takeaway before the details.
+   Keep every rule local: public profiles, the topbar and legal copy are untouched. */
+
+.training,
+.training-lab {
+  min-width: 0;
+  max-width: 100%;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+}
+
+.training {
+  margin-block: 28px;
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  line-height: 1.5;
+}
+
+.training *,
+.training *::before,
+.training *::after {
+  box-sizing: border-box;
+}
+
+.training .training {
+  margin-block: 0;
+}
+
+.training :where(div, section, article, header, form, fieldset, details, label, li, dl, dt, dd) {
+  min-width: 0;
+}
+
+.training [hidden] {
+  display: none !important;
+}
+
+.training :where(a, button, input, select, textarea, summary, [tabindex]) {
+  scroll-margin-block: 7rem 2rem;
+}
+
+.training :focus-visible {
+  outline: 3px solid var(--ink);
+  outline-offset: 3px;
+  box-shadow: 0 0 0 2px var(--card);
+}
+
+/* A restrained heading and normal document flow, rather than dashboard tiles. */
+.training-head {
+  min-width: 0;
+  margin-block: 0 20px;
+  padding-block-end: 16px;
+  border-bottom: 3px solid var(--ink);
+}
+
+.training h1 {
+  max-width: 22ch;
+  margin: 0 0 12px;
+  font: 900 clamp(36px, 5.5vw, 64px)/1.04 var(--display);
+  letter-spacing: -.01em;
+  text-transform: none;
+  text-wrap: balance;
+}
+
+.training h2 {
+  margin: 0 0 10px;
+  font: 800 clamp(25px, 3vw, 32px)/1.15 var(--display);
+  letter-spacing: .01em;
+  text-transform: none;
+}
+
+.training h3 {
+  margin: 0 0 10px;
+  font: 800 24px/1.2 var(--display);
+}
+
+.training h4 {
+  margin: 16px 0 8px;
+  font-size: 16px;
+  line-height: 1.4;
+}
+
+.training h5 {
+  margin: 14px 0 6px;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
+.training p {
+  margin: 8px 0 12px;
+}
+
+.training-head p {
+  max-width: 76ch;
+}
+
+.training-head > :first-child,
+.training-card > :first-child {
+  margin-block-start: 0;
+}
+
+.training-head > :last-child,
+.training-card > :last-child {
+  margin-block-end: 0;
+}
+
+.training [data-training-content] .training-head {
+  margin-block-end: 16px;
+  padding-block-end: 12px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.training [data-training-content] .training-head h1 {
+  font-size: clamp(28px, 4vw, 42px);
+}
+
+.training-muted {
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.training small {
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.training :is([data-focus-summary], [data-experiment-comparison]) > p:first-child {
+  padding: 10px 12px;
+  border-left: 4px solid var(--plum);
+  background: var(--peach-wash);
+}
+
+.training-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 16px;
+  min-width: 0;
+  margin-block: 16px;
+}
+
+.training-grid > * {
+  min-width: 0;
+}
+
+.training-card {
+  min-width: 0;
+  max-width: 100%;
+  margin-block: 0 16px;
+  padding: 20px;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  background: var(--card);
+}
+
+.training-grid > .training-card,
+.training-list > .training-card {
+  margin-block: 0;
+}
+
+.training-card .training-card {
+  padding: 16px;
+  border: 1px solid var(--rule);
+  background: var(--paper);
+}
+
+/* Unselected puzzle attempts and unopened team editors have no empty chrome. */
+.training-card:empty {
+  display: none;
+}
+
+/* Inputs remain full-width inside shrinking grid tracks, including native dates. */
+.training-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-content: start;
+  gap: 14px;
+  min-width: 0;
+  margin-block: 14px 0;
+}
+
+.training label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.45;
+}
+
+.training :is(input, select, textarea) {
+  box-sizing: border-box;
+  min-width: 0;
+  width: 100%;
+  max-width: 100%;
+  min-height: 44px;
+  padding: 9px 10px;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 16px;
+  line-height: 1.4;
+  accent-color: var(--ink);
+}
+
+.training select {
+  text-overflow: ellipsis;
+}
+
+/* WebKit's native menulist can ignore min-height. Keep the real select/popup,
+   but draw its chevron locally so the control honours the 44px target. */
+.training select:not([multiple]):not([size]) {
+  appearance: none;
+  padding-inline-end: 34px;
+}
+
+.training label:has(> select:not([multiple]):not([size])) {
+  position: relative;
+}
+
+.training label:has(> select:not([multiple]):not([size]))::after {
+  position: absolute;
+  inset-inline-end: 14px;
+  bottom: 19px;
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid currentColor;
+  border-bottom: 2px solid currentColor;
+  content: "";
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+.training textarea {
+  display: block;
+  min-height: 96px;
+  resize: vertical;
+}
+
+.training :is(input, textarea)::placeholder {
+  color: var(--muted);
+  opacity: 1;
+}
+
+.training :is(input, select, textarea):disabled {
+  background: var(--track);
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+.training :is(input, textarea)[readonly] {
+  background: var(--paper);
+}
+
+.training :is(input, select, textarea)[aria-invalid="true"] {
+  border-color: var(--plum);
+  border-style: dashed;
+}
+
+/* Native check/radio glyphs stay compact; the entire >=44px label is the target.
+   Puzzle radios are emitted after their label text, so reverse that row only. */
+.training input:is([type="checkbox"], [type="radio"]) {
+  flex: 0 0 22px;
+  width: 22px;
+  min-width: 22px;
+  height: 22px;
+  min-height: 22px;
+  margin: 0;
+  padding: 0;
+}
+
+.training label:has(> input:is([type="checkbox"], [type="radio"])) {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 44px;
+  padding: 10px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  cursor: pointer;
+}
+
+.training label:has(> input[type="radio"]) {
+  flex-direction: row-reverse;
+  justify-content: flex-end;
+}
+
+.training label:has(> input:checked) {
+  border-color: var(--rule);
+  background: var(--peach-wash);
+}
+
+.training label:has(> input:disabled) {
+  cursor: default;
+}
+
+.training input[type="file"] {
+  min-height: 56px;
+  padding: 4px;
+  overflow: hidden;
+}
+
+.training input[type="file"]::file-selector-button {
+  min-width: 44px;
+  min-height: 44px;
+  max-width: 100%;
+  margin-inline-end: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--ink);
+  border-radius: 4px;
+  background: var(--paper);
+  color: var(--ink);
+  font: inherit;
+  cursor: pointer;
+}
+
+.training fieldset {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  max-width: 100%;
+  margin: 0;
+  padding: 14px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--paper);
+}
+
+.training legend {
+  max-width: 100%;
+  padding-inline: 4px;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: normal;
+}
+
+.training :is([data-choices], [data-observations], [data-moments]) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+
+.training-form > :is(p, .training-grid, .training-actions, .training-inline, .training-details),
+.training fieldset > :is(p, .training-grid, .training-actions, .training-inline, .training-details) {
+  margin-block: 0;
+}
+
+.training-form > button,
+.training fieldset > button {
+  justify-self: start;
+}
+
+.training-tools {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 100px), 1fr));
+  gap: 4px 16px;
+  margin-block: 16px;
+  padding-block: 12px;
+  border-block: 1px solid var(--track);
+}
+
+/* Secondary actions are paper buttons, not a wall of equally loud dark blocks. */
+.training a[href] {
+  display: inline-flex;
+  align-items: center;
+  min-width: 44px;
+  min-height: 44px;
+  max-width: 100%;
+  text-decoration-thickness: .08em;
+  text-underline-offset: .2em;
+}
+
+.training :is(button, .btn) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-width: 44px;
+  min-height: 44px;
+  max-width: 100%;
+  padding: 10px 14px;
+  border: 2px solid var(--ink);
+  border-radius: var(--radius);
+  background: transparent;
+  color: var(--ink);
+  font: 800 17px/1.25 var(--display);
+  letter-spacing: .01em;
+  text-align: center;
+  text-decoration: none;
+  text-transform: none;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.training button[type="submit"],
+.training a.btn:not(.ghost),
+.training button[aria-pressed="true"] {
+  border-color: var(--ink);
+  background: var(--ink);
+  color: var(--card);
+}
+
+.training button[type="submit"] {
+  color: var(--peach);
+}
+
+.training button[aria-pressed="true"] {
+  text-decoration: underline;
+  text-underline-offset: .2em;
+}
+
+.training :is(button, .btn):is(:disabled, [aria-disabled="true"]) {
+  border-color: var(--muted);
+  background: var(--track);
+  color: var(--muted);
+  cursor: not-allowed;
+  opacity: 1;
+}
+
+.training button[aria-busy="true"] {
+  cursor: progress;
+}
+
+.training-actions,
+.training-inline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 8px;
+  min-width: 0;
+  max-width: 100%;
+  margin-block: 12px;
+}
+
+.training-actions > *,
+.training-inline > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.training-actions > label,
+.training-inline > label {
+  flex: 1 1 10rem;
+}
+
+.training-inline > label:has(> input:is([type="checkbox"], [type="radio"])) {
+  flex-basis: 100%;
+}
+
+.training-status {
+  min-width: 0;
+  min-height: 1.5em;
+  margin-block: 8px 12px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.training-status:not(:empty) {
+  padding: 10px 12px;
+  border-left: 3px solid var(--ink);
+  background: var(--peach-wash);
+}
+
+.training-status:is(.error, [role="alert"]) {
+  border-color: var(--plum);
+  color: var(--plum);
+  font-weight: 600;
+}
+
+.training :is([data-dirty], [data-attempt-status], [data-list-status], [data-mark-count]) {
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.training [data-dirty] {
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+/* Keep native disclosure markers and keyboard behavior. No faux tabs. */
+.training-details {
+  min-width: 0;
+  max-width: 100%;
+  margin-block: 14px;
+  border-top: 1px solid var(--rule);
+}
+
+.training-details > summary {
+  min-width: 44px;
+  min-height: 44px;
+  padding: 12px 4px;
+  font-weight: 600;
+  line-height: 1.4;
+  list-style-position: inside;
+  cursor: pointer;
+}
+
+.training-details > summary::marker {
+  color: var(--plum);
+}
+
+.training-details[open] > summary {
+  margin-block-end: 12px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.training-details > label {
+  margin-block: 12px;
+}
+
+.training-grid > .training-details {
+  margin: 0;
+  padding: 12px;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--paper);
+}
+
+.training-card.training-details > summary {
+  padding-inline: 0;
+}
+
+.training-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  margin-block: 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.training-list > li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding-block: 10px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.training-list > li:last-child {
+  border-bottom: 0;
+}
+
+.training-list > li > :is(p, small, h3, dl) {
+  flex-basis: 100%;
+  margin-block: 0;
+}
+
+.training-list > li > .btn:first-child {
+  flex: 1 1 14rem;
+  justify-content: flex-start;
+  font: 600 14px/1.45 "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  text-align: left;
+}
+
+.training-list > .training-details {
+  margin-block: 0;
+}
+
+.training ol.training-list {
+  display: block;
+  padding-inline-start: 1.6rem;
+  list-style: decimal;
+}
+
+.training ol.training-list > li {
+  display: list-item;
+}
+
+.training :is(ol, ul):not(.training-list) {
+  padding-inline-start: 1.5rem;
+}
+
+.training :is(ol, ul):not(.training-list) > li + li {
+  margin-block-start: 6px;
+}
+
+.training dl {
+  margin-block: 12px;
+}
+
+.training dt {
+  margin-block-start: 12px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.training dd {
+  margin: 2px 0 0;
+  white-space: pre-wrap;
+}
+
+/* Tables have two producers: table.training-table and div.training-table > table.
+   Only wrappers scroll; never make the document wider or restyle table semantics. */
+.training .table-scroll,
+.training-table:not(table) {
+  min-width: 0;
+  max-width: 100%;
+  margin-block: 12px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--card);
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  scroll-padding-inline: 12px;
+  scrollbar-color: var(--ink) var(--track);
+}
+
+.training table.training-table,
+.training-table > table {
+  width: 100%;
+  min-width: 34rem;
+  border-collapse: collapse;
+  font-size: 13px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+}
+
+.training-table caption {
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 13px;
+  text-align: left;
+  white-space: normal;
+}
+
+.training-table :is(th, td) {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: top;
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.training-table thead th {
+  border-bottom: 2px solid var(--ink);
+  background: var(--paper);
+  font: 800 14px/1.35 var(--display);
+  letter-spacing: .02em;
+  text-transform: uppercase;
+}
+
+.training-table tbody th {
+  font: 600 13px/1.5 "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.training-table tbody tr:last-child > :is(th, td) {
+  border-bottom: 0;
+}
+
+/* Exact board coordinates stay usable, not squeezed into tiny mobile inputs. */
+.training-table table:has([data-marks]),
+.training table.training-table:has([data-marks]) {
+  min-width: 68rem;
+}
+
+.training-table td:has(input[type="number"]) {
+  min-width: 7rem;
+}
+
+.training-table td:has(input:not([type="number"])) {
+  min-width: 12rem;
+}
+
+.training-table td:has(select) {
+  min-width: 9rem;
+}
+
+.training-table td:has(button) {
+  min-width: 10rem;
+}
+
+.training-table label {
+  font-size: 12px;
+}
+
+/* Intrinsic video aspect takes over after metadata loads; 16:9 is only a fallback.
+   The script sets maxHeight inline, so this one override enforces the 480px cap.
+   Keep the video borderless/unpadded and centred: frameRect() measures its box. */
+.training-video {
+  position: relative;
+  min-width: 0;
+  max-width: 100%;
+  margin-block: 12px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: var(--ink);
+  overflow: hidden;
+}
+
+.training-video video {
+  display: block;
+  width: 100%;
+  height: auto;
+  max-height: min(480px, 65vh) !important;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  aspect-ratio: auto 16 / 9;
+  object-fit: contain;
+  object-position: 50% 50%;
+}
+
+/* JS owns display, left/top, width/height and pointer-events for the picture area.
+   No inset:0, size constraints, transforms or generic SVG sizing on this overlay. */
+.training-overlay {
+  position: absolute;
+  display: none;
+  z-index: 1;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+}
+
+.training-overlay:focus-visible,
+.training-video video:focus-visible {
+  outline: 3px solid var(--peach);
+  outline-offset: -4px;
+  box-shadow: none;
+}
+
+/* Original vector schematics only; no canvas fill or remotely fetched map assets. */
+.training-board {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 680px;
+  height: auto;
+  margin: 12px auto;
+  padding: 0;
+  border: 1px solid var(--rule);
+  border-radius: var(--radius);
+  background: var(--paper);
+  color: var(--ink);
+  touch-action: pan-y;
+}
+
+.training-board text {
+  font-family: var(--mono);
+}
+
+.training-lab > .training-grid {
+  margin-block-start: 0;
+}
+
+@media (hover: hover) {
+  .training a[href]:not(.btn):hover {
+    color: var(--plum);
+  }
+
+  .training :is(button, .btn):not(:disabled):not([aria-disabled="true"]):hover {
+    border-color: var(--plum);
+    background: var(--peach-wash);
+    color: var(--plum);
+  }
+
+  .training button[type="submit"]:not(:disabled):hover {
+    background: var(--plum);
+    color: var(--card);
+  }
+
+  .training-details > summary:hover,
+  .training input[type="file"]::file-selector-button:hover {
+    background: var(--peach-wash);
+  }
+}
+
+@media (max-width: 800px) {
+  .training-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .training-form .training-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .training {
+    margin-block: 20px;
+  }
+
+  .training-head {
+    margin-block-end: 16px;
+    padding-block-end: 12px;
+  }
+
+  .training-card,
+  .training-card .training-card {
+    padding: 12px;
+  }
+
+  .training-grid,
+  .training-form .training-grid {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 12px;
+  }
+
+  .training fieldset {
+    padding: 10px;
+  }
+
+  .training-actions > *,
+  .training-inline > label {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  .training-form > button,
+  .training fieldset > button {
+    justify-self: stretch;
+    width: 100%;
+  }
+
+  .training-list > li > .btn {
+    flex-basis: 100%;
+    width: 100%;
+  }
+}
+
+@media (forced-colors: active) {
+  .training :focus-visible {
+    outline: 3px solid Highlight;
+    box-shadow: none;
+  }
+
+  .training button[aria-pressed="true"],
+  .training label:has(> input:checked) {
+    border-color: Highlight;
+  }
+
+  .training-status:not(:empty),
+  .training-card,
+  .training-details,
+  .training .table-scroll,
+  .training-table:not(table) {
+    border-color: CanvasText;
+  }
+}

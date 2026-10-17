@@ -1,10 +1,12 @@
-// Optional browser regression checks. All requests are fixtures; no running backend is needed.
+// Existing-app browser regressions. All requests are fixtures; no running backend is needed.
+// Training journeys live in training.cjs; the retired simulator is archived outside active tests.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const playwright = require("playwright");
 
 const root = path.resolve(__dirname, "..");
+const unexpectedWorkspaceRequests = [];
 const winrate = (games = 20, wins = 12) => ({ games, wins, wr: games ? wins / games : null, lo: 0.38, hi: 0.79 });
 const champions = {
   1: { name: "Aurelion Sol", icon: "https://images.test/1.png" },
@@ -263,17 +265,27 @@ const clashInsights = { team: { name: `Team ${unsafeText}`, tag: "TEST", tier: 2
 async function fixturePage(browser, width, options = {}) {
   const context = await browser.newContext({ viewport: { width, height: 900 }, reducedMotion: options.reducedMotion || "reduce" });
   const page = await context.newPage();
+
   const errors = [];
   page.on("pageerror", (err) => { errors.push(err.message); if (process.env.DEBUG) console.error(err); });
   const state = { authenticated: options.authenticated !== false, liveRequests: 0, pickAlphas: [], buildQueries: [], matchQueues: [], matchRequests: [], randomRequests: [],
-    storyRequests: [], timelineRequests: [], insightRequests: [], analysisRequests: [], picksRequests: [], pickQueries: [], liveSnapshots: [], goals: clone(options.goals || []) };
+    storyRequests: [], timelineRequests: [], insightRequests: [], analysisRequests: [], picksRequests: [], pickQueries: [], liveSnapshots: [],
+    goals: clone(options.goals || []) };
   await page.route("**/*", async (route) => {
     const url = new URL(route.request().url());
+    if (/^\/static\/practice(?:[./-]|$)/.test(url.pathname) || /^\/api\/training(?:\/|$)/.test(url.pathname)) {
+      unexpectedWorkspaceRequests.push(`${route.request().method()} ${url.href}`);
+      return route.fulfill({ status: 599, contentType: "application/json", body: JSON.stringify({ detail: "Existing-app routes must not fetch private training data or load the old simulator." }) });
+    }
     if (url.host !== "rift.test" || url.pathname === "/favicon.ico" || /^\/static\/(favicon|apple-touch-icon)/.test(url.pathname)) {
       return route.fulfill({ contentType: "image/svg+xml", body: '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"></svg>' });
     }
     const files = { "/": ["static/index.html", "text/html"], "/static/app.js": ["static/app.js", "text/javascript"], "/static/style.css": ["static/style.css", "text/css"],
-      "/static/insights.js": ["static/insights.js", "text/javascript"], "/static/insights.css": ["static/insights.css", "text/css"] };
+      "/static/insights.js": ["static/insights.js", "text/javascript"], "/static/insights.css": ["static/insights.css", "text/css"],
+      "/static/training.js": ["static/training.js", "text/javascript"], "/static/training.css": ["static/training.css", "text/css"],
+      "/static/training-review.js": ["static/training-review.js", "text/javascript"],
+      "/static/training-team.js": ["static/training-team.js", "text/javascript"],
+      "/static/training-lab.js": ["static/training-lab.js", "text/javascript"] };
     if (files[url.pathname]) {
       const [file, contentType] = files[url.pathname];
       return route.fulfill({ contentType, body: fs.readFileSync(path.join(root, file)) });
@@ -806,6 +818,8 @@ async function checkWidth(browser, width) {
         assert.equal(request.path, "/api/player/player/coaching");
         assert.deepEqual(request.query, { range: "20" });
         assert.equal(await page.locator('[data-goal-action="start"]').count(), 2);
+        assert.deepEqual(await page.locator(".insight-drill").evaluateAll((links) => links.map((link) => [link.getAttribute("href"), link.getBoundingClientRect().height >= 44])),
+          [["#/practice/lasthit?focus=CS+per+minute&role=MIDDLE", true], ["#/practice/review?focus=Deaths+per+game&role=MIDDLE", true]], "Coaching links preserve the focus and role in manual practice and review routes");
         assert.equal(await page.locator('.insight-percentile[role="meter"]').getAttribute("aria-valuenow"), "35");
         assert.equal(await page.locator(".insight-percentile").count(), 2, "Missing percentiles are not fabricated as zero");
         await page.locator('[data-goal-action="start"]').first().click();
@@ -2018,7 +2032,11 @@ async function checkStates(browser) {
   try {
     const failures = [];
     const run = async (label, check) => {
-      try { await check(); }
+      const workspaceRequestsBefore = unexpectedWorkspaceRequests.length;
+      try {
+        await check();
+        assert.deepEqual(unexpectedWorkspaceRequests.slice(workspaceRequestsBefore), [], "Existing-app navigation must not request private training data or simulator assets");
+      }
       catch (error) { failures.push(label); console.error(`FAIL: ${label}\n${error.stack}`); }
     };
     for (const width of [320, 375, 390, 768, 1280]) {

@@ -1,3 +1,4 @@
+import json
 import os
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -95,12 +96,23 @@ class DataDragonTests(unittest.IsolatedAsyncioTestCase):
                 if versions_calls < 3:
                     return httpx.Response(503, text="not JSON")
                 return httpx.Response(200, json=["26.20.1"])
-            return httpx.Response(200, json={"data": {"Annie": {"key": "1", "name": "Annie", "id": "Annie"}}})
+            # raw text: httpx's json= refuses Infinity, which Python's parser (and so Data Dragon parsing) accepts
+            return httpx.Response(200, content=json.dumps({"data": {
+                "Annie": {"key": "1", "name": "Annie", "id": "Annie"},
+                "Ashe": {"key": "22", "name": "Ashe", "id": "Ashe", "stats": {
+                    "movespeed": 325, "attackdamage": 59, "attackspeed": 0.658, "attackrange": 600, "hp": 610}},
+                "Odd": {"key": "999", "name": "Odd", "id": "Odd", "stats": {
+                    "movespeed": "fast", "attackdamage": 0, "attackspeed": float("inf"), "attackrange": True}},
+            }}).encode(), headers={"Content-Type": "application/json"})
 
         with patch.object(riot.httpx, "AsyncClient", side_effect=self.client_factory(respond)), patch.object(riot.asyncio, "sleep", new_callable=AsyncMock) as sleep:
             version, champions = await riot.load_champions()
         self.assertEqual(version, "26.20.1")
         self.assertEqual(champions[1]["name"], "Annie")
+        # practice drills read level-1 movement and attack stats; absent or malformed values are left out
+        self.assertEqual(champions[1]["stats"], {})
+        self.assertEqual(champions[22]["stats"], {"ms": 325, "ad": 59, "as": 0.658, "range": 600})
+        self.assertEqual(champions[999]["stats"], {})
         self.assertEqual(len(requests), 4)
         self.assertEqual([call.args[0] for call in sleep.await_args_list], [1, 2])
         self.assertTrue(all("X-Riot-Token" not in request.headers for request in requests))

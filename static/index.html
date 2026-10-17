@@ -13,18 +13,23 @@
   <link href="https://fonts.googleapis.com/css2?family=Big+Shoulders+Display:wght@700;800;900&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
   <link rel="stylesheet" href="/static/insights.css">
+  <link rel="stylesheet" href="/static/training.css">
 </head>
 <body>
   <header class="topbar">
     <div class="topbar-inner">
       <a href="#/" class="wordmark">RIFT<span>/</span>ODDS</a>
       <form class="search compact" id="top-search" hidden></form>
-      <div class="user" id="user" hidden><a class="btn ghost" id="admin-link" href="#/admin" hidden>Admin</a><a class="btn" id="my-profile" hidden>My profile</a><span id="username"></span><button class="btn ghost" id="logout">Log out</button></div>
+      <div class="user" id="user" hidden><a class="btn ghost" id="practice-link" href="#/practice">Practice</a><a class="btn ghost" id="admin-link" href="#/admin" hidden>Admin</a><a class="btn" id="my-profile" hidden>My profile</a><span id="username"></span><button class="btn ghost" id="logout">Log out</button></div>
     </div>
   </header>
-  <main id="app" aria-label="League player statistics"></main>
+  <main id="app" aria-label="League player statistics and training"></main>
   <footer class="legal">Rift Odds isn't endorsed by Riot Games and doesn't reflect the views or opinions of Riot Games or anyone officially involved in producing or managing Riot Games properties. Riot Games, and all associated properties are trademarks or registered trademarks of Riot Games, Inc.</footer>
   <script src="/static/app.js"></script>
   <script src="/static/insights.js"></script>
+  <script src="/static/training.js"></script>
+  <script src="/static/training-review.js"></script>
+  <script src="/static/training-team.js"></script>
+  <script src="/static/training-lab.js"></script>
 </body>
 </html>

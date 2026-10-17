@@ -243,7 +243,7 @@
   function renderCoaching(el, data, current) {
     const available = list(data.roles).filter((row) => roles.includes(row.role));
     let selected = available.find((row) => row.role === view.player.coachRole) || available[0];
-    el.innerHTML = `<header class="insight-head"><p class="insight-eyebrow">Patch ${esc(data.patch || 'unknown')} · ${esc(data.tier || 'no tier baseline')}</p><h2>Your next practice focus</h2></header>
+    el.innerHTML = `<header class="insight-head"><p class="insight-eyebrow">Patch ${esc(data.patch || 'unknown')} · ${esc(data.tier || 'no tier baseline')}</p><h2>Your next practice focus</h2><p><a class="insight-training" href="#/practice">Open my private training plan →</a></p></header>
       ${available.length ? `<label class="insight-role-picker">Compare a role<select aria-label="Coaching role" data-insight-controlled>${available.map((row) => `<option value="${esc(row.role)}"${row === selected ? ' selected' : ''}>${esc(roleName(row.role))} · ${count(row.games)} games</option>`).join('')}</select></label>` : ''}<div class="insight-role-content"></div>${forecastHtml(data.forecast)}`;
     const body = el.querySelector('.insight-role-content');
     const draw = () => {
@@ -251,7 +251,7 @@
       const focus = list(selected?.focus).slice(0, 3);
       const goals = list(data.goals).filter((goal) => !selected || goal.role === selected.role);
       body.innerHTML = selected ? `${details('Takeaway', `<p>${focus.length ? `For your next ten ${esc(roleName(selected.role))} games, focus on ${focus.map((metric) => esc(metric.label)).join(', ')}. Try one goal at a time and review the decisions, not just the number.` : 'There is no sufficiently sampled practice target for this role yet. That is not evidence that nothing can improve.'}</p><p class="insight-muted">${count(selected.games)} selected ${esc(roleName(selected.role))} role games. Targets are modest practice benchmarks, not promotion requirements.</p>`, true)}
-        <div class="insight-grid">${focus.map((metric, index) => `<article class="insight-box"><h3>${index + 1}. ${esc(metric.label)}</h3><p>${esc(metric.advice || '')}</p><p>Your mean <b>${metricValue(metric, metric.you)}</b> → practice target <b>${metricValue(metric, metric.target)}</b> (${metric.better === -1 ? 'lower' : 'higher'} direction; context matters).</p><p class="insight-muted">Halfway toward the sampled ${esc(metric.target_tier || 'peer')} mean. ${count(metric.games)} player samples.</p>${data.can_edit === true && finite(metric.target) ? goalAction('start', index, 'Start goal', goals.some((goal) => goal.metric === metric.key)) : ''}</article>`).join('')}</div>
+        <div class="insight-grid">${focus.map((metric, index) => `<article class="insight-box"><h3>${index + 1}. ${esc(metric.label)}</h3><p>${esc(metric.advice || '')}</p><p>Your mean <b>${metricValue(metric, metric.you)}</b> → practice target <b>${metricValue(metric, metric.target)}</b> (${metric.better === -1 ? 'lower' : 'higher'} direction; context matters).</p><p class="insight-muted">Halfway toward the sampled ${esc(metric.target_tier || 'peer')} mean. ${count(metric.games)} player samples.</p>${drillLink(metric.key, selected.role, metric.label)}${data.can_edit === true && finite(metric.target) ? goalAction('start', index, 'Start goal', goals.some((goal) => goal.metric === metric.key)) : ''}</article>`).join('')}</div>
         ${fingerprintHtml(selected, data.tier)}
         ${details('Metric comparisons and sample counts', metricsHtml(selected, data))}
         ${details('How to use these comparisons', `<p>${esc(selected.takeaway || 'Cached role-specific comparisons; missing values are not zero.')}</p>`)}`
@@ -272,6 +272,10 @@
     });
     draw();
   }
+  // A sampled gap is a starting point for a user-chosen plan, not a diagnosis or a guaranteed fix.
+  const DRILLS = { cs_min: ['lasthit', 'Plan consistent farming practice'], cs10: ['lasthit', 'Plan consistent farming practice'],
+    deaths: ['review', 'Review a positioning decision'] };
+  const drillLink = (key, role, label) => DRILLS[key] ? `<p><a class="insight-drill" href="#/practice/${DRILLS[key][0]}?${esc(new URLSearchParams({ focus: label, role }).toString())}">${DRILLS[key][1]} →</a></p>` : '';
   const goalAction = (action, index, label, saved = false) => `<div class="insight-action"><button type="button" class="insight-button insight-goal-button" data-goal-action="${action}" data-index="${index}"${saved ? ' disabled' : ''}>${saved ? 'Goal already saved' : esc(label)}</button><p class="insight-action-status" role="status" aria-live="polite"></p></div>`;
   function goalHtml(goal, selected, index, editable) {
     const metric = list(selected?.metrics).find((entry) => entry.key === goal.metric) || { label: goal.metric };

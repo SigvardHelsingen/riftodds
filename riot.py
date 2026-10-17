@@ -1,6 +1,7 @@
 """Thin async Riot API client with a sliding-window rate limiter."""
 import asyncio
 import copy
+import math
 import os
 import time
 from collections import deque
@@ -250,13 +251,24 @@ async def _ddragon_json(client, path):
     raise RuntimeError("Data Dragon retry attempts must be positive")
 
 
+PRACTICE_STATS = {"ms": "movespeed", "ad": "attackdamage", "as": "attackspeed", "range": "attackrange"}
+
+
+def _practice_stats(stats):
+    """Level-1 movement and basic-attack numbers for the practice drills; missing or odd values are left out."""
+    stats = stats if isinstance(stats, dict) else {}
+    return {key: stats[source] for key, source in PRACTICE_STATS.items()
+            if type(stats.get(source)) in (int, float) and math.isfinite(stats[source]) and stats[source] > 0}
+
+
 async def load_champions():
-    """(ddragon version, {championId: {name, icon}}) from Data Dragon."""
+    """(ddragon version, {championId: {name, icon, stats}}) from Data Dragon."""
     async with httpx.AsyncClient(timeout=20) as c:
         version = (await _ddragon_json(c, "/api/versions.json"))[0]
         data = (await _ddragon_json(c, f"/cdn/{version}/data/en_US/champion.json"))["data"]
     return version, {
-        int(ch["key"]): {"name": ch["name"], "icon": f"{DDRAGON}/cdn/{version}/img/champion/{ch['id']}.png"}
+        int(ch["key"]): {"name": ch["name"], "icon": f"{DDRAGON}/cdn/{version}/img/champion/{ch['id']}.png",
+                         "stats": _practice_stats(ch.get("stats"))}
         for ch in data.values()
     }
 

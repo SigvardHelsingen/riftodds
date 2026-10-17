@@ -66,6 +66,7 @@
 .insight-retry { visibility: hidden; }
 .insight-retry.insight-visible { visibility: visible; }
 .insight-action { margin-top: 12px; }
+.insight-drill, .insight-training { display: inline-flex; align-items: center; min-height: 44px; font-weight: 600; }
 .insight-goal-button { min-width: min(100%, 165px); }
 .insight-action-status { min-height: 3em; font-size: 13px; }
 .insight-form { display: grid; grid-template-columns: minmax(0, 1fr) minmax(100px, .6fr); gap: 12px; align-items: end; }

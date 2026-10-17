@@ -38,6 +38,7 @@ import scouting
 import stats
 import store
 import timeline
+import training_api
 from riot import PLATFORMS, Riot, RiotError, load_champions, load_items, load_runes, load_spells, profile_icon
 
 SOLO_QUEUE = 420
@@ -294,6 +295,7 @@ async def ensure_cache_matches_key(riot):
 # No /docs, /redoc or /openapi.json: they'd publish the members-only API to anyone.
 app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+app.include_router(training_api.router)
 
 # The client renders with innerHTML, so the CSP is the backstop for a missed esc(): scripts only from
 # this origin, images from Data Dragon, fonts from Google Fonts. Inline style attributes position the charts.
@@ -301,7 +303,7 @@ SECURITY_HEADERS = {
     "Content-Security-Policy": "; ".join((
         "default-src 'self'", "script-src 'self'", "connect-src 'self'",
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com", "font-src 'self' https://fonts.gstatic.com",
-        "img-src 'self' data: https://ddragon.leagueoflegends.com",
+        "img-src 'self' data: https://ddragon.leagueoflegends.com", "media-src 'self' blob:",
         "object-src 'none'", "base-uri 'none'", "form-action 'self'", "frame-ancestors 'none'")),
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "same-origin",
@@ -563,7 +565,8 @@ def index_html():
     """index.html with content-hashed asset URLs: after a deploy, browsers can't pair the new API
     with a cached old app.js."""
     html = (STATIC / "index.html").read_text()
-    for name in ("app.js", "style.css", "insights.js", "insights.css"):
+    for name in ("app.js", "style.css", "insights.js", "insights.css", "training.js", "training-review.js",
+                     "training-team.js", "training-lab.js", "training.css"):
         digest = hashlib.sha256((STATIC / name).read_bytes()).hexdigest()[:12]
         html = html.replace(f"/static/{name}", f"/static/{name}?v={digest}")
     return html

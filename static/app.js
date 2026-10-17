@@ -1,5 +1,6 @@
 // Rift Odds — tiny hash-routed SPA.  #/            → patch landing
 //                                    #/p/euw1/Name%23TAG/40 → player
+//                                    #/practice/... → private training workspace
 const $ = (s, root = document) => root.querySelector(s);
 const $$ = (s, root = document) => [...root.querySelectorAll(s)];
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -24,6 +25,7 @@ let DATA = null;
 let pollTimer = null;
 let ME = null; // { username, account }
 let nav = 0;    // bumped on every route; async renders bail out if it changed
+let acceptedHash = null;
 
 const playerHash = (platform, riotId, range) => `#/p/${platform}/${encodeURIComponent(riotId)}/${range}`;
 const myHash = () => ME?.account && playerHash(ME.account.platform, `${ME.account.game_name}#${ME.account.tag_line}`, view.player.range || META.default_range);
@@ -33,11 +35,11 @@ async function api(path, opts, current) {
   const body = await r.json().catch(() => ({}));
   if (r.status === 401 && path !== "/api/login") {
     if (!current || current()) showLogin(); // session expired or user removed; obsolete requests must not change routes
-    throw new Error("Not logged in");
+    throw Object.assign(new Error("Not logged in"), { status: 401 });
   }
   if (!r.ok) {
     const detail = Array.isArray(body.detail) ? body.detail.map((error) => error.msg).join("; ") : body.detail;
-    throw new Error(detail || `HTTP ${r.status}`);
+    throw Object.assign(new Error(detail || `HTTP ${r.status}`), { status: r.status });
   }
   return body;
 }
@@ -47,6 +49,8 @@ const postJSON = (path, data, current) =>
 
 // ---------------------------------------------------------------- login
 function showLogin() {
+  window.Training?.dispose(); // Forced expiry must clear media and private drafts without a confirmation.
+  acceptedHash = null;
   nav++;
   randomBuildResult = null;
   ME = null;
@@ -165,6 +169,15 @@ function prepareTables(root = $("#app")) {
 
 // ---------------------------------------------------------------- router
 async function route() {
+  if (window.Training && !window.Training.canLeave()) {
+    // hashchange runs after the address changes; cancel without replacing the live editor or its nav token.
+    if (acceptedHash !== null && location.hash !== acceptedHash) {
+      history.replaceState(null, "", location.pathname + location.search + acceptedHash);
+    }
+    return;
+  }
+  window.Training?.dispose();
+  acceptedHash = location.hash;
   nav++;
   clearInterval(pollTimer);
   clearInterval(livePoll);
@@ -179,6 +192,8 @@ async function route() {
     showOdds();
   } else if (location.hash === "#/admin") {
     showAdmin();
+  } else if (/^#\/practice(?:[/?]|$)/.test(location.hash)) {
+    showTraining();
   } else {
     showLanding();
   }
@@ -2021,6 +2036,9 @@ async function loadMatchDetail(mid) {
       <td class="num">${p.gold15 == null ? "–" : kpts(p.gold15)}</td>
       <td>${items(p.items)}</td></tr>`).join("")}</tbody></table></div>`).join("");
   el.insertAdjacentHTML("afterbegin", storySection(mid));
+  if (ME?.account?.puuid === DATA.puuid) {
+    el.insertAdjacentHTML("afterbegin", `<p class="training-match-link"><a class="btn ghost" href="#/practice/review?match=${encodeURIComponent(mid)}">Review my decisions</a> <span class="muted small">Private notes and your local recording · nothing is uploaded</span></p>`);
+  }
   loadStory($(".story", el));
   prepareTables(el);
 }
@@ -2173,8 +2191,15 @@ async function start() {
 }
 
 $("#logout").addEventListener("click", async () => {
-  await postJSON("/api/logout", {});
-  showLogin();
+  if (window.Training && !window.Training.canLeave()) return;
+  const button = $("#logout");
+  button.disabled = true;
+  try {
+    await postJSON("/api/logout", {});
+    showLogin();
+  } catch (error) {
+    if (ME) window.alert(`Couldn't log out. ${error.message}`);
+  } finally { button.disabled = false; }
 });
 window.addEventListener("hashchange", () => ME && META && route());
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });

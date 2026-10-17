@@ -33,6 +33,13 @@ interval, so "60% over 10 games" is shown with how sure it really is.
 - **Model evidence:** `#/odds` shows chronological holdout Brier/log-loss scores and reliability tables.
   Replay win-chance estimates appear only when an eligible model beats the frozen training-prior and
   50/50 baselines; other match types retain gold/event stories without solo-queue odds.
+- **Training workspace:** `#/practice` helps authenticated members choose one focus, follow manual workout
+  instructions inside League, and log sessions and baseline/practice experiments. Optionally track completed cached
+  matches against a frozen baseline and find reflection prompts for your own games. Review timestamped notes and
+  annotations with an optional on-device video and local match-clock alignment; turn takeaways into spaced lessons
+  and authored decision puzzles. Schematic strategy boards and simple calculators explain your own assumptions.
+  Records are private to your membership; private teams require invitation acceptance and explicit sharing, never
+  automatic access to personal notes. This replaces the browser League simulator, not League's Practice Tool.
 - **Admin page:** admins see each member's last visit, logins and player lookups.
 
 ## Running it yourself
@@ -72,8 +79,9 @@ SQLite targets 2 MiB of page cache per connection and uses disk for temporary qu
 
 The standing UI/data-safety rules are in [`AGENTS.md`](AGENTS.md). New features belong in existing
 views: game stories inside match fold-outs, purchase order inside builds, matchup/Clash tools inside
-Draft, and practice targets inside Coaching & habits. Charts always have numeric table views;
-background refreshes retain input, focus and disclosure state.
+Draft, and practice targets inside Coaching & habits. The training workspace is reached from the top bar and
+Coaching focus cards; linked-player match fold-outs offer a private review link. It adds no player-profile tabs.
+Charts always have numeric table views; background refreshes retain input, focus and disclosure state.
 
 ### Data readiness
 
@@ -106,6 +114,106 @@ background refreshes retain input, focus and disclosure state.
 - Goals are stored separately per member, current linked account, role and metric; unlinking/changing
   accounts removes them. Public/cohort responses do not contain another member's private goals. The
   existing self-link action is not Riot Sign On or proof of Riot account ownership.
+
+### Training workspace
+
+Training works with an authenticated member login even without a linked Riot account. Start at `#/practice`:
+
+- Save a one-focus weekly plan. Only one plan can be active; activating another archives the previous plan
+  without deleting its history. Six authored workouts cover last hits, recall preparation, jungle clears, vision
+  setup, rotation review and trading windows. Open League's Practice Tool or replay yourself and follow the
+  instructions there; the site neither runs a simulated League game nor controls the client.
+- Log sessions and reflections manually, including setup adherence and role/champion/patch context. A blank
+  session result is missing, not zero. The **Recent progress** section covers loaded manual sessions only;
+  optional cached-match observations are separate. Experiments compare manually recorded baseline and practice
+  means with sample counts and context; empty groups stay unavailable. These are descriptive comparisons,
+  not causal evidence or promises of rank gains.
+- In **Connect practice to match results and choose a review moment**, explicitly load cached match progress,
+  then choose **Start match tracking** for your saved plan. Tracking is opt-in, uses your currently linked account,
+  and captures a role, optional champion (any champion is allowed), queue, patch and the saved plan's game count
+  (1–20). It freezes the IDs of up to that many latest comparable games completed strictly before the start,
+  then observes the **first N** comparable games started strictly afterward once they are completed—not the newest N.
+  The start time retains fractional seconds, so a game already underway in the same second cannot slip in.
+  Only verified completed, non-remake Summoner's Rift games in supported queues qualify. Both baseline and practice
+  candidate searches inspect at most 200 cached matches each; this is not an all-history comparison. Missing baseline
+  games keep their place rather than being replaced. Each metric has its own sample count; missing measurements,
+  empty means and unavailable differences stay missing, not zero. Lane/jungle CS, lane gold and death measures are
+  shown only where applicable. Partial timelines cannot establish a complete early-death count; lane-gold samples
+  use a complete frame within 15 seconds of the target. Ordinary plan edits do not change the captured filters or window: explicitly restart
+  to replace them. Start/restart and stop advance the saved plan revision without saving or replacing editor drafts;
+  loading or refreshing cached progress never autosaves the plan or filter edits.
+- Choose **Find cached review prompts** for either this plan's captured subsequent-game window or the latest ten
+  completed cached Ranked Solo games across all roles, champions and patches. Only your currently linked account's
+  own games are eligible. The queue offers at most six prompts, at most three per game, with timeline-availability
+  counts and cached evidence. These are questions to investigate, not mistake verdicts, causal claims or recommended
+  plays; no prompts does not mean no mistakes, and a missing timeline is not a game without events. Queue links only
+  prefill the match and requested focus: they do not fetch context, create notes or save anything automatically.
+- Use `#/practice/review` for timestamped decisions: what was known, plausible options, your decision, outcome
+  and lesson, with arrows, circles or text annotations. A video is optional and must be playable by your browser.
+  Selecting a file creates a temporary on-device Blob URL: footage, filename, device path and Blob URL are never
+  saved or uploaded. Re-select the file on a later visit; detaching it or leaving the review revokes the URL.
+  Only explicitly saved notes, manual labels, timestamps, clock basis and annotation coordinates go to the member
+  database. Existing reviews default to **Video clock**; **Match clock** timestamps can be aligned by pausing at a known
+  game time and entering that time (video time = match time + local offset). The offset is strictly local, never
+  persisted or shared, and resets when the video, review or match changes. Changing a populated review's clock basis
+  requires alignment and confirmation, converts every numeric moment timestamp atomically, and fails without partial
+  changes if any conversion is invalid; it never merely relabels timestamps. Out-of-recording event/moment jumps report
+  unavailable rather than silently seeking to zero. Team copies retain clock labels; already-derived lessons/puzzles
+  keep their original clock labels. **Load cached match events** is a separate explicit action for your currently
+  linked account's completed game; loading context does not add notes. Choose **Create review moment** to add an
+  unsaved draft moment, then save explicitly. Cached retrospective evidence goes into Outcome, not what you knew
+  at the time. Neither action downloads a missing match or timeline.
+- Create personal question/answer lessons, including from saved review moments, and rate recall with Again,
+  Good or Easy; the server schedules the next review. Due lists cover loaded lessons, so load older records to
+  include older due dates. Decision puzzles are authored text scenarios, not footage analysis or an answer-key
+  score: explain a choice before revealing tradeoffs and discussion, then save your reasoning and reflection.
+- Use `#/practice/lab` for original schematic boards and physical-damage/armor/ability-haste calculations from
+  numbers you enter. Boards are not exact map geometry or live positions. Calculators omit item passives,
+  penetration, shields, critical strikes and ability/patch-specific interactions; they are not a combat simulator
+  or a build recommendation. Numeric fields and tables provide keyboard alternatives to drawing and overlays.
+- Invite existing members to private teams at `#/practice/team`. An invitation alone exposes neither documents
+  nor the roster: acceptance is required. Only reviews, puzzles and boards can be created in a team or explicitly
+  copied there; a copy is independent and never updates the personal original. Review/puzzle creators edit their
+  documents, accepted members can edit shared boards, and the team owner can moderate/delete. Plans, sessions,
+  lessons, attempts and experiments stay personal. No footage is shared; check notes for private information
+  before copying. Removing membership revokes future team reads, not copies someone has already made.
+
+Training makes **no new Riot calls** and has no AI analysis, live advice, client automation, recorder, video upload
+or footage scraping. It claims no Riot approval. Existing analytics and linked-account goals remain separate;
+unlinking or switching Riot accounts preserves training records and tracking links, but hides tracked cache progress
+until you relink the captured account or explicitly restart for the new one. Deleting a plan removes its tracking
+link, not independent notes. Removing a member with `auth.py remove <name>` erases their authored training data,
+tracking links and memberships and deletes their owned teams, including those teams' shared documents. Other members'
+independent copies are not recalled. Personal JSON export includes all personal records and a `tracking` field only
+when tracking links exist (captured account, filters, fractional start, game count and frozen baseline IDs), not team
+documents, cached match/timeline data, local calibration or video; it is not a video backup or workspace import feature.
+
+Storage is lazily added to `users.db` with additive tables. The ordinary workspace, CRUD and export remain independent
+of `cache.db`; only explicit match endpoints in `training_matches.py` open it read-only, without creating or migrating
+it, fetching Riot data or training models. Missing/old caches stay honestly unavailable. Cache-derived progress and
+review context are member-private, never part of player/cohort responses or team copies unless you explicitly author
+and share notes. Back up `users.db` using SQLite's backup API before deployment. The enforced limits in `training.py`
+are 200 authored records per member (personal records plus their authored documents in teams where membership is active),
+100 documents per team, 10 active/pending team memberships per member and 20 active/pending members per team
+(including the owner), with 32 KiB per record. Requests are capped
+at 40 KiB in `training_api.py`. Initial lists contain at most 50 newest records per kind, with explicit truncation
+flags and older-record pagination; export includes personal records beyond those initial pages. Leaving or losing
+team access frees the author’s member quota without deleting shared documents; those remain under the team cap.
+Pending re-invitations do not reclaim quota. Accepting re-invitation counts accessible authored documents again;
+if that exceeds the member cap, editing/deletion still works, but new records require freeing space first.
+
+Saves and deletes use revisions. A stale revision returns **409** and keeps your draft rather than overwriting
+newer data; compare/copy your draft before explicitly reloading. Unsaved drafts are page-local, not autosaved or
+stored in localStorage, and navigation warns before discarding them. Logout/session expiry clears private route
+state and local media; warnings are not durable draft recovery. See [`TRAINING_CONTRACT.md`](TRAINING_CONTRACT.md)
+for API, validation and ownership details.
+
+Deploy `training.py`, `training_api.py`, `training_matches.py`, their auth/app integration and all four
+`static/training*.js` modules plus `static/training.css` together; the app content-hashes these assets.
+The old simulator is no longer loaded. Keep
+its preserved code, artwork and tests in the ignored `legacy-practice/` archive, outside deployed `static/` and
+active `tests/`; do not deploy that archive. Old `#/practice/lasthit` and `#/practice/dodge` links now open the
+training hub with the last-hit or trading-window workout selected, not the old games. No new dependencies are needed.
 
 ### Odds and observed LP pace
 
@@ -154,22 +262,47 @@ JavaScript and CSS assets together; content-hashed URLs cover both new insight a
 ```sh
 uv run python -m unittest discover -s tests
 uvx ruff@0.17.0 check .   # bug-finding rules only; see [tool.ruff] in pyproject.toml
-node --check static/app.js
-node --check static/insights.js
+for f in static/*.js tests/*.cjs; do node --check "$f"; done
+node tests/training-core.cjs
+node tests/training-review.cjs
+node tests/training-lab.cjs
+node tests/training-sync.cjs
 ```
 
-Browser checks run against fully mocked responses at phone, tablet and desktop widths:
+The four training Node suites above need no browser. Browser checks use fully mocked responses at phone,
+tablet and desktop widths (installing the existing optional Playwright/Chromium tooling requires network access):
 
 ```sh
 npm install --prefix .browser-tools --no-save --package-lock=false playwright@1.64.0
 node .browser-tools/node_modules/playwright/cli.js install chromium
 NODE_PATH=.browser-tools/node_modules node tests/mobile.cjs
 NODE_PATH=.browser-tools/node_modules node tests/insights.cjs
+NODE_PATH=.browser-tools/node_modules node tests/training-core.cjs --browser
+NODE_PATH=.browser-tools/node_modules node tests/training-review.cjs --browser
+NODE_PATH=.browser-tools/node_modules node tests/training-lab.cjs --browser
+NODE_PATH=.browser-tools/node_modules node tests/training-sync.cjs --browser
+NODE_PATH=.browser-tools/node_modules node tests/training-matches.cjs
+NODE_PATH=.browser-tools/node_modules node tests/training-team.cjs
+NODE_PATH=.browser-tools/node_modules node tests/training.cjs
 ```
 
-These checks use fixture cache/member databases and mocked API responses only. The suites cover
-schema/legacy transitions, malformed/undo/timestamp handling, bounded aggregation, temporal leakage,
-calibration, goal privacy, stale requests, explicit network actions, and mobile/keyboard interaction.
+For an optional Safari-engine check, install WebKit with the same Playwright CLI (`install webkit`) and run
+`BROWSER=webkit NODE_PATH=.browser-tools/node_modules node tests/training.cjs`. CI uses Chromium.
+
+These checks use fixture cache/member databases and mocked API responses only, never real databases or Riot
+calls. Python discovery includes `test_training.py`, `test_training_api.py`, `test_training_integration.py` and
+`test_training_matches.py` for lazy/additive schema, strict validation and quotas, revision races, reference cleanup,
+member/team privacy, unlink/account-switch retention, tracking export/deletion, read-only cache boundaries, bounded
+candidate/digest work, frozen baseline/first-N windows and fractional-second opt-in boundaries. Training Node/browser
+suites cover manual plans/sessions, zero versus missing data, experiments, explicit tracking/refresh and review-queue
+scopes, local-video metadata boundaries and Blob URL cleanup, local clock calibration and atomic basis conversion,
+explicit cached-context loading and focus-only links, annotations, lesson scheduling, puzzle reasoning,
+boards/calculators, team acceptance/revocation, clock-label retention, 409 draft retention and stale route/member/plan
+responses. `training-sync.cjs` runs pure checks by default and adds mocked browser checks with `--browser`;
+`training-matches.cjs` runs both its frozen-fixture pure checks and mocked browser checks by default.
+Existing analytics suites still cover timeline/build handling, bounded aggregation, temporal leakage, calibration,
+goal privacy, explicit network actions and mobile/keyboard behavior.
+The retired simulator suite is excluded from CI; its `legacy-practice/` archive is not part of active validation.
 
 [CI](.github/workflows/ci.yml) runs all of the above, browser checks included, on every push to `main` and
 every pull request. It needs no secrets or Riot key. When bumping Playwright, change it here and in the workflow.
